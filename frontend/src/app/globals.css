@@ -1,0 +1,58 @@
+@import "tailwindcss";
+
+:root {
+  --background: #FAF8F5;
+  --foreground: #2A1D1A;
+  
+  --crimson-primary: #5C1D24;
+  --crimson-deep: #431217;
+  --crimson-hover: #73232C;
+  --crimson-subtle: #FDF5F6;
+  --crimson-border: #F0DADC;
+
+  --gold-primary: #C99726;
+  --gold-dark: #8F6910;
+  --gold-subtle: #FEF9EE;
+  --gold-border: #F3E0B5;
+
+  --ivory-canvas: #FAF8F5;
+  --ivory-card: #FFFFFF;
+  --ivory-border: #EAE4DC;
+  --ivory-muted: #F4EFE8;
+
+  --text-main: #271E1B;
+  --text-muted: #6B5E59;
+  --text-subtle: #988B86;
+
+  --whatsapp-primary: #25D366;
+  --whatsapp-dark: #075E54;
+  --whatsapp-bg: #E8F8EE;
+  --whatsapp-bubble: #DCF8C6;
+}
+
+body {
+  background-color: var(--background);
+  color: var(--foreground);
+  font-family: var(--font-sans), system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+}
+
+.font-serif {
+  font-family: var(--font-serif), Georgia, serif;
+}
+
+/* Custom scrollbar for clean boutique feel */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: #F4EFE8;
+}
+::-webkit-scrollbar-thumb {
+  background: #D7CEC5;
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #B9ACA0;
+}
