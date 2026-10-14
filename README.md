@@ -8,7 +8,7 @@
 [![MongoDB](https://img.shields.io/badge/MongoDB-Replica%20Set-green?style=flat&logo=mongodb)](https://www.mongodb.com/)
 [![Vitest](https://img.shields.io/badge/Tests-61%20Passed%20(1.9s)-success?style=flat&logo=vitest)](https://vitest.dev/)
 [![WhatsApp](https://img.shields.io/badge/WhatsApp-Cloud%20API%20Sandbox-25D366?style=flat&logo=whatsapp)](https://developers.facebook.com/)
-[![Architecture](https://img.shields.io/badge/Architecture-Modular%20Monolith-orange?style=flat)]()
+[![Architecture](https://img.shields.io/badge/Architecture-Modular%20Monolith-orange?style=flat)](#2-system-architecture)
 
 ---
 
