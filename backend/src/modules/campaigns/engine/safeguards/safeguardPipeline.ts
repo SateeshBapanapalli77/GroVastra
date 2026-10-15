@@ -7,6 +7,7 @@ import { CampaignDeliveryIntentModel } from '../../models/CampaignDeliveryIntent
 import { TenantControlGateModel } from '../../models/TenantControlGate.model';
 import { CampaignControlGateModel } from '../../models/CampaignControlGate.model';
 import { CustomerModel, ICustomer } from '../../../crm/models/Customer.model';
+import { ProductModel } from '../../../inventory/models/Product.model';
 import { getApprovedTemplate } from '../../adapters/templateCatalogue';
 import { decryptText, sha256 } from '../../../../shared/utils/crypto';
 import { normalizeE164 } from '../../../../shared/utils/phone';
@@ -119,7 +120,22 @@ export async function executePreflightSafeguards(
     return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
   }
 
-  // 7. Resolve Parameter Bindings (Spec p.19, C05)
+  // 7. Template Purpose Gate (Spec p.27, test C14)
+  // Marketing template must never pass itself off as service
+  if (version.purpose === 'ORDER_SERVICE' && template.category === 'MARKETING') {
+    return { status: 'BLOCKED', reason: 'BLOCKED_TEMPLATE_PURPOSE_MISMATCH' };
+  }
+
+  // 8. Live Stock Re-check Gate (Spec p.13, tests A15, A16)
+  if (enrollment.sourceRef?.type === 'STOCK_EVENT') {
+    const sku = enrollment.sourceRef.id;
+    const product = await ProductModel.findOne({ tenantId, sku });
+    if (!product || product.stockCount <= 0 || !product.isSellable) {
+      return { status: 'SKIP', reason: 'SKIPPED_STOCK_DEPLETED' };
+    }
+  }
+
+  // 9. Resolve Parameter Bindings (Spec p.19, C05)
   const storeDisplayName = (version as any).brandName || campaign?.name || '';
   const parameters: Record<string, string> = {};
   const rawBindings = stepDef.bindings instanceof Map

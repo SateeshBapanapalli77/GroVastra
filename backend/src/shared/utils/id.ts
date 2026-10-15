@@ -17,7 +17,13 @@ export type IdPrefix =
   | 'set'  // Settings
   | 'dr'   // Dry Run
   | 'aud'  // Audit Log
-  | 'idemp'; // Idempotency Record
+  | 'idemp'// Idempotency Record
+  | 'conn' // Tenant Connection
+  | 'quar' // Quarantine Record
+  | 'inbox'// Event Inbox
+  | 'fact' // Customer Fact
+  | 'arr'  // Arrival Event
+  | 'req'; // Request Record
 
 export function generateId(prefix: IdPrefix): string {
   return `${prefix}_${ulid().toLowerCase()}`;

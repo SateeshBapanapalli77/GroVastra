@@ -101,6 +101,84 @@ export const APPROVED_TEMPLATES: Record<string, ApprovedTemplate> = {
     render(vars) {
       return `Hello ${vars.name || ''}, we have missed your visits! Explore our new seasonal festive weave arrivals with ${vars.offer || ''} on your next visit.`;
     }
+  },
+  tpl_festival_launch: {
+    id: 'tpl_festival_launch',
+    name: 'Festival Collection Launch',
+    category: 'MARKETING',
+    revision: 1,
+    language: 'en',
+    status: 'APPROVED',
+    bodyTemplate: 'Dear {{name}}, celebrate the upcoming festivities with our exclusive festive weaves at {{shop}}.',
+    variableKeys: ['name', 'shop'],
+    render(vars) {
+      return `Dear ${vars.name || ''}, celebrate the upcoming festivities with our exclusive festive weaves at ${vars.shop || ''}.`;
+    }
+  },
+  tpl_collection_launch: {
+    id: 'tpl_collection_launch',
+    name: 'New Collection Release',
+    category: 'MARKETING',
+    revision: 1,
+    language: 'en',
+    status: 'APPROVED',
+    bodyTemplate: 'Dear {{name}}, our newest seasonal collection has just arrived at {{shop}}! Discover handcrafted silk masterpieces.',
+    variableKeys: ['name', 'shop'],
+    render(vars) {
+      return `Dear ${vars.name || ''}, our newest seasonal collection has just arrived at ${vars.shop || ''}! Discover handcrafted silk masterpieces.`;
+    }
+  },
+  tpl_enquiry_followup: {
+    id: 'tpl_enquiry_followup',
+    name: 'Boutique Enquiry Follow-Up',
+    category: 'MARKETING',
+    revision: 1,
+    language: 'en',
+    status: 'APPROVED',
+    bodyTemplate: 'Hi {{name}}, we noticed you inquired about our sarees. Let us know if we can reserve a styling session for you.',
+    variableKeys: ['name'],
+    render(vars) {
+      return `Hi ${vars.name || ''}, we noticed you inquired about our sarees. Let us know if we can reserve a styling session for you.`;
+    }
+  },
+  tpl_fitting_appointment: {
+    id: 'tpl_fitting_appointment',
+    name: 'Fitting Appointment Reminder',
+    category: 'UTILITY',
+    revision: 1,
+    language: 'en',
+    status: 'APPROVED',
+    bodyTemplate: 'Dear {{name}}, your bespoke bridal fitting appointment is scheduled at {{store}}.',
+    variableKeys: ['name', 'store'],
+    render(vars) {
+      return `Dear ${vars.name || ''}, your bespoke bridal fitting appointment is scheduled at ${vars.store || ''}.`;
+    }
+  },
+  tpl_delivery_update: {
+    id: 'tpl_delivery_update',
+    name: 'Order Delivery Update',
+    category: 'UTILITY',
+    revision: 1,
+    language: 'en',
+    status: 'APPROVED',
+    bodyTemplate: 'Dear {{name}}, your boutique order {{outfit}} is out for delivery from {{store}}.',
+    variableKeys: ['name', 'outfit', 'store'],
+    render(vars) {
+      return `Dear ${vars.name || ''}, your boutique order ${vars.outfit || ''} is out for delivery from ${vars.store || ''}.`;
+    }
+  },
+  tpl_vip_milestone: {
+    id: 'tpl_vip_milestone',
+    name: 'VIP Patron Milestone Celebration',
+    category: 'MARKETING',
+    revision: 1,
+    language: 'en',
+    status: 'APPROVED',
+    bodyTemplate: 'Dear {{name}}, thank you for being a cherished patron at {{shop}}! You have unlocked our VIP Privileged Styling Circle.',
+    variableKeys: ['name', 'shop'],
+    render(vars) {
+      return `Dear ${vars.name || ''}, thank you for being a cherished patron at ${vars.shop || ''}! You have unlocked our VIP Privileged Styling Circle.`;
+    }
   }
 };
 

@@ -184,10 +184,172 @@ export const BOUTIQUE_CAMPAIGN_PRESETS: CampaignPreset[] = [
         prerequisite: 'NONE',
         templateId: 'tpl_winback_offer',
         templateRevision: 1,
-        bindings: { name: 'customer.firstName', offer: '10% on handlooms' },
+        bindings: { name: 'customer.firstName', offer: 'shop.displayName' },
         stopOnReply: true,
         stopOnGoal: true,
         maxLatenessMinutes: 180
+      }
+    ]
+  },
+  {
+    id: 'preset_festival_launch',
+    name: 'Festival Collection Launch',
+    category: 'MERCHANDISE',
+    purpose: 'MARKETING',
+    description: 'Celebrate festive seasons with exclusive private preview invitations for store patrons.',
+    defaultPriority: 50,
+    trigger: {
+      type: 'EVENT_DRIVEN',
+      eventType: 'festival.announced'
+    },
+    defaultSteps: [
+      {
+        stepId: 'festival_greeting',
+        name: 'Festive Preview Announcement',
+        offsetDays: 0,
+        localTime: '11:00',
+        prerequisite: 'NONE',
+        templateId: 'tpl_festival_launch',
+        templateRevision: 1,
+        bindings: { name: 'customer.firstName', shop: 'shop.displayName' },
+        stopOnReply: true,
+        stopOnGoal: true,
+        maxLatenessMinutes: 240
+      }
+    ]
+  },
+  {
+    id: 'preset_collection_release',
+    name: 'New Collection Release',
+    category: 'MERCHANDISE',
+    purpose: 'MARKETING',
+    description: 'Invite VIP patrons to view newly arrived seasonal collection releases.',
+    defaultPriority: 50,
+    trigger: {
+      type: 'EVENT_DRIVEN',
+      eventType: 'collection.released'
+    },
+    defaultSteps: [
+      {
+        stepId: 'collection_preview',
+        name: 'Collection Preview Invitation',
+        offsetDays: 0,
+        localTime: '11:00',
+        prerequisite: 'NONE',
+        templateId: 'tpl_collection_launch',
+        templateRevision: 1,
+        bindings: { name: 'customer.firstName', shop: 'shop.displayName' },
+        stopOnReply: true,
+        stopOnGoal: true,
+        maxLatenessMinutes: 240
+      }
+    ]
+  },
+  {
+    id: 'preset_unresolved_enquiry',
+    name: 'Unresolved Boutique Enquiry',
+    category: 'LIFECYCLE',
+    purpose: 'MARKETING',
+    description: 'Promptly follow up on boutique styling and saree inquiries before patron interest fades.',
+    defaultPriority: 70,
+    trigger: {
+      type: 'EVENT_DRIVEN',
+      eventType: 'enquiry.received'
+    },
+    defaultSteps: [
+      {
+        stepId: 'enquiry_nudge_24h',
+        name: 'First Follow-Up (+24h)',
+        offsetDays: 1,
+        localTime: '11:00',
+        prerequisite: 'NONE',
+        templateId: 'tpl_enquiry_followup',
+        templateRevision: 1,
+        bindings: { name: 'customer.firstName' },
+        stopOnReply: true,
+        stopOnGoal: true,
+        maxLatenessMinutes: 180
+      }
+    ]
+  },
+  {
+    id: 'preset_vip_milestone',
+    name: 'VIP Patron Milestone',
+    category: 'LIFECYCLE',
+    purpose: 'MARKETING',
+    description: 'Recognize high-value patrons when they cross milestone boutique spend thresholds.',
+    defaultPriority: 60,
+    trigger: {
+      type: 'EVENT_DRIVEN',
+      eventType: 'customer.vip_promoted'
+    },
+    defaultSteps: [
+      {
+        stepId: 'vip_congratulations',
+        name: 'VIP Privileged Status Notice',
+        offsetDays: 0,
+        localTime: '12:00',
+        prerequisite: 'NONE',
+        templateId: 'tpl_vip_milestone',
+        templateRevision: 1,
+        bindings: { name: 'customer.firstName', shop: 'shop.displayName' },
+        stopOnReply: true,
+        stopOnGoal: true,
+        maxLatenessMinutes: 240
+      }
+    ]
+  },
+  {
+    id: 'preset_fitting_appointment',
+    name: 'Fitting Appointment Reminder',
+    category: 'SERVICE',
+    purpose: 'ORDER_SERVICE',
+    description: 'Operational appointment notice for bridal and blouse custom measurements.',
+    defaultPriority: 90,
+    trigger: {
+      type: 'EVENT_DRIVEN',
+      eventType: 'appointment.scheduled'
+    },
+    defaultSteps: [
+      {
+        stepId: 'fitting_reminder',
+        name: 'Fitting Time Confirmation',
+        offsetDays: 0,
+        localTime: '10:00',
+        prerequisite: 'NONE',
+        templateId: 'tpl_fitting_appointment',
+        templateRevision: 1,
+        bindings: { name: 'customer.firstName', store: 'shop.displayName' },
+        stopOnReply: false,
+        stopOnGoal: false,
+        maxLatenessMinutes: 240
+      }
+    ]
+  },
+  {
+    id: 'preset_delivery_update',
+    name: 'Order Courier Delivery Update',
+    category: 'SERVICE',
+    purpose: 'ORDER_SERVICE',
+    description: 'Real-time order delivery dispatched notice with out-for-delivery tracking.',
+    defaultPriority: 90,
+    trigger: {
+      type: 'EVENT_DRIVEN',
+      eventType: 'delivery.updated'
+    },
+    defaultSteps: [
+      {
+        stepId: 'out_for_delivery',
+        name: 'Out For Delivery Notice',
+        offsetDays: 0,
+        localTime: '10:30',
+        prerequisite: 'NONE',
+        templateId: 'tpl_delivery_update',
+        templateRevision: 1,
+        bindings: { name: 'customer.firstName', outfit: 'order.itemTitle', store: 'shop.displayName' },
+        stopOnReply: false,
+        stopOnGoal: false,
+        maxLatenessMinutes: 240
       }
     ]
   }

@@ -89,6 +89,10 @@ export class MockWhatsAppDeliveryAdapter implements IWhatsAppDeliveryAdapter {
     return this.submissions.length;
   }
 
+  getCallCount(): number {
+    return this.submissions.length;
+  }
+
   setForcedState(state: 'AUTO' | 'FORCE_REJECT' | 'FORCE_TIMEOUT'): void {
     this.forcedState = state;
   }

@@ -1,4 +1,3 @@
-import { BoutiqueJobModel } from '../../crm/models/BoutiqueJob.model';
 import { CustomerModel } from '../../crm/models/Customer.model';
 import { CampaignModel } from '../models/Campaign.model';
 import { CampaignVersionModel } from '../models/CampaignVersion.model';
@@ -8,40 +7,52 @@ import { DomainEvent } from '../../../shared/events/types';
 import { generateId } from '../../../shared/utils/id';
 import { logger } from '../../../config/logger';
 
-export interface AlterationStrategyResult {
-  jobId: string;
+export interface ServiceStrategyResult {
+  referenceId: string;
   enrolled: boolean;
   executionId?: string;
 }
 
 /**
- * Boutique Alterations & Fitting Strategy (Handoff Page 15):
- * Triggers when custom blouse stitching, fall-pico, or alterations reach READY_FOR_PICKUP.
- * Service purpose: Not subject to marketing caps, but checks customer channel suppression.
+ * Boutique Service Family Evaluator (Spec p.15 & 27, tests B16, C14):
+ * - Fitting appointments (fitting:appointmentId)
+ * - Custom alterations (alteration:jobId)
+ * - Out-for-delivery updates (delivery:orderId:status)
+ * - Purpose is strictly ORDER_SERVICE (does not consume marketing contact cap)
+ * - Per-order deduplication (rejects duplicate courier updates)
+ * - Rejects stale entity versions
  */
-export async function evaluateAlterationReadyEvent(
-  event: DomainEvent<{ jobId: string; customerId: string; itemTitle: string }>
-): Promise<AlterationStrategyResult> {
-  const { tenantId, occurredAt, data } = event;
-  const { jobId, customerId, itemTitle } = data;
 
-  const activeCampaign = await CampaignModel.findOne({
+async function findActiveCampaignForEventType(tenantId: string, eventType: string) {
+  const campaigns = await CampaignModel.find({
     tenantId,
     status: 'ACTIVE'
   }).lean();
 
-  if (!activeCampaign || !activeCampaign.activeVersionId) {
-    return { jobId, enrolled: false };
+  for (const c of campaigns) {
+    if (!c.activeVersionId) continue;
+    const v = await CampaignVersionModel.findOne({
+      id: c.activeVersionId,
+      tenantId
+    }).lean();
+    if (v && (v.trigger?.eventType === eventType || v.trigger?.type === eventType)) {
+      return { campaign: c, version: v };
+    }
   }
+  return null;
+}
 
-  const version = await CampaignVersionModel.findOne({
-    id: activeCampaign.activeVersionId,
-    tenantId
-  }).lean();
+export async function evaluateAlterationReadyEvent(
+  event: DomainEvent<{ jobId: string; customerId: string; itemTitle: string }>
+): Promise<ServiceStrategyResult> {
+  const { tenantId, occurredAt, data, entityVersion } = event;
+  const { jobId, customerId, itemTitle } = data;
 
-  if (!version || version.trigger.eventType !== 'alteration.completed') {
-    return { jobId, enrolled: false };
+  const match = await findActiveCampaignForEventType(tenantId, 'alteration.completed');
+  if (!match) {
+    return { referenceId: jobId, enrolled: false };
   }
+  const { campaign: activeCampaign, version } = match;
 
   const customer = await CustomerModel.findOne({
     id: customerId,
@@ -51,18 +62,23 @@ export async function evaluateAlterationReadyEvent(
   });
 
   if (!customer) {
-    return { jobId, enrolled: false };
+    return { referenceId: jobId, enrolled: false };
   }
 
   const occurrenceId = `alteration:${jobId}`;
 
-  // Upsert enrollment
   let enrollment = await CampaignEnrollmentModel.findOne({
     tenantId,
     campaignId: activeCampaign.id,
     customerId,
     occurrenceId
   });
+
+  // Stale entity version check (Spec p.24)
+  if (enrollment && enrollment.sourceRef && entityVersion && entityVersion < enrollment.sourceRef.version) {
+    logger.info({ jobId, entityVersion, currentVersion: enrollment.sourceRef.version }, 'Stale entity version rejected');
+    return { referenceId: jobId, enrolled: false };
+  }
 
   let enrolled = false;
   if (!enrollment) {
@@ -76,7 +92,7 @@ export async function evaluateAlterationReadyEvent(
       sourceRef: {
         type: 'ORDER_EVENT',
         id: jobId,
-        version: 1
+        version: entityVersion || 1
       },
       planRevision: 1,
       status: 'ACTIVE',
@@ -86,7 +102,6 @@ export async function evaluateAlterationReadyEvent(
     enrolled = true;
   }
 
-  // Create immediate pickup execution
   const stepDef = version.steps[0] || {
     stepId: 'ready_for_pickup',
     templateRef: { id: 'tpl_alteration_ready', revision: 1, language: 'en' },
@@ -125,6 +140,192 @@ export async function evaluateAlterationReadyEvent(
     });
   }
 
-  logger.info({ jobId, customerId, executionId }, 'Processed alteration pickup notification');
-  return { jobId, enrolled, executionId };
+  return { referenceId: jobId, enrolled, executionId };
+}
+
+export async function evaluateFittingAppointmentEvent(
+  event: DomainEvent<{ appointmentId: string; customerId: string }>
+): Promise<ServiceStrategyResult> {
+  const { tenantId, occurredAt, data, entityVersion } = event;
+  const { appointmentId, customerId } = data;
+
+  const match = await findActiveCampaignForEventType(tenantId, 'appointment.scheduled');
+  if (!match) {
+    return { referenceId: appointmentId, enrolled: false };
+  }
+  const { campaign: activeCampaign, version } = match;
+
+  const customer = await CustomerModel.findOne({
+    id: customerId,
+    tenantId,
+    status: 'ACTIVE',
+    channelSuppressed: false
+  });
+
+  if (!customer) {
+    return { referenceId: appointmentId, enrolled: false };
+  }
+
+  const occurrenceId = `fitting:${appointmentId}`;
+
+  let enrollment = await CampaignEnrollmentModel.findOne({
+    tenantId,
+    campaignId: activeCampaign.id,
+    customerId,
+    occurrenceId
+  });
+
+  if (enrollment && enrollment.sourceRef && entityVersion && entityVersion < enrollment.sourceRef.version) {
+    return { referenceId: appointmentId, enrolled: false };
+  }
+
+  let enrolled = false;
+  if (!enrollment) {
+    enrollment = await CampaignEnrollmentModel.create({
+      id: generateId('enr'),
+      tenantId,
+      campaignId: activeCampaign.id,
+      campaignVersionId: version.id,
+      customerId,
+      occurrenceId,
+      sourceRef: {
+        type: 'ORDER_EVENT',
+        id: appointmentId,
+        version: entityVersion || 1
+      },
+      planRevision: 1,
+      status: 'ACTIVE',
+      replyHoldAt: null,
+      goalReachedAt: null
+    });
+    enrolled = true;
+  }
+
+  const stepDef = version.steps[0] || {
+    stepId: 'fitting_reminder',
+    templateRef: { id: 'tpl_fitting_appointment', revision: 1, language: 'en' },
+    maxLatenessMinutes: 240
+  };
+
+  const existingExecution = await CampaignExecutionModel.findOne({
+    tenantId,
+    enrollmentId: enrollment.id,
+    stepId: stepDef.stepId
+  });
+
+  let executionId = existingExecution?.id;
+
+  if (!existingExecution) {
+    executionId = generateId('exe');
+    const dueAt = new Date();
+    const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 240) * 60 * 1000);
+
+    await CampaignExecutionModel.create({
+      id: executionId,
+      tenantId,
+      enrollmentId: enrollment.id,
+      campaignId: activeCampaign.id,
+      stepId: stepDef.stepId,
+      dueAt,
+      expiresAt,
+      localDate: dueAt.toISOString().slice(0, 10),
+      localTime: '10:00',
+      timezone: version.timezone || 'Asia/Kolkata',
+      planRevision: 1,
+      state: 'SCHEDULED',
+      prerequisite: 'NONE',
+      deliveryIntentId: null,
+      lease: { token: null, until: null, claimedBy: null }
+    });
+  }
+
+  return { referenceId: appointmentId, enrolled, executionId };
+}
+
+export async function evaluateDeliveryUpdateEvent(
+  event: DomainEvent<{ orderId: string; customerId: string; deliveryStatus: string }>
+): Promise<ServiceStrategyResult> {
+  const { tenantId, occurredAt, data, entityVersion } = event;
+  const { orderId, customerId, deliveryStatus } = data;
+
+  const match = await findActiveCampaignForEventType(tenantId, 'delivery.updated');
+  if (!match) {
+    return { referenceId: orderId, enrolled: false };
+  }
+  const { campaign: activeCampaign, version } = match;
+
+  const customer = await CustomerModel.findOne({
+    id: customerId,
+    tenantId,
+    status: 'ACTIVE',
+    channelSuppressed: false
+  });
+
+  if (!customer) {
+    return { referenceId: orderId, enrolled: false };
+  }
+
+  // Deduplication per order and courier status (Spec p.15)
+  // Re-occurring duplicate courier updates are ignored
+  const occurrenceId = `delivery:${orderId}:${deliveryStatus}`;
+
+  let enrollment = await CampaignEnrollmentModel.findOne({
+    tenantId,
+    campaignId: activeCampaign.id,
+    customerId,
+    occurrenceId
+  });
+
+  if (enrollment) {
+    logger.info({ orderId, deliveryStatus }, 'Duplicate courier delivery event ignored');
+    return { referenceId: orderId, enrolled: false, executionId: undefined };
+  }
+
+  enrollment = await CampaignEnrollmentModel.create({
+    id: generateId('enr'),
+    tenantId,
+    campaignId: activeCampaign.id,
+    campaignVersionId: version.id,
+    customerId,
+    occurrenceId,
+    sourceRef: {
+      type: 'ORDER_EVENT',
+      id: orderId,
+      version: entityVersion || 1
+    },
+    planRevision: 1,
+    status: 'ACTIVE',
+    replyHoldAt: null,
+    goalReachedAt: null
+  });
+
+  const stepDef = version.steps[0] || {
+    stepId: 'out_for_delivery',
+    templateRef: { id: 'tpl_delivery_update', revision: 1, language: 'en' },
+    maxLatenessMinutes: 240
+  };
+
+  const executionId = generateId('exe');
+  const dueAt = new Date();
+  const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 240) * 60 * 1000);
+
+  await CampaignExecutionModel.create({
+    id: executionId,
+    tenantId,
+    enrollmentId: enrollment.id,
+    campaignId: activeCampaign.id,
+    stepId: stepDef.stepId,
+    dueAt,
+    expiresAt,
+    localDate: dueAt.toISOString().slice(0, 10),
+    localTime: '10:30',
+    timezone: version.timezone || 'Asia/Kolkata',
+    planRevision: 1,
+    state: 'SCHEDULED',
+    prerequisite: 'NONE',
+    deliveryIntentId: null,
+    lease: { token: null, until: null, claimedBy: null }
+  });
+
+  return { referenceId: orderId, enrolled: true, executionId };
 }

@@ -93,12 +93,17 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 
 | Preset Family | Evaluator Exists | Event Consumer | Occurrence Key | Proven by Test | UI Enabled |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| Birthday Celebration | Yes | N/A (Calendar) | `birthday:YYYY` | Yes | Yes |
-| Wedding Anniversary | Partial | N/A (Calendar) | `anniversary:eventId:YYYY` | Partial | Yes |
-| Saree Restock Alert | Partial | `stock.published` | `arrival:arrivalId:reqId` | Partial | Yes |
-| Unresolved Enquiry | Partial | `enquiry.received` | `enquiry:enquiryId` | Partial | Yes |
-| Boutique Alterations & Delivery | Partial | `order.completed` | `boutique:orderId` | Partial | Yes |
-| Inactivity Win-back | Partial | Daily Scan | `winback:YYYY-MM` | Partial | Yes |
+| **Merchandise**: Requested Restock (Exact SKU, Live Stock Preflight) | Yes | `inventory.restock` | `arrival:arrivalEventId:requestId` | Yes (`p3Presets.test.ts` A15) | Yes |
+| **Merchandise**: Multi-match Customer Consolidation & Recount Rejection | Yes | `inventory.arrival` | `arrival:arrivalEventId:requestId` | Yes (`p3Presets.test.ts` A16) | Yes |
+| **Merchandise**: Festival, Collection & Selected-Stock Offers | Yes | `festival.launch`, `collection.released`, `stockoffer.active` | `festival:seasonId`, `collection:releaseId`, `stockoffer:offerId` | Yes (`p3Presets.test.ts`) | Yes |
+| **Lifecycle**: Customer Purchase Facts & Inactivity Scan | Yes | Daily Scan Worker | `winback:orderId:version` | Yes (`p3Presets.test.ts` A13, B17) | Yes |
+| **Lifecycle**: Refund Anchor Recomputation (No Completed Duplicate) | Yes | `order.refunded` | `winback:orderId:version` | Yes (`p3Presets.test.ts` A14) | Yes |
+| **Lifecycle**: Complete the Outfit & First-to-Second Purchase | Yes | `order.completed` | `outfit:orderId`, `repeat:orderId` | Yes (`p3Presets.test.ts`) | Yes |
+| **Retention**: VIP Milestone, Store Credit Expiry & Exhibition | Yes | `customer.vip_milestone`, `credit.expiring`, `exhibition.announced` | `vip:level`, `credit:creditId`, `exhibition:showId` | Yes (`p3Presets.test.ts`) | Yes |
+| **Boutique Service**: Alterations & Fitting (Exempt from Marketing Cap) | Yes | `alteration.completed`, `appointment.scheduled` | `alteration:jobId`, `fitting:appointmentId` | Yes (`p3Presets.test.ts` B16) | Yes |
+| **Boutique Service**: Delivery Updates & Courier Deduplication | Yes | `delivery.updated` | `delivery:orderId:status` | Yes (`p3Presets.test.ts` B16) | Yes |
+| **Boutique Service**: Template Purpose Gate Mismatch Block | Yes | Ingress Safeguard | N/A | Yes (`p3Presets.test.ts` C14) | Yes |
+| **Source Contracts**: Schema Versioning, Stale Version Rejection & Quarantine | Yes | `/internal/campaign-events` & Domain Adapters | Ingress Event ID | Yes (`p3Presets.test.ts`) | Yes |
 
 ---
 

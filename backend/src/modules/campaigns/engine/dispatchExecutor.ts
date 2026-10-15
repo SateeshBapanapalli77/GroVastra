@@ -6,6 +6,7 @@ import { TenantControlGateModel } from '../models/TenantControlGate.model';
 import { CampaignControlGateModel } from '../models/CampaignControlGate.model';
 import { executePreflightSafeguards, PipelineOutcome } from './safeguards/safeguardPipeline';
 import { checkAndReserveContactCapacity, updateContactReservationStatus } from './safeguards/contactCapResolver';
+import { ProductModel } from '../../inventory/models/Product.model';
 import { IWhatsAppDeliveryAdapter } from '../adapters/deliveryAdapter.interface';
 import { getWhatsAppDeliveryAdapter } from '../adapters/adapterFactory';
 import { encryptText, decryptText, sha256 } from '../../../shared/utils/crypto';
@@ -103,6 +104,21 @@ export async function replanExecution(
   );
 
   return Boolean(updated);
+}
+
+/**
+ * Executes dispatch for a specified execution ID (used in worker loops and tests).
+ */
+export async function executeDueStepDispatch(
+  executionId: string,
+  adapter: IWhatsAppDeliveryAdapter = getWhatsAppDeliveryAdapter(),
+  serverNow: Date = new Date()
+): Promise<'PROVIDER_ACCEPTED' | 'SKIPPED' | 'DEFERRED' | 'OUTCOME_UNKNOWN' | 'RETRY_WAIT' | 'BLOCKED' | 'FAILED'> {
+  const execution = await CampaignExecutionModel.findOne({ id: executionId });
+  if (!execution) return 'FAILED';
+  const res = await processClaimedExecution(execution, adapter, serverNow);
+  if (res === 'ACCEPTED') return 'PROVIDER_ACCEPTED';
+  return res as any;
 }
 
 /**
@@ -216,7 +232,7 @@ export async function processClaimedExecution(
 
     // 2. Preflight passed -> PROCEED to ONE MongoDB Transaction (Handoff p.25, P1.b, P1.c)
     // Validate control generations + reserve contact capacity + freeze one delivery intent + mark DISPATCHING
-    const { customer, version, campaign, parameters, payloadHash } = outcome;
+    const { customer, version, enrollment, campaign, parameters, payloadHash } = outcome;
     const stepDef = version.steps.find((s) => s.stepId === execution.stepId)!;
     const attemptId = `attempt_${ulid().toLowerCase()}`;
     const deliveryIntentId = execution.deliveryIntentId || generateId('di');
@@ -271,6 +287,15 @@ export async function processClaimedExecution(
 
           if (!capResult.allowed) {
             throw new Error(capResult.reason || 'SKIPPED_CONTACT_CAP');
+          }
+        }
+
+        // Step C.2: Re-check live stock inside atomic transaction (Spec p.13, test A15, A16)
+        if (enrollment.sourceRef?.type === 'STOCK_EVENT') {
+          const sku = enrollment.sourceRef.id;
+          const product = await ProductModel.findOne({ tenantId, sku }).session(session);
+          if (!product || product.stockCount <= 0 || !product.isSellable) {
+            throw new Error('SKIPPED_STOCK_DEPLETED');
           }
         }
 
@@ -377,6 +402,22 @@ export async function processClaimedExecution(
           }
         );
         return errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED';
+      }
+
+      if (errMsg === 'SKIPPED_STOCK_DEPLETED') {
+        await CampaignExecutionModel.updateOne(
+          { id: executionId, tenantId },
+          {
+            $set: {
+              state: 'SKIPPED',
+              outcomeReason: 'SKIPPED_STOCK_DEPLETED',
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          }
+        );
+        return 'SKIPPED';
       }
 
       // Lease lost or expired CAS conflict
