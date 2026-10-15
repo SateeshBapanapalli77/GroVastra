@@ -12,6 +12,8 @@ export type IdPrefix =
   | 'prd'  // Product
   | 'chk'  // Checkpoint
   | 'cg'   // Contact Gate
+  | 'tg'   // Tenant Gate
+  | 'tomb' // Tombstone
   | 'dr';  // Dry Run
 
 export function generateId(prefix: IdPrefix): string {

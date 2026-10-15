@@ -6,6 +6,7 @@ import { CampaignEnrollmentModel } from '../models/CampaignEnrollment.model';
 import { CampaignExecutionModel } from '../models/CampaignExecution.model';
 import { matchesAudienceRules } from './audienceEngine';
 import { generateId } from '../../../shared/utils/id';
+import { isEnrollmentReplayBlocked } from '../services/retentionService';
 import {
   resolveNextAnnualOccurrence,
   calculateDueInstant,
@@ -93,6 +94,13 @@ export async function planAnnualOccasions(
     const campaign = await CampaignModel.findOne({ id: campaignId, tenantId });
     const occurrencePrefix = isBirthday ? 'birthday' : 'anniversary';
     const occurrenceId = `${occurrencePrefix}:${occurrence.occurrenceId}`;
+    const enrollmentKey = `${tenantId}:${campaignId}:${customer.id}:${occurrenceId}`;
+
+    // Retention check (Spec p.25 & test B18): tombstone check prevents historical replay
+    if (await isEnrollmentReplayBlocked(tenantId, enrollmentKey)) {
+      skippedCount++;
+      continue;
+    }
 
     // Upsert CampaignEnrollment (Idempotent: tenantId + campaignId + customerId + occurrenceId)
     let enrollment = await CampaignEnrollmentModel.findOne({

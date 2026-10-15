@@ -3,14 +3,20 @@ import { ICampaignEnrollment, CampaignEnrollmentModel } from '../../models/Campa
 import { CampaignExecutionModel } from '../../models/CampaignExecution.model';
 import { CampaignModel } from '../../models/Campaign.model';
 import { CampaignVersionModel, ICampaignVersion } from '../../models/CampaignVersion.model';
+import { CampaignDeliveryIntentModel } from '../../models/CampaignDeliveryIntent.model';
+import { TenantControlGateModel } from '../../models/TenantControlGate.model';
+import { CampaignControlGateModel } from '../../models/CampaignControlGate.model';
 import { CustomerModel, ICustomer } from '../../../crm/models/Customer.model';
-import { checkAndReserveContactCapacity, CapCheckResult } from './contactCapResolver';
+import { getApprovedTemplate } from '../../adapters/templateCatalogue';
+import { decryptText, sha256 } from '../../../../shared/utils/crypto';
+import { normalizeE164 } from '../../../../shared/utils/phone';
 import { logger } from '../../../../config/logger';
 
 export type PipelineOutcome =
-  | { status: 'PROCEED'; customer: ICustomer; version: ICampaignVersion; enrollment: ICampaignEnrollment; campaign: any }
+  | { status: 'PROCEED'; customer: ICustomer; version: ICampaignVersion; enrollment: ICampaignEnrollment; campaign: any; parameters: Record<string, string>; payloadHash: string }
   | { status: 'SKIP'; reason: string }
-  | { status: 'DEFER'; reason: string; nextDueAt: Date };
+  | { status: 'DEFER'; reason: string; nextDueAt: Date }
+  | { status: 'BLOCKED'; reason: string };
 
 /**
  * Preflight Safeguard Pipeline (Chain of Responsibility Pattern)
@@ -19,8 +25,9 @@ export type PipelineOutcome =
  * 2. Campaign / Global Pause & Pause Generation
  * 3. Step Expiry / Lateness Cutoff
  * 4. Stop Rules (stopOnGoal purchase, stopOnReply staff hold)
- * 5. Prerequisite Check (PREVIOUS_ACCEPTED)
- * 6. Contact Frequency Caps (1/24h, 3/7d)
+ * 5. Content / Readiness / Template Blocked
+ * 6. Prerequisite Check (PREVIOUS_ACCEPTED)
+ * (Contact Frequency Caps are reserved inside the atomic submission transaction)
  */
 export async function executePreflightSafeguards(
   execution: ICampaignExecution,
@@ -28,20 +35,28 @@ export async function executePreflightSafeguards(
 ): Promise<PipelineOutcome> {
   const { tenantId, campaignId, enrollmentId, stepId, expiresAt } = execution;
 
-  // 1. Load Campaign & Version
+  // 1. Global Pause Gate (Tenant Control Gate)
+  const tenantGate = await TenantControlGateModel.findOne({ tenantId });
+  if (tenantGate?.globalPause) {
+    return { status: 'SKIP', reason: 'CAMPAIGN_OR_GLOBAL_PAUSED' };
+  }
+
+  // 2. Load Campaign & Version
   const campaign = await CampaignModel.findOne({ id: campaignId, tenantId });
   if (!campaign) {
     return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_NOT_FOUND' };
   }
 
-  // Gate 1: Campaign Pause Check & Pause Generation Validation
-  if (campaign.status === 'PAUSED' || campaign.status === 'ARCHIVED') {
+  // Campaign Pause Gate (Campaign Control Gate & Campaign Model status)
+  const campaignGate = await CampaignControlGateModel.findOne({ tenantId, campaignId });
+  if (campaign.status === 'PAUSED' || campaign.status === 'ARCHIVED' || campaignGate?.paused) {
     return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_PAUSED' };
   }
 
+  const expectedPauseGen = campaignGate?.pauseGeneration ?? campaign.pauseGeneration;
   if (
     typeof execution.pauseGeneration === 'number' &&
-    execution.pauseGeneration !== campaign.pauseGeneration
+    execution.pauseGeneration !== expectedPauseGen
   ) {
     return {
       status: 'DEFER',
@@ -65,13 +80,12 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_STEP_NOT_FOUND' };
   }
 
-  // 2. Load Customer
+  // 3. Load Customer & Permission Gates
   const customer = await CustomerModel.findOne({ id: enrollment.customerId, tenantId });
   if (!customer || customer.status === 'DELETED') {
     return { status: 'SKIP', reason: 'SKIPPED_CUSTOMER_DELETED' };
   }
 
-  // Gate 2: Channel Suppression & Permission
   if (customer.channelSuppressed) {
     return { status: 'SKIP', reason: 'SKIPPED_CHANNEL_SUPPRESSED' };
   }
@@ -80,14 +94,14 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_MARKETING_OPT_OUT' };
   }
 
-  // Gate 3: Expiry Check (Page 17)
+  // 4. Expiry Check (Page 17 & 33)
   if (serverNow > expiresAt) {
     return { status: 'SKIP', reason: 'SKIPPED_STEP_EXPIRED' };
   }
 
-  // Gate 4: Stop Rules (Handoff Page 8 & 11)
-  // Stop on Goal Purchase
-  if (stepDef.stopOnGoal && enrollment.goalReachedAt !== null) {
+  // 5. Stop Rules (Handoff Page 8 & 11)
+  // Stop on Goal Purchase: takes precedence over reply hold (Spec p.33)
+  if (stepDef.stopOnGoal !== false && enrollment.goalReachedAt !== null) {
     return { status: 'SKIP', reason: 'SKIPPED_GOAL_REACHED' };
   }
 
@@ -96,34 +110,105 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_REPLY_HOLD' };
   }
 
-  // Gate 5: Prerequisite Check (Page 8 & 19)
+  // 6. Template Readiness Gate (Spec p.19, p.27, p.32 test C02, C19)
+  const template = getApprovedTemplate(stepDef.templateRef.id);
+  if (!template) {
+    return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
+  }
+  if (template.status === 'PAUSED') {
+    return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
+  }
+
+  // 7. Resolve Parameter Bindings
+  const storeDisplayName = (version as any).brandName || campaign?.name || 'GroVastra Boutique';
+  const parameters: Record<string, string> = {};
+  const rawBindings = stepDef.bindings instanceof Map
+    ? Object.fromEntries(stepDef.bindings.entries())
+    : (stepDef.bindings || {});
+
+  for (const [paramKey, rawExpr] of Object.entries(rawBindings)) {
+    const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
+    if (expr === 'customer.firstName') {
+      parameters[paramKey] = customer.firstName || '';
+    } else if (expr === 'customer.lastName') {
+      parameters[paramKey] = customer.lastName || '';
+    } else if (expr === 'customer.fullName') {
+      parameters[paramKey] = `${customer.firstName} ${customer.lastName}`.trim();
+    } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
+      parameters[paramKey] = storeDisplayName;
+    } else if (expr.startsWith('literal:')) {
+      parameters[paramKey] = expr.slice(8);
+    } else if (expr in customer) {
+      parameters[paramKey] = String((customer as any)[expr] || '');
+    } else {
+      parameters[paramKey] = expr;
+    }
+  }
+
+  if (!parameters.name && customer.firstName) {
+    parameters.name = customer.firstName;
+  }
+  if (!parameters.shop) {
+    parameters.shop = storeDisplayName;
+  }
+
+  const payloadHash = sha256(parameters);
+
+  // 8. Stale Frozen Intent Check (for retries, Spec p.20 & test C20)
+  // "BLOCKED_STALE_INTENT when frozen-intent source data changes"
+  if (execution.deliveryIntentId) {
+    const existingIntent = await CampaignDeliveryIntentModel.findOne({
+      id: execution.deliveryIntentId,
+      tenantId
+    });
+
+    if (existingIntent) {
+      let recipientPhone = '';
+      try {
+        recipientPhone = decryptText(existingIntent.encryptedRecipient);
+      } catch {
+        // cannot decrypt
+      }
+
+      const phoneChanged = recipientPhone && normalizeE164(customer.phone) !== normalizeE164(recipientPhone);
+      const payloadChanged = existingIntent.payloadHash !== payloadHash;
+
+      if (phoneChanged || payloadChanged) {
+        logger.warn(
+          { executionId: execution.id, phoneChanged, payloadChanged },
+          'Source data changed for frozen intent; blocking execution as BLOCKED_STALE_INTENT'
+        );
+        return { status: 'BLOCKED', reason: 'BLOCKED_STALE_INTENT' };
+      }
+    }
+  }
+
+  // 9. Prerequisite Check (Page 8 & 19, test C13)
   if (stepDef.prerequisite === 'PREVIOUS_ACCEPTED') {
     const priorExecutions = await CampaignExecutionModel.find({
       tenantId,
       enrollmentId
     }).lean();
 
-    // Check if there is an accepted previous step (PROVIDER_ACCEPTED, DELIVERED, or READ)
     const priorAccepted = priorExecutions.some(
       (e) => e.stepId !== stepId && ['PROVIDER_ACCEPTED', 'DELIVERED', 'READ'].includes(e.state)
     );
 
     if (!priorAccepted) {
-      // Check if prior step has already failed or skipped permanently
       const priorTerminalFailure = priorExecutions.some(
-        (e) => e.stepId !== stepId && ['SKIPPED', 'FAILED'].includes(e.state)
+        (e) => e.stepId !== stepId && ['SKIPPED', 'FAILED', 'OUTCOME_UNKNOWN'].includes(e.state)
       );
 
       if (priorTerminalFailure) {
         return { status: 'SKIP', reason: 'SKIPPED_PREREQUISITE_NOT_MET' };
       }
 
-      // Prior step might still be scheduled or in transit; defer
-      const retryDue = new Date(serverNow.getTime() + 15 * 60 * 1000); // Check again in 15 min
+      // Prior step might still be in progress; defer
+      const retryDue = new Date(serverNow.getTime() + 15 * 60 * 1000);
       if (retryDue < expiresAt) {
         return {
           status: 'DEFER',
-          reason: 'DEFERRED_WAITING_PREREQUISITE',
+          reason: 'WAITING_PREREQUISITE',
           nextDueAt: retryDue
         };
       }
@@ -131,36 +216,14 @@ export async function executePreflightSafeguards(
     }
   }
 
-  // Gate 6: Contact Caps & Collision Arbitration (Page 18)
-  if (version.purpose === 'MARKETING') {
-    const capResult: CapCheckResult = await checkAndReserveContactCapacity(
-      tenantId,
-      customer.phone,
-      campaignId,
-      execution.id,
-      expiresAt,
-      version.priority,
-      serverNow
-    );
-
-    if (!capResult.allowed) {
-      if (capResult.reason === 'DEFERRED_CONTACT_CAP' && capResult.nextAvailableAt) {
-        return {
-          status: 'DEFER',
-          reason: 'DEFERRED_CONTACT_CAP',
-          nextDueAt: capResult.nextAvailableAt
-        };
-      }
-      return { status: 'SKIP', reason: 'SKIPPED_CONTACT_CAP' };
-    }
-  }
-
-  // All gates passed!
+  // All preflight checks passed
   return {
     status: 'PROCEED',
     customer,
     version,
     enrollment,
-    campaign
+    campaign,
+    parameters,
+    payloadHash
   };
 }

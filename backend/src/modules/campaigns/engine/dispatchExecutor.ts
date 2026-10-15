@@ -1,8 +1,11 @@
+import mongoose from 'mongoose';
 import { CampaignExecutionModel, ICampaignExecution } from '../models/CampaignExecution.model';
 import { CampaignDeliveryIntentModel, ICampaignDeliveryIntent } from '../models/CampaignDeliveryIntent.model';
 import { CampaignEventInboxModel } from '../models/CampaignEventInbox.model';
+import { TenantControlGateModel } from '../models/TenantControlGate.model';
+import { CampaignControlGateModel } from '../models/CampaignControlGate.model';
 import { executePreflightSafeguards, PipelineOutcome } from './safeguards/safeguardPipeline';
-import { updateContactReservationStatus } from './safeguards/contactCapResolver';
+import { checkAndReserveContactCapacity, updateContactReservationStatus } from './safeguards/contactCapResolver';
 import { IWhatsAppDeliveryAdapter } from '../adapters/deliveryAdapter.interface';
 import { getWhatsAppDeliveryAdapter } from '../adapters/adapterFactory';
 import { encryptText, decryptText, sha256 } from '../../../shared/utils/crypto';
@@ -17,11 +20,24 @@ export interface DispatchCycleResult {
   skippedCount: number;
   deferredCount: number;
   unknownCount: number;
+  retryWaitCount: number;
+  blockedCount: number;
   failedCount: number;
 }
 
 /**
- * Atomically claims one due execution using an expiring lease token (Handoff Page 19 & 25)
+ * Known Meta error codes for documented non-acceptance (Spec reference M4)
+ * that are safe to retry under bounded exponential backoff (e.g. Rate limits, cloud API throughput).
+ */
+export function isRetryableThrottleError(errorCode?: string | null): boolean {
+  if (!errorCode) return false;
+  const retryableCodes = ['130429', '131056', '131048', '80007', '429', 'THROTTLED', 'RATE_LIMIT', 'TEMPORARY_UNAVAILABLE'];
+  return retryableCodes.includes(String(errorCode));
+}
+
+/**
+ * Atomically claims one due execution using an expiring lease token (Handoff Page 19 & 25).
+ * Updates claimVersion, keeping planRevision strictly for replans (P1.a).
  */
 export async function claimNextDueExecution(
   tenantId: string,
@@ -35,7 +51,7 @@ export async function claimNextDueExecution(
   const claimed = await CampaignExecutionModel.findOneAndUpdate(
     {
       tenantId,
-      state: { $in: ['SCHEDULED', 'DEFERRED'] },
+      state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] },
       dueAt: { $lte: serverNow },
       $or: [{ 'lease.until': null }, { 'lease.until': { $lte: serverNow } }]
     },
@@ -46,7 +62,7 @@ export async function claimNextDueExecution(
         'lease.until': leaseExpiry,
         'lease.claimedBy': workerId
       },
-      $inc: { planRevision: 1 }
+      $inc: { claimVersion: 1 } // Increment claim fence counter; planRevision unchanged
     },
     {
       sort: { dueAt: 1 },
@@ -58,13 +74,46 @@ export async function claimNextDueExecution(
 }
 
 /**
- * Processes a claimed execution through the safeguard pipeline and WhatsApp dispatch boundary
+ * Re-plans an execution schedule (e.g. date correction within year).
+ * Fails CAS if execution was already claimed/evaluating or planRevision changed (B20).
+ */
+export async function replanExecution(
+  tenantId: string,
+  executionId: string,
+  expectedPlanRevision: number,
+  newDueAt: Date,
+  newExpiresAt?: Date
+): Promise<boolean> {
+  const updated = await CampaignExecutionModel.findOneAndUpdate(
+    {
+      id: executionId,
+      tenantId,
+      deliveryIntentId: null, // Only replan executions before delivery intent exists (Page 20)
+      planRevision: expectedPlanRevision,
+      state: { $in: ['SCHEDULED', 'DEFERRED'] }
+    },
+    {
+      $set: {
+        dueAt: newDueAt,
+        ...(newExpiresAt ? { expiresAt: newExpiresAt } : {})
+      },
+      $inc: { planRevision: 1 }
+    },
+    { new: true }
+  );
+
+  return Boolean(updated);
+}
+
+/**
+ * Processes a claimed execution through preflight safeguards, atomic submission transaction,
+ * WhatsApp delivery adapter, and delivery status correlation.
  */
 export async function processClaimedExecution(
   execution: ICampaignExecution,
   adapter: IWhatsAppDeliveryAdapter = getWhatsAppDeliveryAdapter(),
   serverNow: Date = new Date()
-): Promise<'ACCEPTED' | 'SKIPPED' | 'DEFERRED' | 'OUTCOME_UNKNOWN' | 'FAILED'> {
+): Promise<'ACCEPTED' | 'SKIPPED' | 'DEFERRED' | 'OUTCOME_UNKNOWN' | 'RETRY_WAIT' | 'BLOCKED' | 'FAILED'> {
   const { tenantId, id: executionId } = execution;
 
   try {
@@ -75,8 +124,11 @@ export async function processClaimedExecution(
       const skipped = await CampaignExecutionModel.findOneAndUpdate(
         {
           id: executionId,
+          tenantId,
+          claimVersion: execution.claimVersion,
           planRevision: execution.planRevision,
-          'lease.token': execution.lease.token
+          'lease.token': execution.lease.token,
+          'lease.until': { $gt: serverNow }
         },
         {
           $set: {
@@ -85,18 +137,17 @@ export async function processClaimedExecution(
             'lease.token': null,
             'lease.until': null,
             'lease.claimedBy': null
-          },
-          $inc: { planRevision: 1 }
+          }
         },
         { new: true }
       );
 
       if (!skipped) {
-        logger.warn({ executionId }, 'CAS Conflict: Execution was modified or lease expired while evaluating SKIP');
+        logger.warn({ executionId }, 'CAS Conflict: Execution modified or lease expired while evaluating SKIP');
         return 'FAILED';
       }
 
-      logger.info({ executionId, reason: outcome.reason }, 'Execution skipped by safeguard');
+      logger.info({ executionId, reason: outcome.reason }, 'Execution skipped by preflight safeguard');
       return 'SKIPPED';
     }
 
@@ -104,8 +155,11 @@ export async function processClaimedExecution(
       const deferred = await CampaignExecutionModel.findOneAndUpdate(
         {
           id: executionId,
+          tenantId,
+          claimVersion: execution.claimVersion,
           planRevision: execution.planRevision,
-          'lease.token': execution.lease.token
+          'lease.token': execution.lease.token,
+          'lease.until': { $gt: serverNow }
         },
         {
           $set: {
@@ -115,14 +169,13 @@ export async function processClaimedExecution(
             'lease.token': null,
             'lease.until': null,
             'lease.claimedBy': null
-          },
-          $inc: { planRevision: 1 }
+          }
         },
         { new: true }
       );
 
       if (!deferred) {
-        logger.warn({ executionId }, 'CAS Conflict: Execution was modified or lease expired while evaluating DEFER');
+        logger.warn({ executionId }, 'CAS Conflict: Execution modified or lease expired while evaluating DEFER');
         return 'FAILED';
       }
 
@@ -130,98 +183,208 @@ export async function processClaimedExecution(
       return 'DEFERRED';
     }
 
-    // 2. All safeguards passed -> PROCEED to Two-Phase Delivery Intent Freezing
-    const { customer, version, campaign } = outcome;
-    const stepDef = version.steps.find((s) => s.stepId === execution.stepId)!;
-    const storeDisplayName = (version as any).brandName || campaign?.name || 'GroVastra Boutique';
-
-    // Resolve parameter bindings dynamically (Handoff Page 19)
-    const parameters: Record<string, string> = {};
-    const rawBindings = stepDef.bindings instanceof Map
-      ? Object.fromEntries(stepDef.bindings.entries())
-      : (stepDef.bindings || {});
-
-    for (const [paramKey, rawExpr] of Object.entries(rawBindings)) {
-      const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
-      if (expr === 'customer.firstName') {
-        parameters[paramKey] = customer.firstName || '';
-      } else if (expr === 'customer.lastName') {
-        parameters[paramKey] = customer.lastName || '';
-      } else if (expr === 'customer.fullName') {
-        parameters[paramKey] = `${customer.firstName} ${customer.lastName}`.trim();
-      } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
-        parameters[paramKey] = storeDisplayName;
-      } else if (expr.startsWith('literal:')) {
-        parameters[paramKey] = expr.slice(8);
-      } else if (expr in customer) {
-        parameters[paramKey] = String((customer as any)[expr] || '');
-      } else {
-        parameters[paramKey] = expr;
-      }
-    }
-
-    // Default standard placeholders if template expects them
-    if (!parameters.name && customer.firstName) {
-      parameters.name = customer.firstName;
-    }
-    if (!parameters.shop) {
-      parameters.shop = storeDisplayName;
-    }
-
-    const payloadHash = sha256(parameters);
-    const deliveryIntentId = generateId('di');
-    const attemptId = `attempt_${ulid().toLowerCase()}`;
-
-    // Create immutable delivery intent
-    const deliveryIntent = await CampaignDeliveryIntentModel.create({
-      id: deliveryIntentId,
-      tenantId,
-      executionId,
-      deliveryKey: executionId,
-      connectionId: env.WHATSAPP_CONNECTION_ID,
-      customerId: customer.id,
-      recipientVersion: 1,
-      encryptedRecipient: encryptText(customer.phone),
-      templateRef: {
-        id: stepDef.templateRef.id,
-        revision: stepDef.templateRef.revision,
-        language: stepDef.templateRef.language
-      },
-      parameters,
-      payloadHash,
-      state: 'SUBMITTING',
-      attemptId,
-      providerMessageId: null,
-      submittedAt: serverNow
-    });
-
-    // Move execution to DISPATCHING using Atomic CAS
-    const dispatching = await CampaignExecutionModel.findOneAndUpdate(
-      {
-        id: executionId,
-        state: 'EVALUATING',
-        planRevision: execution.planRevision,
-        'lease.token': execution.lease.token
-      },
-      {
-        $set: {
-          state: 'DISPATCHING',
-          deliveryIntentId
+    if (outcome.status === 'BLOCKED') {
+      const blocked = await CampaignExecutionModel.findOneAndUpdate(
+        {
+          id: executionId,
+          tenantId,
+          claimVersion: execution.claimVersion,
+          planRevision: execution.planRevision,
+          'lease.token': execution.lease.token,
+          'lease.until': { $gt: serverNow }
         },
-        $inc: { planRevision: 1 }
-      },
-      { new: true }
-    );
+        {
+          $set: {
+            state: 'BLOCKED',
+            outcomeReason: outcome.reason,
+            'lease.token': null,
+            'lease.until': null,
+            'lease.claimedBy': null
+          }
+        },
+        { new: true }
+      );
 
-    if (!dispatching) {
-      logger.warn({ executionId }, 'CAS Conflict: Execution was modified or lease expired before dispatching');
-      deliveryIntent.state = 'REJECTED';
-      deliveryIntent.errorCode = 'LEASE_LOST_BEFORE_DISPATCH';
-      await deliveryIntent.save();
+      if (!blocked) {
+        logger.warn({ executionId }, 'CAS Conflict: Execution modified or lease expired while evaluating BLOCKED');
+        return 'FAILED';
+      }
+
+      logger.info({ executionId, reason: outcome.reason }, 'Execution blocked by safeguard');
+      return 'BLOCKED';
+    }
+
+    // 2. Preflight passed -> PROCEED to ONE MongoDB Transaction (Handoff p.25, P1.b, P1.c)
+    // Validate control generations + reserve contact capacity + freeze one delivery intent + mark DISPATCHING
+    const { customer, version, campaign, parameters, payloadHash } = outcome;
+    const stepDef = version.steps.find((s) => s.stepId === execution.stepId)!;
+    const attemptId = `attempt_${ulid().toLowerCase()}`;
+    const deliveryIntentId = execution.deliveryIntentId || generateId('di');
+
+    let deliveryIntentDoc: ICampaignDeliveryIntent | null = null;
+
+    const session = await mongoose.startSession();
+    try {
+      await session.withTransaction(async () => {
+        // Step A: Lock & Validate TenantControlGate (Consistent Lock Order: 1)
+        let tenantGate = await TenantControlGateModel.findOne({ tenantId }).session(session);
+        if (!tenantGate) {
+          const created = await TenantControlGateModel.create(
+            [{ id: generateId('tg'), tenantId, globalPause: false, gateVersion: 1 }],
+            { session }
+          );
+          tenantGate = created[0];
+        }
+        if (tenantGate.globalPause) {
+          throw new Error('CAMPAIGN_OR_GLOBAL_PAUSED');
+        }
+
+        // Step B: Lock & Validate CampaignControlGate (Consistent Lock Order: 2)
+        let campaignGate = await CampaignControlGateModel.findOne({
+          tenantId,
+          campaignId: execution.campaignId
+        }).session(session);
+
+        if (!campaignGate) {
+          const created = await CampaignControlGateModel.create(
+            [{ id: generateId('cg'), tenantId, campaignId: execution.campaignId, paused: false, pauseGeneration: 0 }],
+            { session }
+          );
+          campaignGate = created[0];
+        }
+        if (campaignGate.paused || campaignGate.pauseGeneration !== execution.pauseGeneration) {
+          throw new Error('CAMPAIGN_OR_GLOBAL_PAUSED');
+        }
+
+        // Step C: Lock & Reserve Destination Contact Gate (Consistent Lock Order: 3)
+        if (version.purpose === 'MARKETING') {
+          const capResult = await checkAndReserveContactCapacity(
+            tenantId,
+            customer.phone,
+            execution.campaignId,
+            executionId,
+            execution.expiresAt,
+            version.priority,
+            serverNow,
+            session
+          );
+
+          if (!capResult.allowed) {
+            throw new Error(capResult.reason || 'SKIPPED_CONTACT_CAP');
+          }
+        }
+
+        // Step D: Freeze or reuse Delivery Intent
+        deliveryIntentDoc = await CampaignDeliveryIntentModel.findOne({
+          tenantId,
+          executionId
+        }).session(session);
+
+        if (!deliveryIntentDoc) {
+          const created = await CampaignDeliveryIntentModel.create(
+            [
+              {
+                id: deliveryIntentId,
+                tenantId,
+                executionId,
+                deliveryKey: executionId,
+                connectionId: env.WHATSAPP_CONNECTION_ID,
+                customerId: customer.id,
+                recipientVersion: 1,
+                encryptedRecipient: encryptText(customer.phone),
+                templateRef: {
+                  id: stepDef.templateRef.id,
+                  revision: stepDef.templateRef.revision,
+                  language: stepDef.templateRef.language
+                },
+                parameters,
+                payloadHash,
+                state: 'SUBMITTING',
+                attemptId,
+                providerMessageId: null,
+                submittedAt: serverNow
+              }
+            ],
+            { session }
+          );
+          deliveryIntentDoc = created[0];
+        } else {
+          // Reusing existing frozen intent for safe retry (C08, C20)
+          deliveryIntentDoc.state = 'SUBMITTING';
+          deliveryIntentDoc.attemptId = attemptId;
+          deliveryIntentDoc.submittedAt = serverNow;
+          await deliveryIntentDoc.save({ session });
+        }
+
+        // Step E: Mark Execution DISPATCHING with atomic CAS matching lease token, claimVersion, planRevision
+        const dispatching = await CampaignExecutionModel.findOneAndUpdate(
+          {
+            id: executionId,
+            tenantId,
+            state: 'EVALUATING',
+            claimVersion: execution.claimVersion,
+            planRevision: execution.planRevision,
+            'lease.token': execution.lease.token,
+            'lease.until': { $gt: serverNow },
+            expiresAt: { $gt: serverNow }
+          },
+          {
+            $set: {
+              state: 'DISPATCHING',
+              deliveryIntentId: deliveryIntentDoc.id
+            }
+          },
+          { session, new: true }
+        );
+
+        if (!dispatching) {
+          throw new Error('LEASE_LOST_BEFORE_DISPATCH');
+        }
+      });
+    } catch (txErr: any) {
+      await session.endSession();
+
+      const errMsg = txErr.message || '';
+      logger.warn({ executionId, error: errMsg }, 'Submission transaction aborted and rolled back');
+
+      if (errMsg === 'CAMPAIGN_OR_GLOBAL_PAUSED') {
+        await CampaignExecutionModel.updateOne(
+          { id: executionId, tenantId },
+          {
+            $set: {
+              state: 'SKIPPED',
+              outcomeReason: 'CAMPAIGN_OR_GLOBAL_PAUSED',
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          }
+        );
+        return 'SKIPPED';
+      }
+
+      if (errMsg === 'DEFERRED_CONTACT_CAP' || errMsg === 'SKIPPED_CONTACT_CAP') {
+        await CampaignExecutionModel.updateOne(
+          { id: executionId, tenantId },
+          {
+            $set: {
+              state: errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED',
+              outcomeReason: errMsg,
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          }
+        );
+        return errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED';
+      }
+
+      // Lease lost or expired CAS conflict
       return 'FAILED';
     }
+    await session.endSession();
 
-    // 3. Dispatch to WhatsApp Adapter (Outside of DB transaction)
+    // 3. Provider HTTP Call Outside the DB Transaction (Strict Rule, Handoff p.25)
     const sendResult = await adapter.sendCampaignStep({
       executionId,
       deliveryKey: executionId,
@@ -238,59 +401,159 @@ export async function processClaimedExecution(
       recipientPhone: customer.phone
     });
 
-    // 4. Handle Adapter Response & Update States via CAS
+    const refreshedIntent = (await CampaignDeliveryIntentModel.findOne({ tenantId, executionId })) || deliveryIntentDoc;
+
+    // 4. Handle Adapter Response & Update States
     if (sendResult.state === 'ACCEPTED') {
-      deliveryIntent.state = 'ACCEPTED';
-      deliveryIntent.providerMessageId = sendResult.providerMessageId || null;
-      await deliveryIntent.save();
+      if (refreshedIntent) {
+        refreshedIntent.state = 'ACCEPTED';
+        refreshedIntent.providerMessageId = sendResult.providerMessageId || null;
+        await refreshedIntent.save();
+      }
 
       await CampaignExecutionModel.findOneAndUpdate(
-        { id: executionId, state: 'DISPATCHING', planRevision: dispatching.planRevision },
+        { id: executionId, tenantId, state: 'DISPATCHING' },
         {
           $set: {
             state: 'PROVIDER_ACCEPTED',
             'lease.token': null,
             'lease.until': null,
             'lease.claimedBy': null
-          },
-          $inc: { planRevision: 1 }
+          }
         }
       );
 
       await updateContactReservationStatus(tenantId, customer.phone, executionId, 'ACCEPTED');
       logger.info({ executionId, providerId: sendResult.providerMessageId }, 'Message accepted by provider');
+
+      // Check if a late status event already arrived before response persistence (Test C12)
+      if (sendResult.providerMessageId) {
+        const earlyStatus = await CampaignEventInboxModel.findOne({
+          tenantId,
+          type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read'] },
+          'data.providerMessageId': sendResult.providerMessageId
+        }).exec();
+
+        if (earlyStatus) {
+          const isRead = earlyStatus.type === 'whatsapp.status.read';
+          await CampaignExecutionModel.updateOne(
+            { id: executionId, tenantId },
+            {
+              $set: {
+                state: isRead ? 'READ' : 'DELIVERED',
+                deliveredAt: earlyStatus.occurredAt,
+                readAt: isRead ? earlyStatus.occurredAt : null
+              }
+            }
+          );
+          if (refreshedIntent) {
+            refreshedIntent.deliveredAt = earlyStatus.occurredAt;
+            if (isRead) refreshedIntent.readAt = earlyStatus.occurredAt;
+            await refreshedIntent.save();
+          }
+        }
+      }
+
       return 'ACCEPTED';
     }
 
     if (sendResult.state === 'OUTCOME_UNKNOWN') {
-      deliveryIntent.state = 'OUTCOME_UNKNOWN';
-      await deliveryIntent.save();
+      if (refreshedIntent) {
+        refreshedIntent.state = 'OUTCOME_UNKNOWN';
+        await refreshedIntent.save();
+      }
 
       await CampaignExecutionModel.findOneAndUpdate(
-        { id: executionId, state: 'DISPATCHING', planRevision: dispatching.planRevision },
+        { id: executionId, tenantId, state: 'DISPATCHING' },
         {
           $set: {
             state: 'OUTCOME_UNKNOWN',
             'lease.token': null,
             'lease.until': null,
             'lease.claimedBy': null
-          },
-          $inc: { planRevision: 1 }
+          }
         }
       );
 
+      // Rule 3: An ambiguous send is never resubmitted, requeued or released from the contact cap!
       await updateContactReservationStatus(tenantId, customer.phone, executionId, 'UNKNOWN');
       logger.warn({ executionId }, 'Message outcome unknown; awaiting webhook correlation');
       return 'OUTCOME_UNKNOWN';
     }
 
+    // Proven Non-Acceptance / Rejection
+    // Release contact reservation on proven non-acceptance (Spec p.18, C08)
+    await updateContactReservationStatus(tenantId, customer.phone, executionId, 'RELEASED');
+
+    // Check if error is a documented retryable throttle/error (Spec reference M4, test C08)
+    const isRetryable = isRetryableThrottleError(sendResult.errorCode);
+    const MAX_RETRIES = 3;
+
+    if (isRetryable && execution.retryCount < MAX_RETRIES) {
+      // Exponential backoff: 60s, 120s, 240s
+      const backoffMs = Math.min(30 * 60 * 1000, 60 * 1000 * Math.pow(2, execution.retryCount));
+      const retryAt = new Date(serverNow.getTime() + backoffMs);
+
+      // Test C09: Expiry reached during retry delay -> mark expired
+      if (retryAt >= execution.expiresAt) {
+        if (refreshedIntent) {
+          refreshedIntent.state = 'REJECTED';
+          refreshedIntent.errorCode = 'EXPIRED_DURING_RETRY';
+          await refreshedIntent.save();
+        }
+
+        await CampaignExecutionModel.findOneAndUpdate(
+          { id: executionId, tenantId, state: 'DISPATCHING' },
+          {
+            $set: {
+              state: 'SKIPPED',
+              outcomeReason: 'STEP_EXPIRED',
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          }
+        );
+        logger.info({ executionId }, 'Step expired during retry backoff interval');
+        return 'SKIPPED';
+      }
+
+      // Enter RETRY_WAIT reusing the same frozen intent and delivery key (C08)
+      if (refreshedIntent) {
+        refreshedIntent.state = 'REJECTED';
+        refreshedIntent.errorCode = sendResult.errorCode || 'THROTTLED';
+        await refreshedIntent.save();
+      }
+
+      await CampaignExecutionModel.findOneAndUpdate(
+        { id: executionId, tenantId, state: 'DISPATCHING' },
+        {
+          $set: {
+            state: 'RETRY_WAIT',
+            dueAt: retryAt,
+            retryAt,
+            outcomeReason: 'RETRY_WAIT',
+            'lease.token': null,
+            'lease.until': null,
+            'lease.claimedBy': null
+          },
+          $inc: { retryCount: 1 }
+        }
+      );
+
+      logger.info({ executionId, retryAt, retryCount: execution.retryCount + 1 }, 'Scheduled safe retry for throttled message');
+      return 'RETRY_WAIT';
+    }
+
     // Permanent Rejection
-    deliveryIntent.state = 'REJECTED';
-    deliveryIntent.errorCode = sendResult.errorCode || 'UNKNOWN_ERROR';
-    await deliveryIntent.save();
+    if (refreshedIntent) {
+      refreshedIntent.state = 'REJECTED';
+      refreshedIntent.errorCode = sendResult.errorCode || 'UNKNOWN_ERROR';
+      await refreshedIntent.save();
+    }
 
     await CampaignExecutionModel.findOneAndUpdate(
-      { id: executionId, state: 'DISPATCHING', planRevision: dispatching.planRevision },
+      { id: executionId, tenantId, state: 'DISPATCHING' },
       {
         $set: {
           state: 'FAILED',
@@ -298,12 +561,10 @@ export async function processClaimedExecution(
           'lease.token': null,
           'lease.until': null,
           'lease.claimedBy': null
-        },
-        $inc: { planRevision: 1 }
+        }
       }
     );
 
-    await updateContactReservationStatus(tenantId, customer.phone, executionId, 'RELEASED');
     logger.error({ executionId, error: sendResult.errorMessage }, 'Message permanently rejected by provider');
     return 'FAILED';
   } catch (err) {
@@ -315,8 +576,7 @@ export async function processClaimedExecution(
           'lease.token': null,
           'lease.until': null,
           'lease.claimedBy': null
-        },
-        $inc: { planRevision: 1 }
+        }
       }
     );
     return 'FAILED';
@@ -324,7 +584,7 @@ export async function processClaimedExecution(
 }
 
 /**
- * Runs a single polling cycle over due executions
+ * Runs a single polling cycle over due executions for one tenant
  */
 export async function runDispatchCycle(
   tenantId: string,
@@ -338,6 +598,8 @@ export async function runDispatchCycle(
     skippedCount: 0,
     deferredCount: 0,
     unknownCount: 0,
+    retryWaitCount: 0,
+    blockedCount: 0,
     failedCount: 0
   };
 
@@ -352,6 +614,8 @@ export async function runDispatchCycle(
     else if (outcome === 'SKIPPED') result.skippedCount++;
     else if (outcome === 'DEFERRED') result.deferredCount++;
     else if (outcome === 'OUTCOME_UNKNOWN') result.unknownCount++;
+    else if (outcome === 'RETRY_WAIT') result.retryWaitCount++;
+    else if (outcome === 'BLOCKED') result.blockedCount++;
     else if (outcome === 'FAILED') result.failedCount++;
   }
 
@@ -379,7 +643,7 @@ async function recipientPhoneOf(intent: ICampaignDeliveryIntent | null): Promise
 }
 
 /**
- * Moves stale DISPATCHING attempts to OUTCOME_UNKNOWN (Handoff p.27).
+ * Moves stale DISPATCHING attempts to OUTCOME_UNKNOWN (Handoff p.27, test C07).
  * A crashed worker is indistinguishable from a lost response, so the outcome is UNKNOWN, never requeued.
  * The contact reservation stays held; only proven non-acceptance may release it.
  */
@@ -399,18 +663,19 @@ export async function sweepStaleDispatching(
 
   for (const exec of stale) {
     const moved = await CampaignExecutionModel.findOneAndUpdate(
-      { id: exec.id, tenantId, state: 'DISPATCHING', planRevision: exec.planRevision },
+      { id: exec.id, tenantId, state: 'DISPATCHING' },
       {
         $set: {
           state: 'OUTCOME_UNKNOWN',
           outcomeReason: 'DISPATCH_INTERRUPTED',
-          'lease.token': null, 'lease.until': null, 'lease.claimedBy': null
-        },
-        $inc: { planRevision: 1 }
+          'lease.token': null,
+          'lease.until': null,
+          'lease.claimedBy': null
+        }
       },
       { new: true }
     );
-    if (!moved) continue; // original worker finished meanwhile; leave it alone
+    if (!moved) continue;
 
     const intent = exec.deliveryIntentId
       ? await CampaignDeliveryIntentModel.findOne({ id: exec.deliveryIntentId, tenantId }).exec()
@@ -427,8 +692,8 @@ export async function sweepStaleDispatching(
 }
 
 /**
- * Reconciles OUTCOME_UNKNOWN executions from provider EVIDENCE only.
- * NEVER requeues, retries, fails, or releases the contact reservation (tests C06/C07/C13).
+ * Reconciles OUTCOME_UNKNOWN executions from provider EVIDENCE only (tests C06, C07, C12, C13).
+ * NEVER requeues, retries, fails, or releases the contact reservation without evidence.
  */
 export async function sweepOutcomeUnknownExecutions(
   tenantId: string,
@@ -441,7 +706,10 @@ export async function sweepOutcomeUnknownExecutions(
     const intent = exec.deliveryIntentId
       ? await CampaignDeliveryIntentModel.findOne({ id: exec.deliveryIntentId, tenantId }).exec()
       : null;
-    if (!intent) { result.stillUnknown++; continue; }
+    if (!intent) {
+      result.stillUnknown++;
+      continue;
+    }
 
     const phone = await recipientPhoneOf(intent);
     const byIntentReceipt = Boolean(intent.deliveredAt || intent.readAt);
@@ -450,23 +718,25 @@ export async function sweepOutcomeUnknownExecutions(
       ? null
       : await CampaignEventInboxModel.findOne({
           tenantId,
-          entityId: exec.id,
-          type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read'] }
+          type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read'] },
+          $or: [
+            { entityId: exec.id },
+            { 'data.providerMessageId': intent.providerMessageId }
+          ]
         }).sort({ occurredAt: -1 }).exec();
 
     if (byIntentReceipt || statusEvent) {
       const isRead = byIntentReceipt ? Boolean(intent.readAt) : statusEvent!.type === 'whatsapp.status.read';
       const deliveredAt = byIntentReceipt ? intent.deliveredAt ?? intent.readAt : statusEvent!.occurredAt;
       const moved = await CampaignExecutionModel.findOneAndUpdate(
-        { id: exec.id, tenantId, state: 'OUTCOME_UNKNOWN', planRevision: exec.planRevision },
+        { id: exec.id, tenantId, state: 'OUTCOME_UNKNOWN' },
         {
           $set: {
             state: isRead ? 'READ' : 'DELIVERED',
             deliveredAt,
             readAt: isRead ? (byIntentReceipt ? intent.readAt : statusEvent!.occurredAt) : null,
             outcomeReason: null
-          },
-          $inc: { planRevision: 1 }
+          }
         }
       );
       if (moved) {
@@ -478,8 +748,8 @@ export async function sweepOutcomeUnknownExecutions(
 
     if (intent.state === 'ACCEPTED' && intent.providerMessageId) {
       const moved = await CampaignExecutionModel.findOneAndUpdate(
-        { id: exec.id, tenantId, state: 'OUTCOME_UNKNOWN', planRevision: exec.planRevision },
-        { $set: { state: 'PROVIDER_ACCEPTED', outcomeReason: null }, $inc: { planRevision: 1 } }
+        { id: exec.id, tenantId, state: 'OUTCOME_UNKNOWN' },
+        { $set: { state: 'PROVIDER_ACCEPTED', outcomeReason: null } }
       );
       if (moved) {
         if (phone) await updateContactReservationStatus(tenantId, phone, exec.id, 'ACCEPTED');
@@ -493,4 +763,3 @@ export async function sweepOutcomeUnknownExecutions(
   }
   return result;
 }
-

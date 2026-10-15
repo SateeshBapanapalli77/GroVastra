@@ -10,6 +10,8 @@ export type ExecutionState =
   | 'OUTCOME_UNKNOWN'
   | 'SKIPPED'
   | 'DEFERRED'
+  | 'RETRY_WAIT'
+  | 'BLOCKED'
   | 'FAILED';
 
 export interface ICampaignExecution extends Document {
@@ -23,7 +25,8 @@ export interface ICampaignExecution extends Document {
   localDate: string; // 'YYYY-MM-DD'
   localTime: string; // '10:00'
   timezone: string; // 'Asia/Kolkata'
-  planRevision: number; // CAS revision counter
+  planRevision: number; // Date-plan replan counter only (Page 20 & 25)
+  claimVersion: number; // Worker claim fence counter (increments on claim)
   pauseGeneration: number; // Fencing token matching campaign.pauseGeneration
   state: ExecutionState;
   prerequisite: 'NONE' | 'PREVIOUS_ACCEPTED';
@@ -55,6 +58,7 @@ const CampaignExecutionSchema = new Schema<ICampaignExecution>(
     localTime: { type: String, required: true },
     timezone: { type: String, required: true, default: 'Asia/Kolkata' },
     planRevision: { type: Number, required: true, default: 1 },
+    claimVersion: { type: Number, required: true, default: 0 },
     pauseGeneration: { type: Number, required: true, default: 0 },
     state: {
       type: String,
@@ -69,6 +73,8 @@ const CampaignExecutionSchema = new Schema<ICampaignExecution>(
         'OUTCOME_UNKNOWN',
         'SKIPPED',
         'DEFERRED',
+        'RETRY_WAIT',
+        'BLOCKED',
         'FAILED'
       ],
       default: 'SCHEDULED'

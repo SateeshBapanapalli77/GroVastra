@@ -1,6 +1,9 @@
-import { CampaignContactGateModel, IContactReservation } from '../../models/CampaignContactGate.model';
+import mongoose, { ClientSession } from 'mongoose';
+import { CampaignContactGateModel, IContactReservation, ICampaignContactGate } from '../../models/CampaignContactGate.model';
+import { CampaignExecutionModel } from '../../models/CampaignExecution.model';
 import { sha256 } from '../../../../shared/utils/crypto';
 import { generateId } from '../../../../shared/utils/id';
+import { normalizeE164 } from '../../../../shared/utils/phone';
 import { DateTime } from 'luxon';
 import { logger } from '../../../../config/logger';
 
@@ -11,14 +14,10 @@ export interface CapCheckResult {
   gateId?: string;
 }
 
-import mongoose from 'mongoose';
-
-// In-memory fallback cache for fast unit tests when offline / DB disconnected
-const inMemoryGates: Map<string, any> = new Map();
-
 /**
  * Enforces destination-level rolling contact caps (1 per 24h, 3 per 7d)
- * and arbitrates priority across competing campaigns. (Handoff Page 18)
+ * and arbitrates priority across competing campaigns (Handoff p.18, tests B09, B10).
+ * Destination cap is enforced across duplicate CRM records sharing a phone number.
  */
 export async function checkAndReserveContactCapacity(
   tenantId: string,
@@ -27,41 +26,35 @@ export async function checkAndReserveContactCapacity(
   executionId: string,
   expiresAt: Date,
   priority: number = 80,
-  serverNow: Date = new Date()
+  serverNow: Date = new Date(),
+  session?: ClientSession
 ): Promise<CapCheckResult> {
-  const destinationHash = sha256(destinationPhone);
-  const isDbConnected = mongoose.connection.readyState === 1;
+  const canonicalPhone = normalizeE164(destinationPhone);
+  const destinationHash = sha256(canonicalPhone);
 
-  let gate: any = null;
-
-  if (isDbConnected) {
-    gate = await CampaignContactGateModel.findOne({ tenantId, destinationHash });
-    if (!gate) {
-      try {
-        gate = await CampaignContactGateModel.create({
-          id: generateId('cg'),
-          tenantId,
-          destinationHash,
-          version: 1,
-          history: []
-        });
-      } catch (err) {
-        gate = await CampaignContactGateModel.findOne({ tenantId, destinationHash });
+  let gate = await CampaignContactGateModel.findOne({ tenantId, destinationHash }).session(session || null);
+  if (!gate) {
+    try {
+      const created = await CampaignContactGateModel.create(
+        [
+          {
+            id: generateId('cg'),
+            tenantId,
+            destinationHash,
+            version: 1,
+            history: []
+          }
+        ],
+        session ? { session } : {}
+      );
+      gate = created[0];
+    } catch (err: any) {
+      if (err.code === 11000) {
+        gate = await CampaignContactGateModel.findOne({ tenantId, destinationHash }).session(session || null);
+      } else {
+        throw err;
       }
     }
-  } else {
-    // In-memory mode for unit testing
-    const cacheKey = `${tenantId}:${destinationHash}`;
-    if (!inMemoryGates.has(cacheKey)) {
-      inMemoryGates.set(cacheKey, {
-        id: generateId('cg'),
-        tenantId,
-        destinationHash,
-        version: 1,
-        history: []
-      });
-    }
-    gate = inMemoryGates.get(cacheKey);
   }
 
   if (!gate) {
@@ -72,20 +65,40 @@ export async function checkAndReserveContactCapacity(
   const cutoff24h = nowDt.minus({ hours: 24 }).toJSDate();
   const cutoff7d = nowDt.minus({ days: 7 }).toJSDate();
 
-  // Active entries in rolling windows (exclude released and displaced entries)
+  // Active entries in rolling windows (counting RESERVED, ACCEPTED, and UNKNOWN)
+  // Spec p.18: Keep one rolling contact-ledger entry per execution; count reserved, accepted and unknown.
+  // Only proven non-acceptance releases that attempt's reservation (to RELEASED or DISPLACED).
   const validHistory: IContactReservation[] = (gate.history || []).filter(
     (h: IContactReservation) => h.status !== 'RELEASED' && h.status !== 'DISPLACED'
   );
 
+  // If this exact execution is retrying safely, reuse its existing reservation slot (C08, C20)
+  const existingSelf = validHistory.find((h: IContactReservation) => h.executionId === executionId);
+  if (existingSelf) {
+    existingSelf.reservedAt = serverNow;
+    existingSelf.expiresAt = expiresAt;
+    existingSelf.priority = priority;
+    existingSelf.status = 'RESERVED';
+    gate.version += 1;
+    await gate.save(session ? { session } : undefined);
+    return { allowed: true, gateId: gate.id };
+  }
+
   const contactsIn24h = validHistory.filter((h: IContactReservation) => h.reservedAt > cutoff24h);
   const contactsIn7d = validHistory.filter((h: IContactReservation) => h.reservedAt > cutoff7d);
 
-  // Cap Rule 1: Max 1 per rolling 24h with Priority Arbitration (Page 18)
+  // Cap Rule 1: Max 1 marketing contact per rolling 24h with Collision Arbitration (Spec p.18, test B09)
   if (contactsIn24h.length >= 1) {
-    // Check if the occupying reservation can be displaced by higher priority
-    const displaceable = contactsIn24h.find(
-      (h: IContactReservation) => h.status === 'RESERVED' && priority > (h.priority ?? 50)
-    );
+    // Collision arbitration: priority, then earliest expiry, then stable creation/ID order
+    const displaceable = contactsIn24h.find((h: IContactReservation) => {
+      if (h.status !== 'RESERVED') return false; // Cannot displace already accepted or unknown
+      if (priority > (h.priority ?? 50)) return true;
+      if (priority === (h.priority ?? 50)) {
+        if (expiresAt.getTime() < h.expiresAt.getTime()) return true;
+        if (expiresAt.getTime() === h.expiresAt.getTime() && executionId < h.executionId) return true;
+      }
+      return false;
+    });
 
     if (displaceable) {
       logger.info(
@@ -99,10 +112,34 @@ export async function checkAndReserveContactCapacity(
       );
 
       displaceable.status = 'DISPLACED';
+
+      // Defer the loser if still useful, otherwise mark skipped
+      const displacedNextAvailable = new Date(serverNow.getTime() + 24 * 60 * 60 * 1000 + 1000);
+      const loserIsUseful = displacedNextAvailable < displaceable.expiresAt;
+
+      await CampaignExecutionModel.updateOne(
+        { id: displaceable.executionId, tenantId },
+        {
+          $set: {
+            state: loserIsUseful ? 'DEFERRED' : 'SKIPPED',
+            outcomeReason: loserIsUseful ? 'DEFERRED_CONTACT_CAP' : 'SKIPPED_CONTACT_CAP',
+            dueAt: loserIsUseful ? displacedNextAvailable : undefined,
+            'lease.token': null,
+            'lease.until': null,
+            'lease.claimedBy': null
+          }
+        },
+        session ? { session } : {}
+      );
     } else {
       const earliestRelease = new Date(contactsIn24h[0].reservedAt.getTime() + 24 * 60 * 60 * 1000 + 1000);
       logger.info(
-        { executionId, destinationHash: destinationHash.slice(0, 8), contactsIn24h: contactsIn24h.length, priority },
+        {
+          executionId,
+          destinationHash: destinationHash.slice(0, 8),
+          contactsIn24h: contactsIn24h.length,
+          priority
+        },
         'Contact cap 1/24h exceeded and no lower priority reservation could be displaced'
       );
 
@@ -120,9 +157,11 @@ export async function checkAndReserveContactCapacity(
     }
   }
 
-  // Cap Rule 2: Max 3 per rolling 7d
+  // Cap Rule 2: Max 3 marketing contacts per rolling 7d (Spec p.18)
   if (contactsIn7d.length >= 3) {
-    const oldestIn7d = contactsIn7d.sort((a: IContactReservation, b: IContactReservation) => a.reservedAt.getTime() - b.reservedAt.getTime())[0];
+    const oldestIn7d = [...contactsIn7d].sort(
+      (a: IContactReservation, b: IContactReservation) => a.reservedAt.getTime() - b.reservedAt.getTime()
+    )[0];
     const earliestRelease = new Date(oldestIn7d.reservedAt.getTime() + 7 * 24 * 60 * 60 * 1000 + 1000);
     logger.info(
       { executionId, destinationHash: destinationHash.slice(0, 8), contactsIn7d: contactsIn7d.length },
@@ -154,9 +193,7 @@ export async function checkAndReserveContactCapacity(
 
   gate.history.push(newReservation);
   gate.version += 1;
-  if (typeof gate.save === 'function') {
-    await gate.save();
-  }
+  await gate.save(session ? { session } : undefined);
 
   logger.debug(
     { executionId, destinationHash: destinationHash.slice(0, 8), priority },
@@ -170,36 +207,26 @@ export async function checkAndReserveContactCapacity(
 }
 
 /**
- * Confirms or releases a reservation upon provider response
+ * Confirms or releases a reservation upon provider response (Spec p.18)
  */
 export async function updateContactReservationStatus(
   tenantId: string,
   destinationPhone: string,
   executionId: string,
-  status: 'ACCEPTED' | 'UNKNOWN' | 'RELEASED'
+  status: 'ACCEPTED' | 'UNKNOWN' | 'RELEASED',
+  session?: ClientSession
 ): Promise<void> {
-  const destinationHash = sha256(destinationPhone);
-  const isDbConnected = mongoose.connection.readyState === 1;
+  const canonicalPhone = normalizeE164(destinationPhone);
+  const destinationHash = sha256(canonicalPhone);
 
-  if (isDbConnected) {
-    await CampaignContactGateModel.updateOne(
-      { tenantId, destinationHash, 'history.executionId': executionId },
-      {
-        $set: {
-          'history.$.status': status
-        },
-        $inc: { version: 1 }
-      }
-    );
-  } else {
-    const cacheKey = `${tenantId}:${destinationHash}`;
-    const gate = inMemoryGates.get(cacheKey);
-    if (gate) {
-      const reservation = gate.history.find((h: any) => h.executionId === executionId);
-      if (reservation) {
-        reservation.status = status;
-      }
-      gate.version += 1;
-    }
-  }
+  await CampaignContactGateModel.updateOne(
+    { tenantId, destinationHash, 'history.executionId': executionId },
+    {
+      $set: {
+        'history.$.status': status
+      },
+      $inc: { version: 1 }
+    },
+    session ? { session } : {}
+  );
 }

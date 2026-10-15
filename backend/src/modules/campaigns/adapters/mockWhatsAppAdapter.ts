@@ -5,7 +5,7 @@ import { ulid } from 'ulid';
 
 export class MockWhatsAppDeliveryAdapter implements IWhatsAppDeliveryAdapter {
   private submissions: SendCampaignStepParams[] = [];
-  private forcedState: 'AUTO' | 'FORCE_REJECT' | 'FORCE_TIMEOUT' = 'AUTO';
+  private forcedState: 'AUTO' | 'FORCE_REJECT' | 'FORCE_TIMEOUT' | 'FORCE_THROTTLE' = 'AUTO';
 
   async sendCampaignStep(params: SendCampaignStepParams): Promise<SendStepResult> {
     this.submissions.push(params);
@@ -55,6 +55,15 @@ export class MockWhatsAppDeliveryAdapter implements IWhatsAppDeliveryAdapter {
         state: 'OUTCOME_UNKNOWN',
         errorCode: 'NETWORK_TIMEOUT',
         errorMessage: 'Simulated network timeout during provider call'
+      };
+    }
+
+    if (this.forcedState === 'FORCE_THROTTLE') {
+      return {
+        success: false,
+        state: 'REJECTED',
+        errorCode: '130429',
+        errorMessage: 'Simulated Meta Cloud API throughput rate limit hit (130429)'
       };
     }
 

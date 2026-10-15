@@ -26,7 +26,6 @@ const TenantConnectionSchema = new Schema<ITenantConnection>(
   }
 );
 
-TenantConnectionSchema.index({ connectionId: 1 }, { unique: true });
 TenantConnectionSchema.index({ tenantId: 1, status: 1 });
 
 export const TenantConnectionModel = mongoose.model<ITenantConnection>(

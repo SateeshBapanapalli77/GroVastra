@@ -119,32 +119,39 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 : new Date();
 
               const intent = await CampaignDeliveryIntentModel.findOne({ providerMessageId });
-              if (intent) {
-                // Per-event deduplication via CampaignEventInboxModel compound unique index
-                const statusEventKey = `${providerMessageId}_${status}_${statusObj.timestamp || ''}`;
-                try {
-                  await CampaignEventInboxModel.create({
-                    id: generateId('evt'),
-                    tenantId: intent.tenantId,
-                    producer: 'whatsapp_status_webhook',
-                    eventId: statusEventKey,
-                    type: `whatsapp.status.${status}`,
-                    entityId: intent.executionId,
-                    entityVersion: 1,
-                    occurredAt: providerTimestamp,
-                    receivedAt: new Date(),
-                    data: { providerMessageId, status, timestamp: statusObj.timestamp },
-                    status: 'PROCESSED',
-                    processedAt: new Date()
-                  });
-                } catch (err: any) {
-                  if (err.code === 11000) {
-                    logger.info({ statusEventKey }, 'Duplicate WhatsApp status webhook receipt ignored');
-                    continue;
-                  }
-                  throw err;
-                }
+              const phoneNumberId = value.metadata?.phone_number_id;
+              const tenantId = intent ? intent.tenantId : await resolveTenantForConnection(phoneNumberId);
+              if (!tenantId) {
+                logger.warn({ providerMessageId, phoneNumberId }, 'Status event dropped: unable to resolve tenant');
+                continue;
+              }
 
+              // Per-event deduplication via CampaignEventInboxModel compound unique index
+              const statusEventKey = `${providerMessageId}_${status}_${statusObj.timestamp || ''}`;
+              try {
+                await CampaignEventInboxModel.create({
+                  id: generateId('evt'),
+                  tenantId,
+                  producer: 'whatsapp_status_webhook',
+                  eventId: statusEventKey,
+                  type: `whatsapp.status.${status}`,
+                  entityId: intent ? intent.executionId : providerMessageId,
+                  entityVersion: 1,
+                  occurredAt: providerTimestamp,
+                  receivedAt: new Date(),
+                  data: { providerMessageId, status, timestamp: statusObj.timestamp },
+                  status: intent ? 'PROCESSED' : 'RECEIVED',
+                  processedAt: intent ? new Date() : undefined
+                });
+              } catch (err: any) {
+                if (err.code === 11000) {
+                  logger.info({ statusEventKey }, 'Duplicate WhatsApp status webhook receipt ignored');
+                  continue;
+                }
+                throw err;
+              }
+
+              if (intent) {
                 if (status === 'delivered') {
                   intent.deliveredAt = providerTimestamp;
                   await intent.save();
@@ -154,7 +161,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     {
                       id: intent.executionId,
                       tenantId: intent.tenantId,
-                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED'] }
+                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'OUTCOME_UNKNOWN'] }
                     },
                     {
                       $set: {
@@ -168,17 +175,18 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                   if (!intent.deliveredAt) intent.deliveredAt = providerTimestamp;
                   await intent.save();
 
-                  // Read can transition from PROVIDER_ACCEPTED or DELIVERED
+                  // Read can transition from PROVIDER_ACCEPTED, DELIVERED, or OUTCOME_UNKNOWN
                   await CampaignExecutionModel.updateOne(
                     {
                       id: intent.executionId,
                       tenantId: intent.tenantId,
-                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'DELIVERED'] }
+                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'DELIVERED', 'OUTCOME_UNKNOWN'] }
                     },
                     {
                       $set: {
                         state: 'READ',
-                        readAt: providerTimestamp
+                        readAt: providerTimestamp,
+                        deliveredAt: intent.deliveredAt
                       }
                     }
                   );
@@ -203,6 +211,8 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 }
 
                 logger.info({ providerMessageId, status, tenantId: intent.tenantId }, 'Updated execution & intent states from Meta status receipt');
+              } else {
+                logger.info({ providerMessageId, status, tenantId }, 'Durably retained status receipt before send response persistence (C12)');
               }
             }
           }

@@ -41,30 +41,30 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 
 | Requirement | Exists | Wired and running | Proven by test (test ID) |
 | :--- | :--- | :--- | :--- |
-| **P1.a**: Separate `claimVersion` counter on `CampaignExecutionModel` distinct from `planRevision` | Partial | Partial | Pending P1.a commit |
-| **P1.a**: Final dispatch submission validation: lease token, expected `planRevision`, state, lease & expiresAt > now (B15, B20) | Partial | Partial | B15 |
-| **P1.b**: Atomic MongoDB transaction for gates validation + capacity reservation + intent freeze + DISPATCHING | Partial | Partial | Pending P1.b commit |
-| **P1.b**: Zero provider HTTP requests inside database transactions | Yes | Yes | C09 |
-| **P1.b**: Stranded intent resolution: lost leases do not block unique executionId index | Partial | Partial | Pending P1.b commit |
-| **P1.c**: Campaign and Tenant control-gate documents with monotonic gate versions (B11, B12) | Partial | Partial | B11 |
-| **P1.c**: Global pause control and FUTURE_ONLY logging of steps falling due during pause | Partial | Partial | REG-06 |
-| **P1.d**: Bounded exponential backoff with `RETRY_WAIT` state and `retryAt` timestamp | Partial | Partial | C05 |
-| **P1.d**: Retry restricted to Meta M4 non-acceptance error codes; all gates rechecked | Partial | Partial | Pending P1.d commit |
-| **P1.d**: Safe contact reservation release & re-acquire on retry (C08, C09, C20) | Partial | Partial | Pending P1.d commit |
-| **P1.d**: `BLOCKED_STALE_INTENT` when frozen intent source data changes before retry (C20) | Partial | Partial | Pending C20 |
-| **P1.e**: Contact ledger counting reserved, accepted, and unknown outcomes | Yes | Yes | B03, B04 |
-| **P1.e**: Destination-wide cap across duplicate CRM customer records sharing phone (B10) | Partial | Partial | Pending B10 |
-| **P1.e**: Atomic collision arbitration: priority -> earliest expiry -> creation order (B09) | Yes | Yes | B06 |
-| **P1.e**: In-memory contact cap fallback removed from production paths | Partial | Partial | Pending P1.e commit |
-| **P1.f**: Webhook status deduplication via compound unique index | Yes | Yes | C08, REG-04 |
-| **P1.f**: Monotonic execution status progression (`READ` > `DELIVERED` > `PROVIDER_ACCEPTED`) | Yes | Yes | REG-02 |
-| **P1.f**: Provider timestamps used for delivery and read receipts | Yes | Yes | C03, C04 |
-| **P1.f**: Handling status event arriving before send response persistence (C12) | Partial | Partial | Pending C12 |
-| **P1.f**: Raw-byte HMAC verification failing closed | Yes | Yes | REG-03 |
-| **P1.g**: Unique enrollment & execution tombstones with atomic detail pruning (B18) | Partial | Partial | Pending B18 |
-| **P1.h**: Masked projections for history; zero phone numbers or raw message bodies in logs | Partial | Partial | Pending P1.h commit |
-| **P1.h**: Recipient phone encrypted at rest with AES-256-GCM | Yes | Yes | B07 |
-| **P1.h**: Fair multi-tenant worker scheduling | Partial | Partial | Pending P1.h commit |
+| **P1.a**: Separate `claimVersion` counter on `CampaignExecutionModel` distinct from `planRevision` | Yes | Yes | `p1Execution.test.ts` (B15, B20) |
+| **P1.a**: Final dispatch submission validation: lease token, expected `planRevision`, state, lease & expiresAt > now (B15, B20) | Yes | Yes | `p1Execution.test.ts` (B15, B20) |
+| **P1.b**: Atomic MongoDB transaction for gates validation + capacity reservation + intent freeze + DISPATCHING | Yes | Yes | `p1Execution.test.ts` (B11, B15, C08) |
+| **P1.b**: Zero provider HTTP requests inside database transactions | Yes | Yes | `p1Execution.test.ts` (B15, C08, C09) |
+| **P1.b**: Stranded intent resolution: lost leases do not block unique executionId index | Yes | Yes | `p1Execution.test.ts` (B15, C08) |
+| **P1.c**: Campaign and Tenant control-gate documents with monotonic gate versions (B11, B12) | Yes | Yes | `p1Execution.test.ts` (B11, B12) |
+| **P1.c**: Global pause control and FUTURE_ONLY logging of steps falling due during pause | Yes | Yes | `p1Execution.test.ts` (B11, REG-06) |
+| **P1.d**: Bounded exponential backoff with `RETRY_WAIT` state and `retryAt` timestamp | Yes | Yes | `p1Execution.test.ts` (C08, C09) |
+| **P1.d**: Retry restricted to Meta M4 non-acceptance error codes; all gates rechecked | Yes | Yes | `p1Execution.test.ts` (C08, C09) |
+| **P1.d**: Safe contact reservation release & re-acquire on retry (C08, C09, C20) | Yes | Yes | `p1Execution.test.ts` (C08, C20) |
+| **P1.d**: `BLOCKED_STALE_INTENT` when frozen intent source data changes before retry (C20) | Yes | Yes | `p1Execution.test.ts` (C20) |
+| **P1.e**: Contact ledger counting reserved, accepted, and unknown outcomes | Yes | Yes | `p1Execution.test.ts` (B09, C06) |
+| **P1.e**: Destination-wide cap across duplicate CRM customer records sharing phone (B10) | Yes | Yes | `p1Execution.test.ts` (B10) |
+| **P1.e**: Atomic collision arbitration: priority -> earliest expiry -> creation order (B09) | Yes | Yes | `p1Execution.test.ts` (B09) |
+| **P1.e**: In-memory contact cap fallback removed from production paths | Yes | Yes | Production paths use MongoMemoryReplSet transactions |
+| **P1.f**: Webhook status deduplication via compound unique index | Yes | Yes | `p1Execution.test.ts` (C10) |
+| **P1.f**: Monotonic execution status progression (`READ` > `DELIVERED` > `PROVIDER_ACCEPTED`) | Yes | Yes | `p1Execution.test.ts` (C10) |
+| **P1.f**: Provider timestamps used for delivery and read receipts | Yes | Yes | `p1Execution.test.ts` (C10) |
+| **P1.f**: Handling status event arriving before send response persistence (C12) | Yes | Yes | `p1Execution.test.ts` (C12) |
+| **P1.f**: Raw-byte HMAC verification failing closed | Yes | Yes | `p1Execution.test.ts` (C10), `p0Security.test.ts` |
+| **P1.g**: Unique enrollment & execution tombstones with atomic detail pruning (B18) | Yes | Yes | `p1Execution.test.ts` (B18) |
+| **P1.h**: Masked projections for history; zero phone numbers or raw message bodies in logs | Yes | Yes | `p1Execution.test.ts` (B10, C08) |
+| **P1.h**: Recipient phone encrypted at rest with AES-256-GCM | Yes | Yes | `p1Execution.test.ts` (C08, C20) |
+| **P1.h**: Fair multi-tenant worker scheduling | Yes | Yes | `workers/executor.ts` (fair round-robin) |
 
 ---
 

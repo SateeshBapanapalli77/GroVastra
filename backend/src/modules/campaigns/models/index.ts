@@ -9,3 +9,6 @@ export * from './CampaignCheckpoint.model';
 export * from './CampaignCustomerFact.model';
 export * from './CampaignDryRun.model';
 export * from './TenantConnection.model';
+export * from './TenantControlGate.model';
+export * from './CampaignControlGate.model';
+export * from './CampaignTombstone.model';
