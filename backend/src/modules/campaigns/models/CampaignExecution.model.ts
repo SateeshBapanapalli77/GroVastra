@@ -24,6 +24,7 @@ export interface ICampaignExecution extends Document {
   localTime: string; // '10:00'
   timezone: string; // 'Asia/Kolkata'
   planRevision: number; // CAS revision counter
+  pauseGeneration: number; // Fencing token matching campaign.pauseGeneration
   state: ExecutionState;
   prerequisite: 'NONE' | 'PREVIOUS_ACCEPTED';
   deliveryIntentId: string | null;
@@ -54,6 +55,7 @@ const CampaignExecutionSchema = new Schema<ICampaignExecution>(
     localTime: { type: String, required: true },
     timezone: { type: String, required: true, default: 'Asia/Kolkata' },
     planRevision: { type: Number, required: true, default: 1 },
+    pauseGeneration: { type: Number, required: true, default: 0 },
     state: {
       type: String,
       required: true,

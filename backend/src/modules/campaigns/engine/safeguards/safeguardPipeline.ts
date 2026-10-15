@@ -40,10 +40,14 @@ export async function executePreflightSafeguards(
   }
 
   if (
-    typeof (execution as any).pauseGeneration === 'number' &&
-    (execution as any).pauseGeneration < campaign.pauseGeneration
+    typeof execution.pauseGeneration === 'number' &&
+    execution.pauseGeneration !== campaign.pauseGeneration
   ) {
-    return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_PAUSED' };
+    return {
+      status: 'DEFER',
+      reason: 'DEFERRED_PAUSE_GENERATION_MISMATCH',
+      nextDueAt: new Date(serverNow.getTime() + 60 * 1000)
+    };
   }
 
   const enrollment = await CampaignEnrollmentModel.findOne({ id: enrollmentId, tenantId });

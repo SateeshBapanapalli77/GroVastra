@@ -44,10 +44,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
             <div className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
             <div className="truncate">
               <div className="text-xs font-semibold text-[#271E1B] truncate">
-                Padmavati Handlooms
+                GroVastra Boutique
               </div>
               <div className="text-[10px] text-[#6B5E59] truncate">
-                Kukatpally, Hyderabad
+                Flagship Store • Hyderabad
               </div>
             </div>
           </div>

@@ -50,7 +50,7 @@ export const Header: React.FC<HeaderProps> = ({ breadcrumbs }) => {
         {/* Support note */}
         <div className="text-[10px] text-[#988B86] hidden xl:block text-right">
           Managed by GroVastra Integration Support for
-          <span className="block font-semibold text-[#6B5E59]">Padmavati Handlooms</span>
+          <span className="block font-semibold text-[#6B5E59]">Active Boutique Store</span>
         </div>
 
         {/* Help icon */}

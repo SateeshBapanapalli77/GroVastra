@@ -1,8 +1,10 @@
 import { DateTime } from 'luxon';
 import { CustomerModel, ICustomer } from '../../crm/models/Customer.model';
+import { CampaignModel } from '../models/Campaign.model';
 import { CampaignVersionModel, ICampaignVersion } from '../models/CampaignVersion.model';
 import { CampaignEnrollmentModel } from '../models/CampaignEnrollment.model';
 import { CampaignExecutionModel } from '../models/CampaignExecution.model';
+import { matchesAudienceRules } from './audienceEngine';
 import { generateId } from '../../../shared/utils/id';
 import {
   resolveNextAnnualOccurrence,
@@ -82,6 +84,13 @@ export async function planAnnualOccasions(
       continue;
     }
 
+    // Evaluate Audience Rules (Handoff Page 15)
+    if (!matchesAudienceRules(customer as any, version.audience as any)) {
+      skippedCount++;
+      continue;
+    }
+
+    const campaign = await CampaignModel.findOne({ id: campaignId, tenantId });
     const occurrencePrefix = isBirthday ? 'birthday' : 'anniversary';
     const occurrenceId = `${occurrencePrefix}:${occurrence.occurrenceId}`;
 
@@ -117,9 +126,16 @@ export async function planAnnualOccasions(
       plannedEnrollments++;
     }
 
+    // Version Pinning: Existing active enrollments stay pinned to their original campaignVersionId
+    let effectiveVersion = version;
+    if (!isNewEnrollment && enrollment.campaignVersionId !== version.id) {
+      const pinned = await CampaignVersionModel.findOne({ id: enrollment.campaignVersionId, tenantId });
+      if (pinned) effectiveVersion = pinned;
+    }
+
     // Upsert CampaignExecutions for each step in this campaign version
     let stepsPlannedForCustomer = 0;
-    for (const step of version.steps) {
+    for (const step of effectiveVersion.steps) {
       const existingExecution = await CampaignExecutionModel.findOne({
         tenantId,
         enrollmentId: enrollment.id,
@@ -149,6 +165,7 @@ export async function planAnnualOccasions(
           localTime: timing.localTime,
           timezone,
           planRevision: 1,
+          pauseGeneration: campaign?.pauseGeneration ?? 0,
           state: 'SCHEDULED',
           prerequisite: step.prerequisite,
           deliveryIntentId: null,

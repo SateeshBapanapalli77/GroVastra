@@ -13,9 +13,20 @@ const envSchema = z.object({
   WHATSAPP_MODE: z.enum(['mock', 'sandbox', 'live']).default('mock'),
   WHATSAPP_PHONE_NUMBER_ID: z.string().optional(),
   WHATSAPP_ACCESS_TOKEN: z.string().optional(),
-  WHATSAPP_APP_SECRET: z.string().default('grovastra_meta_app_secret_test_key_2026'),
+  WHATSAPP_APP_SECRET: z.string().optional(),
   WHATSAPP_WEBHOOK_VERIFY_TOKEN: z.string().default('grovastra_verify_token_2026'),
-  INTERNAL_API_KEY: z.string().default('grovastra_internal_secret_key_2026')
-});
+  INTERNAL_API_KEY: z.string().optional(),
+  JWT_SECRET: z.string().default('grovastra_jwt_signing_secret_boutique_2026')
+}).refine(
+  (data) => {
+    if (data.NODE_ENV === 'production') {
+      return Boolean(data.WHATSAPP_APP_SECRET && data.INTERNAL_API_KEY);
+    }
+    return true;
+  },
+  {
+    message: 'WHATSAPP_APP_SECRET and INTERNAL_API_KEY are strictly mandatory in production environments.'
+  }
+);
 
 export const env = envSchema.parse(process.env);

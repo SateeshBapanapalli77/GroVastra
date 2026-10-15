@@ -9,6 +9,7 @@
     "worker:executor": "tsx watch src/workers/executor.ts",
     "worker:events": "tsx watch src/workers/events.ts",
     "build": "tsc",
+    "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
     "test": "vitest run",
     "seed": "tsx src/scripts/seed.ts"

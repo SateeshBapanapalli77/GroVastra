@@ -65,7 +65,7 @@ export const CampaignStudio: React.FC<{
       prerequisite: 'NONE',
       templateId: campaignType === 'birthday' ? 'tpl_birthday_invite' : 'tpl_anniversary_invite',
       templateRevision: 3,
-      bindings: { name: 'customer.firstName', shop: 'Padmavati Handlooms' },
+      bindings: { name: 'customer.firstName', shop: 'shop.displayName' },
       stopOnReply: true,
       stopOnGoal: true
     },

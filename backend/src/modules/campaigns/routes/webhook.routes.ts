@@ -55,13 +55,28 @@ export function verifyMetaSignature(
 }
 
 /**
+ * Constant-time string comparison preventing timing side-channel attacks
+ */
+export function timingSafeCompare(a: string | undefined, b: string | undefined): boolean {
+  if (!a || !b) return false;
+  const bufA = Buffer.from(a);
+  const bufB = Buffer.from(b);
+  if (bufA.length !== bufB.length) return false;
+  try {
+    return crypto.timingSafeEqual(bufA, bufB);
+  } catch {
+    return false;
+  }
+}
+
+/**
  * POST /api/v1/webhooks/whatsapp
  * Ingests Meta WhatsApp Cloud API delivery receipts, read statuses, and customer replies
  */
 webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => {
   try {
     // 1. Verify HMAC Signature (Fail-closed: requires secret and valid signature)
-    const secret = env.WHATSAPP_APP_SECRET;
+    const secret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET;
     if (!secret) {
       logger.error('WhatsApp webhook secret is not configured; rejecting request (fail-closed)');
       return res.status(500).json({ success: false, error: 'Webhook secret is not configured' });
@@ -185,24 +200,26 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
           // Process Inbound Customer Replies -> Triggers stopOnReply weaver hold!
           if (Array.isArray(value.messages)) {
+            const tenantId = (req as any).tenantId || env.DEFAULT_TENANT_ID;
             for (const msg of value.messages) {
               const rawFrom = msg.from; // e.g. '919876543210'
               const textBody = msg.text?.body || msg.button?.text || '';
               const normalizedPhone = rawFrom.startsWith('+') ? rawFrom : `+${rawFrom}`;
 
-              // Find customer by phone or stripped phone
+              // Strictly tenant-scoped customer lookup by E.164 phone
               const customer = await CustomerModel.findOne({
-                $or: [{ phone: normalizedPhone }, { phone: rawFrom }, { phone: rawFrom.replace(/^91/, '') }]
+                tenantId,
+                phone: normalizedPhone
               });
 
               if (customer) {
                 await CampaignEnrollmentModel.updateMany(
-                  { customerId: customer.id, status: 'ACTIVE' },
+                  { customerId: customer.id, tenantId, status: 'ACTIVE' },
                   { $set: { replyHoldAt: new Date() } }
                 );
 
                 logger.info(
-                  { customerId: customer.id, phone: normalizedPhone },
+                  { customerId: customer.id, tenantId, phone: normalizedPhone },
                   'Inbound WhatsApp message received: activated human weaver hold on enrollments'
                 );
 
@@ -210,7 +227,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                   schemaVersion: 1,
                   producer: 'whatsapp',
                   eventId: generateId('evt'),
-                  tenantId: customer.tenantId,
+                  tenantId,
                   type: 'customer.replied',
                   entityId: customer.id,
                   entityVersion: 1,
@@ -239,7 +256,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
           await intent.save();
 
           await CampaignExecutionModel.updateOne(
-            { id: intent.executionId },
+            { id: intent.executionId, tenantId: intent.tenantId },
             { $set: { state: 'DELIVERED', deliveredAt: new Date() } }
           );
         } else if (status === 'read') {
@@ -248,7 +265,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
           await intent.save();
 
           await CampaignExecutionModel.updateOne(
-            { id: intent.executionId },
+            { id: intent.executionId, tenantId: intent.tenantId },
             { $set: { state: 'READ', readAt: new Date() } }
           );
         }
@@ -257,18 +274,21 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     }
 
     if (customerPhone && messageText) {
+      const normalizedPhone = customerPhone.startsWith('+') ? customerPhone : `+${customerPhone}`;
+      const tenantId = (req as any).tenantId || env.DEFAULT_TENANT_ID;
       const customer = await CustomerModel.findOne({
-        $or: [{ phone: customerPhone }, { phone: customerPhone.replace(/^\+/, '') }]
+        tenantId,
+        phone: normalizedPhone
       });
 
       if (customer) {
         await CampaignEnrollmentModel.updateMany(
-          { customerId: customer.id, status: 'ACTIVE' },
+          { customerId: customer.id, tenantId, status: 'ACTIVE' },
           { $set: { replyHoldAt: new Date() } }
         );
 
         logger.info(
-          { customerId: customer.id },
+          { customerId: customer.id, tenantId },
           'Customer replied via flat test payload; set replyHoldAt on active enrollments'
         );
 
@@ -276,14 +296,14 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
           schemaVersion: 1,
           producer: 'whatsapp',
           eventId: generateId('evt'),
-          tenantId: customer.tenantId,
+          tenantId,
           type: 'customer.replied',
           entityId: customer.id,
           entityVersion: 1,
           occurredAt: new Date(),
           receivedAt: new Date(),
           customerId: customer.id,
-          data: { phone: customerPhone, text: messageText }
+          data: { phone: normalizedPhone, text: messageText }
         });
       }
     }
@@ -301,13 +321,15 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
  */
 webhookRouter.post('/internal/campaign-events', async (req: Request, res: Response) => {
   try {
-    // 1. Authenticate Internal Service Key (fail closed)
+    // 1. Authenticate Internal Service Key (fail closed & constant-time)
     const internalKey =
       (req.headers['x-internal-api-key'] as string) ||
       (req.headers['authorization'] as string)?.replace(/^Bearer\s+/i, '');
 
-    if (!internalKey || internalKey !== env.INTERNAL_API_KEY) {
-      logger.warn({ internalKey }, 'Unauthorized attempt to access /internal/campaign-events');
+    const configuredKey = env.INTERNAL_API_KEY || process.env.INTERNAL_API_KEY;
+
+    if (!internalKey || !configuredKey || !timingSafeCompare(internalKey, configuredKey)) {
+      logger.warn({ ip: req.ip, path: req.path }, 'Unauthorized attempt to access /internal/campaign-events');
       return res.status(401).json({ success: false, error: 'Unauthorized internal service call' });
     }
 
@@ -343,14 +365,21 @@ webhookRouter.post('/internal/campaign-events', async (req: Request, res: Respon
       });
     } catch (err: any) {
       if (err.code === 11000) {
-        // Atomic duplicate catch: Page 25 spec
-        return res.status(200).json({
-          success: true,
-          message: 'Event already ingested (idempotent duplicate)',
-          eventId: id
-        });
+        // Atomic duplicate catch: check existing processing state
+        const existing = await CampaignEventInboxModel.findOne({ tenantId, producer: producerName, eventId: id });
+        if (existing && existing.status === 'PROCESSED') {
+          return res.status(200).json({
+            success: true,
+            message: 'Event already ingested and processed (idempotent duplicate)',
+            eventId: id,
+            status: 'PROCESSED'
+          });
+        }
+        // If existing is still RECEIVED or FAILED, continue to durable dispatch below
+        inboxEvent = existing;
+      } else {
+        throw err;
       }
-      throw err;
     }
 
     // 4. Durable Event Bus Dispatch (only marks PROCESSED after dispatch)
@@ -368,9 +397,11 @@ webhookRouter.post('/internal/campaign-events', async (req: Request, res: Respon
       data: data || {}
     });
 
-    inboxEvent.status = 'PROCESSED';
-    inboxEvent.processedAt = new Date();
-    await inboxEvent.save();
+    if (inboxEvent) {
+      inboxEvent.status = 'PROCESSED';
+      inboxEvent.processedAt = new Date();
+      await inboxEvent.save();
+    }
 
     res.status(201).json({ success: true, eventId: id, status: 'PROCESSED' });
   } catch (err: any) {

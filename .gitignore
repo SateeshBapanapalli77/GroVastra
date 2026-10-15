@@ -2,8 +2,6 @@
 # GroVastra Root .gitignore
 # ==========================================
 
-docs/
-
 # Secrets & Environment Files (CRITICAL: Never commit secrets)
 .env
 .env.local

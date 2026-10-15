@@ -1,4 +1,5 @@
 import { IWhatsAppDeliveryAdapter, SendCampaignStepParams, SendStepResult } from './deliveryAdapter.interface';
+import { getApprovedTemplate } from './templateCatalogue';
 import { logger } from '../../../config/logger';
 import { env } from '../../../config/env';
 
@@ -37,16 +38,33 @@ export class WhatsAppSandboxDeliveryAdapter implements IWhatsAppDeliveryAdapter 
 
     // Dispatch registered template with parameters formatted into Meta Cloud API components
     const templateName = params.template.id;
+    const templateDef = getApprovedTemplate(params.template.id);
 
     const components: any[] = [];
     if (params.parameters && Object.keys(params.parameters).length > 0) {
-      components.push({
-        type: 'body',
-        parameters: Object.entries(params.parameters).map(([_, val]) => ({
+      let bodyParams: { type: string; text: string }[] = [];
+      if (templateDef && templateDef.variableKeys && templateDef.variableKeys.length > 0) {
+        // Enforce Meta's strict positional parameter mapping ({{1}}, {{2}}, etc.)
+        bodyParams = templateDef.variableKeys.map((key) => ({
           type: 'text',
-          text: String(val)
-        }))
-      });
+          text: String(params.parameters[key] ?? '')
+        }));
+      } else {
+        // Deterministic alphabetical fallback if template definition is not found
+        bodyParams = Object.keys(params.parameters)
+          .sort()
+          .map((key) => ({
+            type: 'text',
+            text: String(params.parameters[key] ?? '')
+          }));
+      }
+
+      if (bodyParams.length > 0) {
+        components.push({
+          type: 'body',
+          parameters: bodyParams
+        });
+      }
     }
 
     const payload: any = {

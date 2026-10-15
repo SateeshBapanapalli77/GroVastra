@@ -11,12 +11,13 @@ import { checkAndReserveContactCapacity } from '../src/modules/campaigns/engine/
 import { executePreflightSafeguards } from '../src/modules/campaigns/engine/safeguards/safeguardPipeline';
 import {
   claimNextDueExecution,
-  processClaimedExecution
+  processClaimedExecution,
+  sweepOutcomeUnknownExecutions
 } from '../src/modules/campaigns/engine/dispatchExecutor';
 import { evaluateCampaignDryRun } from '../src/modules/campaigns/engine/dryRun';
 import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/mockWhatsAppAdapter';
 import { getApprovedTemplate } from '../src/modules/campaigns/adapters/templateCatalogue';
-import { verifyMetaSignature } from '../src/modules/campaigns/routes/webhook.routes';
+import { verifyMetaSignature, timingSafeCompare } from '../src/modules/campaigns/routes/webhook.routes';
 
 // Real Domain Models
 import { CustomerModel } from '../src/modules/crm/models/Customer.model';
@@ -1409,13 +1410,15 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       const updated = await CampaignEnrollmentModel.findById(enrollment._id);
       expect(updated?.replyHoldAt).toEqual(replyTime);
     });
+  });
 
-    it('C11: multi-step prerequisite PREVIOUS_ACCEPTED succeeds when prior step is DELIVERED or READ', async () => {
-      const tenantId = 'qa_tenant_c11';
-      const campaignId = 'cmp_c11_multistep';
-      const versionId = 'cv_c11_multistep';
-      const enrollmentId = 'enr_c11';
-      const customerId = 'cus_c11_lakshmi';
+  describe('Regression & Production Hardening Suite (REG-01 - REG-08)', () => {
+    it('REG-01: multi-step prerequisite PREVIOUS_ACCEPTED succeeds when prior step is DELIVERED or READ', async () => {
+      const tenantId = 'qa_tenant_reg01';
+      const campaignId = 'cmp_reg01_multistep';
+      const versionId = 'cv_reg01_multistep';
+      const enrollmentId = 'enr_reg01';
+      const customerId = 'cus_reg01_lakshmi';
 
       // 1. Setup Customer
       await CustomerModel.create({
@@ -1485,7 +1488,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
         enabledBranches: [],
         publishedBy: 'test_runner',
         publishedAt: new Date(),
-        reviewFingerprint: 'fp_c11_test'
+        reviewFingerprint: 'fp_reg01_test'
       });
 
       await CampaignEnrollmentModel.create({
@@ -1505,7 +1508,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
 
       // 3. Create Invitation Execution in DELIVERED state (simulating webhook delivery receipt)
       const invitationExecution = await CampaignExecutionModel.create({
-        id: 'exe_c11_invitation',
+        id: 'exe_reg01_invitation',
         tenantId,
         enrollmentId,
         campaignId,
@@ -1524,7 +1527,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
 
       // 4. Create Follow-up Execution with PREVIOUS_ACCEPTED prerequisite
       const followupExecution = await CampaignExecutionModel.create({
-        id: 'exe_c11_followup',
+        id: 'exe_reg01_followup',
         tenantId,
         enrollmentId,
         campaignId,
@@ -1549,23 +1552,23 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       invitationExecution.readAt = new Date();
       await invitationExecution.save();
 
-      // Clear the temporary contact reservation created by first check to re-evaluate gate 5 with READ state
+      // Clear the temporary contact reservation created by first check to re-evaluate gate with READ state
       await CampaignContactGateModel.deleteMany({ tenantId });
 
       const outcomeAfterRead = await executePreflightSafeguards(followupExecution);
       expect(outcomeAfterRead.status).toBe('PROCEED');
     });
 
-    it('C12: webhook status monotonicity guarantees late delivered receipt cannot overwrite READ state', async () => {
-      const tenantId = 'qa_tenant_c12';
-      const executionId = 'exe_c12_monotonicity';
-      const providerMsgId = 'wamid.C12_RECEIPT_TEST_001';
+    it('REG-02: webhook status monotonicity guarantees late delivered receipt cannot overwrite READ state', async () => {
+      const tenantId = 'qa_tenant_reg02';
+      const executionId = 'exe_reg02_monotonicity';
+      const providerMsgId = 'wamid.REG02_RECEIPT_TEST_001';
 
       await CampaignExecutionModel.create({
         id: executionId,
         tenantId,
-        enrollmentId: 'enr_c12',
-        campaignId: 'cmp_c12',
+        enrollmentId: 'enr_reg02',
+        campaignId: 'cmp_reg02',
         stepId: 'invitation',
         dueAt: new Date(),
         expiresAt: new Date(Date.now() + 3600 * 1000),
@@ -1580,19 +1583,19 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       });
 
       const intent = await CampaignDeliveryIntentModel.create({
-        id: 'di_c12',
+        id: 'di_reg02',
         tenantId,
         executionId,
         deliveryKey: executionId,
         connectionId: 'conn_test',
-        customerId: 'cus_c12',
+        customerId: 'cus_reg02',
         recipientVersion: 1,
         encryptedRecipient: encryptText('+919876543212'),
         templateRef: { id: 'tpl_birthday_invite', revision: 1, language: 'en' },
         parameters: { name: 'Lakshmi' },
-        payloadHash: 'hash_c12',
+        payloadHash: 'hash_reg02',
         state: 'ACCEPTED',
-        attemptId: 'att_c12',
+        attemptId: 'att_reg02',
         providerMessageId: providerMsgId,
         submittedAt: new Date(),
         readAt: new Date()
@@ -1623,7 +1626,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       expect(unchangedExecution?.state).toBe('READ');
     });
 
-    it('C13: HMAC fail-closed verification rejects forged, unconfigured, or tampered payloads', () => {
+    it('REG-03: HMAC fail-closed verification rejects forged, unconfigured, or tampered payloads', () => {
       const secret = 'test_secret_key_12345';
       const rawBody = Buffer.from(JSON.stringify({ object: 'whatsapp_business_account' }));
 
@@ -1642,9 +1645,9 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       expect(verifyMetaSignature(validSig, tamperedBody, secret)).toBe(false);
     });
 
-    it('C14: domain event inbox enforces atomic deduplication and preserves producer occurredAt and entityVersion', async () => {
-      const tenantId = 'qa_tenant_c14';
-      const eventId = 'evt_producer_c14_01';
+    it('REG-04: domain event inbox enforces atomic deduplication and preserves producer occurredAt and entityVersion', async () => {
+      const tenantId = 'qa_tenant_reg04';
+      const eventId = 'evt_producer_reg04_01';
       const producer = 'inventory';
       const customOccurredAt = new Date('2026-10-15T02:00:00.000Z');
       const producerEntityVersion = 4;
@@ -1673,7 +1676,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       let duplicateThrewE11000 = false;
       try {
         await CampaignEventInboxModel.create({
-          id: 'evt_producer_c14_01_alt',
+          id: 'evt_producer_reg04_01_alt',
           tenantId,
           producer,
           eventId,
@@ -1691,6 +1694,153 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       }
 
       expect(duplicateThrewE11000).toBe(true);
+    });
+
+    it('REG-05: timingSafeCompare provides constant-time comparison against timing side-channels', () => {
+      const validKey = 'internal_secret_key_prod_998877';
+      expect(timingSafeCompare(validKey, validKey)).toBe(true);
+      expect(timingSafeCompare(validKey, 'internal_secret_key_wrong')).toBe(false);
+      expect(timingSafeCompare(undefined, validKey)).toBe(false);
+      expect(timingSafeCompare(validKey, undefined)).toBe(false);
+      expect(timingSafeCompare('short', 'longer_string')).toBe(false);
+    });
+
+    it('REG-06: pauseGeneration stamp and campaign resume synchronize executions without stranding', async () => {
+      const tenantId = 'qa_tenant_reg06';
+      const campaignId = 'cmp_reg06';
+
+      const campaign = await CampaignModel.create({
+        id: campaignId,
+        tenantId,
+        name: 'Pause Resume Test Campaign',
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_reg06',
+        draftVersion: 1,
+        pauseGeneration: 0
+      });
+
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_reg06_step',
+        tenantId,
+        enrollmentId: 'enr_reg06',
+        campaignId,
+        stepId: 'invitation',
+        dueAt: new Date(),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-15',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        pauseGeneration: 0,
+        state: 'SCHEDULED',
+        prerequisite: 'NONE'
+      });
+
+      // 1. Simulate pause -> increments pauseGeneration
+      campaign.status = 'PAUSED';
+      campaign.pauseGeneration = 1;
+      await campaign.save();
+
+      // In-flight execution evaluated while campaign is paused -> halts with SKIPPED_CAMPAIGN_PAUSED
+      const pausedOutcome = await executePreflightSafeguards(execution);
+      expect(pausedOutcome.status).toBe('SKIP');
+      expect((pausedOutcome as any).reason).toBe('SKIPPED_CAMPAIGN_PAUSED');
+
+      // 2. Simulate resume before execution update -> generation mismatch defers
+      campaign.status = 'ACTIVE';
+      campaign.pauseGeneration = 2;
+      await campaign.save();
+
+      const mismatchOutcome = await executePreflightSafeguards(execution);
+      expect(mismatchOutcome.status).toBe('DEFER');
+      expect((mismatchOutcome as any).reason).toBe('DEFERRED_PAUSE_GENERATION_MISMATCH');
+
+      // 3. Resume synchronization re-stamps executions with new generation
+      await CampaignExecutionModel.updateMany(
+        { campaignId, tenantId, state: { $in: ['SCHEDULED', 'DEFERRED'] } },
+        { $set: { pauseGeneration: campaign.pauseGeneration } }
+      );
+
+      const updatedExecution = await CampaignExecutionModel.findOne({ id: 'exe_reg06_step' });
+      expect(updatedExecution?.pauseGeneration).toBe(2);
+    });
+
+    it('REG-07: sweepOutcomeUnknownExecutions reconciles late receipts and respects outage grace period', async () => {
+      const tenantId = 'qa_tenant_reg07';
+      const executionId = 'exe_reg07_unknown';
+      const deliveryIntentId = 'di_reg07_unknown';
+
+      // Setup execution in OUTCOME_UNKNOWN updated 40 minutes ago (past 30-min outage grace)
+      const pastTime = new Date(Date.now() - 40 * 60 * 1000);
+      const execution = await CampaignExecutionModel.create({
+        id: executionId,
+        tenantId,
+        enrollmentId: 'enr_reg07',
+        campaignId: 'cmp_reg07',
+        stepId: 'invitation',
+        dueAt: pastTime,
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-15',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        pauseGeneration: 0,
+        state: 'OUTCOME_UNKNOWN',
+        prerequisite: 'NONE',
+        deliveryIntentId,
+        retryCount: 0,
+        createdAt: pastTime,
+        updatedAt: pastTime
+      });
+
+      await CampaignDeliveryIntentModel.create({
+        id: deliveryIntentId,
+        tenantId,
+        executionId,
+        deliveryKey: executionId,
+        connectionId: 'conn_test',
+        customerId: 'cus_reg07',
+        recipientVersion: 1,
+        encryptedRecipient: encryptText('+919876543217'),
+        templateRef: { id: 'tpl_birthday_invite', revision: 1, language: 'en' },
+        parameters: { name: 'Sunita' },
+        payloadHash: 'hash_reg07',
+        state: 'OUTCOME_UNKNOWN',
+        attemptId: 'att_reg07',
+        submittedAt: pastTime
+      });
+
+      // Run sweeper with serverNow = current time (elapsed > 30 min)
+      const sweepResult = await sweepOutcomeUnknownExecutions(tenantId, new Date(), 30 * 60 * 1000);
+
+      // Should schedule 1st retry with exponential backoff (15 min)
+      expect(sweepResult.retriedCount).toBe(1);
+
+      const retried = await CampaignExecutionModel.findOne({ id: executionId });
+      expect(retried?.state).toBe('DEFERRED');
+      expect(retried?.retryCount).toBe(1);
+      expect(retried?.outcomeReason).toBe('OUTAGE_RETRY_SCHEDULED_1');
+    });
+
+    it('REG-08: template variableKeys enforce strict positional parameter mapping for Meta Cloud API', () => {
+      const template = getApprovedTemplate('tpl_birthday_invite');
+      expect(template).not.toBeNull();
+      // tpl_birthday_invite requires variableKeys: ['name', 'shop']
+      expect(template?.variableKeys).toEqual(['name', 'shop']);
+
+      // Parameter dictionary in reversed key order
+      const params = { shop: 'GroVastra Boutique', name: 'Ananya' };
+
+      // Strictly map according to template variableKeys
+      const positionalList = template!.variableKeys.map((key) => ({
+        type: 'text',
+        text: String((params as any)[key] ?? '')
+      }));
+
+      expect(positionalList[0].text).toBe('Ananya'); // {{1}} is name
+      expect(positionalList[1].text).toBe('GroVastra Boutique'); // {{2}} is shop
     });
   });
 });

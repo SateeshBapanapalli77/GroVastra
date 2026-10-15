@@ -166,7 +166,7 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
               </span>
             </div>
             <p className="text-[11px] text-[#6B5E59] leading-relaxed">
-              Under Meta Commercial messaging policies, only pre-screened utility and marketing templates can be staged in autonomous sequences for Padmavati Handlooms. Template creation and parameter modifications are managed via your GroVastra Account Liaison.
+              Under Meta Commercial messaging policies, only pre-screened utility and marketing templates can be staged in autonomous sequences for your boutique. Template creation and parameter modifications are managed via your GroVastra Account Liaison.
             </p>
           </div>
 

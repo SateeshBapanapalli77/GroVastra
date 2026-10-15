@@ -12,13 +12,26 @@ import { CustomerModel } from '../../crm/models/Customer.model';
 import { generateId } from '../../../shared/utils/id';
 import { env } from '../../../config/env';
 
+import { requireAuth, requireRole, signJwt } from '../../../shared/middleware/auth.middleware';
+
 export const campaignRouter = Router();
 
-// Middleware to extract tenantId (defaulting to shop_padmavati_handlooms in dev)
-campaignRouter.use((req: Request, res: Response, next) => {
-  const tenantId = (req.headers['x-tenant-id'] as string) || env.DEFAULT_TENANT_ID;
-  (req as any).tenantId = tenantId;
-  next();
+// Middleware: Authenticate credentials and enforce tenant isolation
+campaignRouter.use(requireAuth);
+
+/**
+ * POST /api/v1/auth/token
+ * Generate development/test bearer token with tenant claims
+ */
+campaignRouter.post('/auth/token', (req: Request, res: Response) => {
+  const tenantId = req.body.tenantId || req.tenantId || env.DEFAULT_TENANT_ID;
+  const role = req.body.role || 'BOUTIQUE_OWNER';
+  const token = signJwt({
+    userId: req.body.userId || 'usr_boutique_owner',
+    tenantId,
+    role
+  });
+  res.json({ success: true, token, tenantId, role });
 });
 
 /**
@@ -307,65 +320,91 @@ campaignRouter.post('/campaigns/:id/dry-runs', async (req: Request, res: Respons
 
 /**
  * POST /api/v1/campaigns/:id/activate
- * Publish immutable version and execute calendar planner
+ * Publish immutable version and execute calendar planner (requires reviewFingerprint from real dry run)
  */
-campaignRouter.post('/campaigns/:id/activate', async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const { reviewFingerprint } = req.body;
+campaignRouter.post(
+  '/campaigns/:id/activate',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = req.tenantId!;
+      const { reviewFingerprint } = req.body;
 
-    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campaign not found' });
-    }
+      // Mandatory review fingerprint check (Handoff Page 21)
+      if (!reviewFingerprint) {
+        return res.status(400).json({
+          success: false,
+          error: 'Mandatory reviewFingerprint is required to activate a campaign. Run dry run first.'
+        });
+      }
 
-    const draft = await CampaignVersionModel.findOne({
-      campaignId: campaign.id,
-      tenantId,
-      version: campaign.draftVersion
-    });
+      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+      if (!campaign) {
+        return res.status(404).json({ success: false, error: 'Campaign not found' });
+      }
 
-    if (!draft) {
-      return res.status(404).json({ success: false, error: 'Draft version not found' });
-    }
-
-    // Spec verification: reviewFingerprint must match dry run
-    if (reviewFingerprint && draft.reviewFingerprint !== reviewFingerprint) {
-      return res.status(400).json({
-        success: false,
-        error: 'Review fingerprint mismatch. Please run dry run before activating.'
+      const draft = await CampaignVersionModel.findOne({
+        campaignId: campaign.id,
+        tenantId,
+        version: campaign.draftVersion
       });
+
+      if (!draft) {
+        return res.status(404).json({ success: false, error: 'Draft version not found' });
+      }
+
+      // Verify fingerprint matches draft review
+      if (draft.reviewFingerprint !== reviewFingerprint) {
+        return res.status(400).json({
+          success: false,
+          error: 'Review fingerprint mismatch. The draft was modified after the dry run.'
+        });
+      }
+
+      // Verify that a real persisted dry run audit exists
+      const dryRunReport = await CampaignDryRunModel.findOne({
+        tenantId,
+        campaignId: campaign.id,
+        draftFingerprint: reviewFingerprint
+      });
+
+      if (!dryRunReport) {
+        return res.status(400).json({
+          success: false,
+          error: 'No dry run execution record found for this review fingerprint.'
+        });
+      }
+
+      // Freeze active version
+      campaign.status = 'ACTIVE';
+      campaign.activeVersionId = draft.id;
+      campaign.activatedAt = new Date();
+      await campaign.save();
+
+      // Trigger calendar planning for annual date occasions
+      let planningResult = null;
+      if (draft.trigger.type === 'ANNUAL_DATE') {
+        planningResult = await planAnnualOccasions(draft);
+      }
+
+      res.json({
+        success: true,
+        campaign,
+        activeVersion: draft,
+        planningResult
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
     }
-
-    // Freeze active version
-    campaign.status = 'ACTIVE';
-    campaign.activeVersionId = draft.id;
-    campaign.activatedAt = new Date();
-    await campaign.save();
-
-    // Trigger calendar planning for annual date occasions
-    let planningResult = null;
-    if (draft.trigger.type === 'ANNUAL_DATE') {
-      planningResult = await planAnnualOccasions(draft);
-    }
-
-    res.json({
-      success: true,
-      campaign,
-      activeVersion: draft,
-      planningResult
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
   }
-});
+);
 
 /**
  * POST /api/v1/campaigns/:id/pause | resume
  */
-campaignRouter.post('/campaigns/:id/pause', async (req: Request, res: Response) => {
+campaignRouter.post('/campaigns/:id/pause', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
   try {
-    const tenantId = (req as any).tenantId;
+    const tenantId = req.tenantId!;
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
@@ -373,21 +412,33 @@ campaignRouter.post('/campaigns/:id/pause', async (req: Request, res: Response) 
     campaign.pauseGeneration += 1;
     await campaign.save();
 
+    // Invalidate in-flight evaluation leases
+    await CampaignExecutionModel.updateMany(
+      { campaignId: campaign.id, tenantId, state: 'EVALUATING' },
+      { $set: { state: 'DEFERRED', 'lease.token': null, 'lease.until': null, outcomeReason: 'DEFERRED_CAMPAIGN_PAUSED' } }
+    );
+
     res.json({ success: true, campaign });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
 });
 
-campaignRouter.post('/campaigns/:id/resume', async (req: Request, res: Response) => {
+campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
   try {
-    const tenantId = (req as any).tenantId;
+    const tenantId = req.tenantId!;
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
     campaign.status = 'ACTIVE';
     campaign.pauseGeneration += 1;
     await campaign.save();
+
+    // Re-stamp all pending executions with the new pauseGeneration so they are re-enabled and not stranded!
+    await CampaignExecutionModel.updateMany(
+      { campaignId: campaign.id, tenantId, state: { $in: ['SCHEDULED', 'DEFERRED'] } },
+      { $set: { pauseGeneration: campaign.pauseGeneration, 'lease.token': null, 'lease.until': null } }
+    );
 
     res.json({ success: true, campaign });
   } catch (err: any) {
@@ -458,113 +509,184 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
  * POST /api/v1/campaigns/:id/publish-revision
  * Creates a new immutable version revision and updates activeVersionId atomically
  */
-campaignRouter.post('/campaigns/:id/publish-revision', async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+/**
+ * POST /api/v1/campaigns/:id/publish-revision
+ * Enforces full review lifecycle (optimistic concurrency, template check, dry-run fingerprint)
+ */
+campaignRouter.post(
+  '/campaigns/:id/publish-revision',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = req.tenantId!;
+      const { expectedVersion, reviewFingerprint } = req.body;
 
-    const currentVersion = campaign.activeVersionId
-      ? await CampaignVersionModel.findOne({ id: campaign.activeVersionId, tenantId })
-      : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
+      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+      if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-    if (!currentVersion) {
-      return res.status(400).json({ success: false, error: 'No base version found to revise' });
+      // 1. Optimistic Concurrency Control (expectedVersion check)
+      if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+        });
+      }
+
+      // 2. Mandatory dry-run reviewFingerprint
+      if (!reviewFingerprint) {
+        return res.status(400).json({
+          success: false,
+          error: 'Mandatory reviewFingerprint is required. Please evaluate dry run before publishing revision.'
+        });
+      }
+
+      const dryRunReport = await CampaignDryRunModel.findOne({
+        tenantId,
+        campaignId: campaign.id,
+        draftFingerprint: reviewFingerprint
+      });
+
+      if (!dryRunReport) {
+        return res.status(400).json({
+          success: false,
+          error: 'No dry run evaluation found matching reviewFingerprint. Cannot publish unverified revision.'
+        });
+      }
+
+      const currentVersion = campaign.activeVersionId
+        ? await CampaignVersionModel.findOne({ id: campaign.activeVersionId, tenantId })
+        : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
+
+      if (!currentVersion) {
+        return res.status(400).json({ success: false, error: 'No base version found to revise' });
+      }
+
+      const candidateSteps = req.body.steps || currentVersion.steps;
+
+      // 3. Template Validation
+      for (const step of candidateSteps) {
+        const tpl = getApprovedTemplate(step.templateRef?.id);
+        if (!tpl) {
+          return res.status(422).json({
+            success: false,
+            error: `Step '${step.stepId}' references unapproved template '${step.templateRef?.id}'`
+          });
+        }
+      }
+
+      // 4. Atomic draftVersion CAS increment
+      const updatedCampaign = await CampaignModel.findOneAndUpdate(
+        { id: campaign.id, tenantId, draftVersion: campaign.draftVersion },
+        { $inc: { draftVersion: 1 } },
+        { new: true }
+      );
+
+      if (!updatedCampaign) {
+        return res.status(409).json({
+          success: false,
+          error: 'Concurrent version update conflict detected.'
+        });
+      }
+
+      const newVersionNumber = updatedCampaign.draftVersion;
+      const newVersionId = generateId('cv');
+
+      const newVersion = await CampaignVersionModel.create({
+        id: newVersionId,
+        tenantId,
+        campaignId: campaign.id,
+        version: newVersionNumber,
+        name: currentVersion.name,
+        industry: currentVersion.industry,
+        purpose: currentVersion.purpose,
+        trigger: req.body.trigger || currentVersion.trigger,
+        timezone: req.body.timezone || currentVersion.timezone,
+        audience: req.body.audience || currentVersion.audience,
+        goal: req.body.goal || currentVersion.goal,
+        steps: candidateSteps,
+        priority: req.body.priority || currentVersion.priority,
+        resumePolicy: currentVersion.resumePolicy || 'FUTURE_ONLY',
+        importPolicy: 'FUTURE_ONLY',
+        enabledBranches: currentVersion.enabledBranches || [],
+        publishedBy: req.user?.userId || 'boutique_manager',
+        publishedAt: new Date(),
+        reviewFingerprint
+      });
+
+      updatedCampaign.activeVersionId = newVersion.id;
+      await updatedCampaign.save();
+
+      res.json({
+        success: true,
+        message: `Version ${newVersionNumber} published successfully`,
+        campaign: updatedCampaign,
+        activeVersion: newVersion
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
     }
-
-    const newVersionNumber = campaign.draftVersion + 1;
-    const newVersionId = generateId('cv');
-
-    const newVersion = await CampaignVersionModel.create({
-      id: newVersionId,
-      tenantId,
-      campaignId: campaign.id,
-      version: newVersionNumber,
-      name: currentVersion.name,
-      industry: currentVersion.industry,
-      purpose: currentVersion.purpose,
-      trigger: req.body.trigger || currentVersion.trigger,
-      timezone: req.body.timezone || currentVersion.timezone,
-      audience: req.body.audience || currentVersion.audience,
-      goal: req.body.goal || currentVersion.goal,
-      steps: req.body.steps || currentVersion.steps,
-      priority: req.body.priority || currentVersion.priority,
-      resumePolicy: currentVersion.resumePolicy || 'FUTURE_ONLY',
-      importPolicy: 'FUTURE_ONLY',
-      enabledBranches: currentVersion.enabledBranches || [],
-      publishedBy: req.body.publishedBy || 'boutique_manager',
-      publishedAt: new Date(),
-      reviewFingerprint: `fp_rev_${newVersionNumber}_${Date.now()}`
-    });
-
-    campaign.draftVersion = newVersionNumber;
-    campaign.activeVersionId = newVersion.id;
-    await campaign.save();
-
-    res.json({
-      success: true,
-      message: `Version ${newVersionNumber} published successfully`,
-      campaign,
-      activeVersion: newVersion
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
   }
-});
+);
 
 /**
  * POST /api/v1/campaigns/:id/archive
- * Archives a campaign and skips any pending executions safely
+ * Archives a campaign, cancels pending executions and marks enrollments CANCELLED
  */
-campaignRouter.post('/campaigns/:id/archive', async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+campaignRouter.post(
+  '/campaigns/:id/archive',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = req.tenantId!;
+      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+      if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-    campaign.status = 'ARCHIVED';
-    campaign.pauseGeneration += 1;
-    await campaign.save();
+      campaign.status = 'ARCHIVED';
+      campaign.pauseGeneration += 1;
+      await campaign.save();
 
-    // Cancel all scheduled or deferred executions for this campaign
-    const cancelledExecutions = await CampaignExecutionModel.updateMany(
-      {
-        campaignId: campaign.id,
-        tenantId,
-        state: { $in: ['SCHEDULED', 'DEFERRED'] }
-      },
-      {
-        $set: {
-          state: 'SKIPPED',
-          outcomeReason: 'SKIPPED_CAMPAIGN_ARCHIVED'
+      // Cancel all scheduled or deferred executions for this campaign
+      const cancelledExecutions = await CampaignExecutionModel.updateMany(
+        {
+          campaignId: campaign.id,
+          tenantId,
+          state: { $in: ['SCHEDULED', 'DEFERRED', 'EVALUATING'] }
+        },
+        {
+          $set: {
+            state: 'SKIPPED',
+            outcomeReason: 'SKIPPED_CAMPAIGN_ARCHIVED',
+            'lease.token': null,
+            'lease.until': null
+          }
         }
-      }
-    );
+      );
 
-    // Conclude active enrollments
-    await CampaignEnrollmentModel.updateMany(
-      {
-        campaignId: campaign.id,
-        tenantId,
-        status: 'ACTIVE'
-      },
-      {
-        $set: {
-          status: 'COMPLETED'
+      // Cancel active enrollments (marked CANCELLED, NOT COMPLETED!)
+      await CampaignEnrollmentModel.updateMany(
+        {
+          campaignId: campaign.id,
+          tenantId,
+          status: 'ACTIVE'
+        },
+        {
+          $set: {
+            status: 'CANCELLED'
+          }
         }
-      }
-    );
+      );
 
-    res.json({
-      success: true,
-      message: 'Campaign archived and pending executions cancelled',
-      campaign,
-      cancelledExecutionsCount: cancelledExecutions.modifiedCount
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+      res.json({
+        success: true,
+        message: 'Campaign archived, active enrollments cancelled, and pending executions skipped',
+        campaign,
+        cancelledExecutionsCount: cancelledExecutions.modifiedCount
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   }
-});
+);
 
 /**
  * GET /api/v1/campaigns/:id/enrollments

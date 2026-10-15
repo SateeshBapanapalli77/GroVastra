@@ -17,6 +17,18 @@ export interface EventConsumerCycleResult {
 export async function processNextPendingEvent(
   tenantId: string
 ): Promise<ICampaignEventInbox | null> {
+  // Recover any stalled events that crashed during processing (> 5 minutes old)
+  await CampaignEventInboxModel.updateMany(
+    {
+      tenantId,
+      status: 'PROCESSING',
+      updatedAt: { $lte: new Date(Date.now() - 5 * 60 * 1000) }
+    },
+    {
+      $set: { status: 'RECEIVED' }
+    }
+  );
+
   const event = await CampaignEventInboxModel.findOneAndUpdate(
     {
       tenantId,

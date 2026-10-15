@@ -1,11 +1,30 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1';
-const DEFAULT_TENANT = 'shop_padmavati_handlooms';
+const DEFAULT_TENANT = process.env.NEXT_PUBLIC_DEFAULT_TENANT || 'shop_padmavati_handlooms';
+
+let cachedToken: string | null = null;
+
+export function setAuthToken(token: string) {
+  cachedToken = token;
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('grovastra_auth_token', token);
+  }
+}
+
+export function getAuthToken(): string | null {
+  if (cachedToken) return cachedToken;
+  if (typeof window !== 'undefined') {
+    return localStorage.getItem('grovastra_auth_token');
+  }
+  return null;
+}
 
 async function request<T = any>(endpoint: string, options: RequestInit = {}): Promise<T> {
-  const headers = {
+  const token = getAuthToken();
+  const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     'x-tenant-id': DEFAULT_TENANT,
-    ...options.headers
+    ...(token ? { Authorization: `Bearer ${token}` } : {}),
+    ...(options.headers as Record<string, string> || {})
   };
 
   const res = await fetch(`${API_BASE}${endpoint}`, {

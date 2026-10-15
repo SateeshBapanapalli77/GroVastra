@@ -526,7 +526,7 @@ export const DashboardView: React.FC<DashboardViewProps> = ({
               </span>
             </div>
             <p className="text-[11px] text-[#6B5E59] mt-1 leading-relaxed max-w-3xl">
-              All outbound WhatsApp automations are strictly bound to the <strong>10:00 AM – 7:00 PM IST</strong> respectful window. Padmavati Handlooms is shielded by GroVastra spam-rate throttle (max 1 conversational blast per contact every 14 days) preventing WhatsApp account flagging or consumer opt-outs.
+              All outbound WhatsApp automations are strictly bound to the <strong>10:00 AM – 7:00 PM IST</strong> respectful window. Your boutique is shielded by GroVastra&apos;s multi-gate throttle (max 1 marketing contact per 24 hours &amp; max 3 contacts per 7 days) preventing WhatsApp account flagging or consumer opt-outs.
             </p>
           </div>
         </div>
