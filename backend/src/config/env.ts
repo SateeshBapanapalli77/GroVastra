@@ -42,6 +42,10 @@ const envSchema = z
       ctx.addIssue({ code: 'custom', path: ['ALLOW_INSECURE_DEV_AUTH'],
         message: 'ALLOW_INSECURE_DEV_AUTH must be false in production' });
     }
+    if (data.DEFAULT_TENANT_ID === 'shop_demo') {
+      ctx.addIssue({ code: 'custom', path: ['DEFAULT_TENANT_ID'],
+        message: 'DEFAULT_TENANT_ID must be set explicitly to a verified boutique tenant ID in production (no shop_demo)' });
+    }
     if (data.WHATSAPP_MODE !== 'mock' && !data.WHATSAPP_CONNECTION_ID) {
       ctx.addIssue({ code: 'custom', path: ['WHATSAPP_CONNECTION_ID'],
         message: 'WHATSAPP_CONNECTION_ID (provided by the integration developer) is required' });

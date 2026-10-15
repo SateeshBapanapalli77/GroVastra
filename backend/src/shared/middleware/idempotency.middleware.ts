@@ -10,13 +10,20 @@ export async function requireIdempotency(req: Request, res: Response, next: Next
   const headerKey = req.headers['idempotency-key'] || req.headers['x-idempotency-key'];
   const key = (typeof headerKey === 'string' ? headerKey : req.body?.idempotencyKey) as string | undefined;
 
-  if (!key) {
-    return next();
+  // Strict Spec rule (Page 26, lines 1201-1202): "Mutations require idempotency keys"
+  if (!key || key.trim() === '') {
+    return res.status(400).json({
+      success: false,
+      error: 'IDEMPOTENCY_KEY_REQUIRED: State-mutating requests require an Idempotency-Key header.'
+    });
   }
 
   const tenantId = (req as any).tenantId;
   if (!tenantId) {
-    return next();
+    return res.status(401).json({
+      success: false,
+      error: 'UNAUTHORIZED: Tenant authentication context required.'
+    });
   }
 
   try {

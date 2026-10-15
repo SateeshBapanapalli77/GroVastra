@@ -11,7 +11,7 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 | Requirement | Exists | Wired and running | Proven by test (test ID) |
 | :--- | :--- | :--- | :--- |
 | Real MongoDB replica set for automated tests (`MongoMemoryReplSet`) | Yes | Yes | All test suites connected |
-| Zero test skips on missing database (fail-closed test harness) | Yes | Yes | All 78 tests run against replica set |
+| Zero test skips on missing database (fail-closed test harness) | Yes | Yes | All 160 unit/integration tests + 58 QA Matrix tests (218 total passing) run against replica set |
 
 ---
 
@@ -43,17 +43,17 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 | :--- | :--- | :--- | :--- |
 | **P1.a**: Separate `claimVersion` counter on `CampaignExecutionModel` distinct from `planRevision` | Yes | Yes | `p1Execution.test.ts` (B15, B20) |
 | **P1.a**: Final dispatch submission validation: lease token, expected `planRevision`, state, lease & expiresAt > now (B15, B20) | Yes | Yes | `p1Execution.test.ts` (B15, B20) |
-| **P1.b**: Atomic MongoDB transaction for gates validation + capacity reservation + intent freeze + DISPATCHING | Yes | Yes | `p1Execution.test.ts` (B11, B15, C08) |
-| **P1.b**: Zero provider HTTP requests inside database transactions | Yes | Yes | `p1Execution.test.ts` (B15, C08, C09) |
+| **P1.b**: Atomic MongoDB transaction for gates validation + capacity reservation + intent freeze + DISPATCHING | Yes | Yes | `p1Execution.test.ts` (B11, B15, C08), `execution.test.ts` |
+| **P1.b**: Zero provider HTTP requests inside database transactions | Yes | Yes | `p1Execution.test.ts` (B15, C08, C09), `execution.test.ts` |
 | **P1.b**: Stranded intent resolution: lost leases do not block unique executionId index | Yes | Yes | `p1Execution.test.ts` (B15, C08) |
-| **P1.c**: Campaign and Tenant control-gate documents with monotonic gate versions (B11, B12) | Yes | Yes | `p1Execution.test.ts` (B11, B12) |
+| **P1.c**: Campaign and Tenant control-gate documents with monotonic gate versions (B11, B12) | Yes | Yes | `execution.test.ts` (section 4, pause race aborts & monotonic increment), `p1Execution.test.ts` (B11, B12), `qaMatrix.test.ts` (B11, B12) |
 | **P1.c**: Global pause control and FUTURE_ONLY logging of steps falling due during pause | Yes | Yes | `p1Execution.test.ts` (B11, REG-06) |
 | **P1.d**: Bounded exponential backoff with `RETRY_WAIT` state and `retryAt` timestamp | Yes | Yes | `p1Execution.test.ts` (C08, C09) |
 | **P1.d**: Retry restricted to Meta M4 non-acceptance error codes; all gates rechecked | Yes | Yes | `p1Execution.test.ts` (C08, C09) |
-| **P1.d**: Safe contact reservation release & re-acquire on retry (C08, C09, C20) | Yes | Yes | `p1Execution.test.ts` (C08, C20) |
+| **P1.d**: Safe contact reservation release & re-acquire on retry (C08, C09, C20) | Yes | Yes | `p1Execution.test.ts` (C08, C20), `qaMatrix.test.ts` (C08) |
 | **P1.d**: `BLOCKED_STALE_INTENT` when frozen intent source data changes before retry (C20) | Yes | Yes | `p1Execution.test.ts` (C20) |
 | **P1.e**: Contact ledger counting reserved, accepted, and unknown outcomes | Yes | Yes | `p1Execution.test.ts` (B09, C06) |
-| **P1.e**: Destination-wide cap across duplicate CRM customer records sharing phone (B10) | Yes | Yes | `p1Execution.test.ts` (B10) |
+| **P1.e**: Destination-wide cap across duplicate CRM customer records sharing phone (B10) | Yes | Yes | `p1Execution.test.ts` (B10), `qaMatrix.test.ts` (B10) |
 | **P1.e**: Atomic collision arbitration: priority -> earliest expiry -> creation order (B09) | Yes | Yes | `p1Execution.test.ts` (B09) |
 | **P1.e**: In-memory contact cap fallback removed from production paths | Yes | Yes | Production paths use MongoMemoryReplSet transactions |
 | **P1.f**: Webhook status deduplication via compound unique index | Yes | Yes | `p1Execution.test.ts` (C10) |
@@ -63,7 +63,7 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 | **P1.f**: Raw-byte HMAC verification failing closed | Yes | Yes | `p1Execution.test.ts` (C10), `p0Security.test.ts` |
 | **P1.g**: Unique enrollment & execution tombstones with atomic detail pruning (B18) | Yes | Yes | `p1Execution.test.ts` (B18) |
 | **P1.h**: Masked projections for history; zero phone numbers or raw message bodies in logs | Yes | Yes | `p1Execution.test.ts` (B10, C08) |
-| **P1.h**: Recipient phone encrypted at rest with AES-256-GCM | Yes | Yes | `p1Execution.test.ts` (C08, C20) |
+| **P1.h**: Recipient phone encrypted at rest with AES-256-GCM | Yes | Yes | `p1Execution.test.ts` (C08, C20), `execution.test.ts` |
 | **P1.h**: Fair multi-tenant worker scheduling | Yes | Yes | `workers/executor.ts` (fair round-robin) |
 
 ---
@@ -80,11 +80,11 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 | **P2.d**: Anniversary & wedding per-eventId occurrences and postponement replan (A09, A10) | Yes | Yes | `p2Milestone.test.ts` (A09, A10) |
 | **P2.e**: Date corrections: within-year replan vs across-year `correctionGroupId` lineage (B04) | Yes | Yes | `p2Milestone.test.ts` (B04) |
 | **P2.f**: Immutable published versions; draft PATCH never mutates published (B14) | Yes | Yes | `p2Milestone.test.ts` (B14) |
-| **P2.g**: Activation requires matching dry-run reviewFingerprint (A03, C01) | Yes | Yes | `p2Milestone.test.ts` (A03, C01) |
-| **P2.h**: Validation endpoint with fieldPath and resolutionOwner (A05) | Yes | Yes | `p2Milestone.test.ts` (A05) |
-| **P2.i**: Meta positional parameters driven strictly by template variable keys (C05) | Yes | Yes | `p2Milestone.test.ts` (C05) |
-| **P2.j**: Idempotency keys on mutations; 409 on version conflict (C15, C16) | Yes | Yes | `p2Milestone.test.ts` (C15, C16) |
-| **P2.k**: Next.js Studio (Editor, Dry Run, Simulator, Activity, Settings with required notice & separate accepted/delivered/read counts) | Yes | Yes | Frontend build clean (Next.js 16) |
+| **P2.g**: Activation requires matching dry-run reviewFingerprint (A03, C01) | Yes | Yes | `p2Milestone.test.ts` (A03, C01), `qaMatrix.test.ts` (A03) |
+| **P2.h**: Validation endpoint with fieldPath and resolutionOwner (A05) | Yes | Yes | `p2Milestone.test.ts` (A05), `qaMatrix.test.ts` (A05) |
+| **P2.i**: Meta positional parameters driven strictly by template variable keys (C05) | Yes | Yes | `p2Milestone.test.ts` (C05), `qaMatrix.test.ts` (C05) |
+| **P2.j**: Idempotency keys on mutations; 409 on version conflict (C15, C16) | Yes | Yes | `p2Milestone.test.ts` (C15, C16), `qaMatrix.test.ts` (C15, C16) |
+| **P2.k**: Next.js Studio (Editor, Dry Run, Simulator, Activity, Settings with required notice & separate accepted/delivered/read counts) | Yes | Yes | Frontend build clean; client draft autosave with `draftVersion`, passes `expectedVersion`, renders 409 conflict banner with reload button, and enforces `Idempotency-Key` headers; verified in `p2Milestone.test.ts` & `qaMatrix.test.ts` (C15, C16) |
 | **P2.l**: Staff actions (resolve-hold, mark-goal) with audited reason precedence | Yes | Yes | `p2Milestone.test.ts` (A11, A12, AuditLogModel) |
 
 ---
@@ -129,6 +129,6 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 | # | Item | Status / Interface | Impact / Resolution |
 | :--- | :--- | :--- | :--- |
 | **B1** | Provider webhook ingestion ownership (spec p.3 vs p.26) | Ingress built in Express webhook module with constant-time HMAC check | Open decision noted in architecture blueprint |
-| **B2** | Live Meta WhatsApp Cloud API credentials & approved templates | `IWhatsAppDeliveryAdapter` interface with `MockWhatsAppDeliveryAdapter` and sandbox adapter | Production fails closed if catalogue is unprovisioned |
+| **B2** | Live Meta WhatsApp Cloud API credentials & approved templates | `IWhatsAppDeliveryAdapter` with per-tenant `TenantConnectionModel` lookup (fails closed if unprovisioned) and database-backed `TemplateCatalogModel` | Per-tenant connections and database-backed templates implemented |
 | **B3** | Product owner approval of default caps (1/24h, 3/7d) and lead times | Configurable in tenant settings with proposed defaults | Ready for tenant overrides |
 | **B4** | Upstream POS/ERP domain event emission contracts | Ingestion schema defined in `/internal/campaign-events` | Adapter contracts provided for upstream systems |

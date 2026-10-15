@@ -185,3 +185,39 @@ export const APPROVED_TEMPLATES: Record<string, ApprovedTemplate> = {
 export function getApprovedTemplate(templateId: string): ApprovedTemplate | null {
   return APPROVED_TEMPLATES[templateId] || null;
 }
+
+export async function resolveApprovedTemplate(templateId: string, tenantId?: string): Promise<ApprovedTemplate | null> {
+  try {
+    const { TemplateCatalogModel } = await import('../models/TemplateCatalog.model');
+    if (tenantId) {
+      const dbTemplate = await TemplateCatalogModel.findOne({
+        id: templateId,
+        $or: [{ tenantId }, { tenantId: null }]
+      }).lean();
+
+      if (dbTemplate) {
+        return {
+          id: dbTemplate.id,
+          name: dbTemplate.name,
+          category: dbTemplate.category,
+          revision: dbTemplate.revision,
+          language: dbTemplate.language,
+          status: dbTemplate.status as 'APPROVED' | 'PAUSED',
+          bodyTemplate: dbTemplate.bodyTemplate,
+          variableKeys: dbTemplate.variableKeys,
+          render: (vars: Record<string, string>) => {
+            let rendered = dbTemplate.bodyTemplate;
+            for (const key of dbTemplate.variableKeys) {
+              rendered = rendered.replace(new RegExp(`{{${key}}}`, 'g'), vars[key] || '');
+            }
+            return rendered;
+          }
+        };
+      }
+    }
+  } catch {
+    // If DB is disconnected or during standalone unit tests, use catalogue
+  }
+
+  return APPROVED_TEMPLATES[templateId] || null;
+}

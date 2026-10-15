@@ -530,11 +530,11 @@ webhookRouter.post('/webhooks/orders', requireInternalAuth('orders'), async (req
       netPaise: typeof netPaise === 'number' ? netPaise : undefined
     });
 
-    // 2. Publish order.completed event with actual netPaise (no fabricated default)
+    // 2. Publish order.completed event with deterministic eventId and actual netPaise (no fabricated default)
     await eventBus.publish({
       schemaVersion: 1,
       producer: 'orders',
-      eventId: generateId('evt'),
+      eventId: `evt_order_${orderId}`,
       tenantId,
       type: 'order.completed',
       entityId: orderId,

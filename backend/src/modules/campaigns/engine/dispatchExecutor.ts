@@ -4,6 +4,7 @@ import { CampaignDeliveryIntentModel, ICampaignDeliveryIntent } from '../models/
 import { CampaignEventInboxModel } from '../models/CampaignEventInbox.model';
 import { TenantControlGateModel } from '../models/TenantControlGate.model';
 import { CampaignControlGateModel } from '../models/CampaignControlGate.model';
+import { TenantConnectionModel } from '../models/TenantConnection.model';
 import { executePreflightSafeguards, PipelineOutcome } from './safeguards/safeguardPipeline';
 import { checkAndReserveContactCapacity, updateContactReservationStatus } from './safeguards/contactCapResolver';
 import { ProductModel } from '../../inventory/models/Product.model';
@@ -236,39 +237,61 @@ export async function processClaimedExecution(
     const attemptId = `attempt_${ulid().toLowerCase()}`;
     const deliveryIntentId = execution.deliveryIntentId || generateId('di');
 
-    let deliveryIntentDoc: ICampaignDeliveryIntent | null = null;
+    let resolvedConnectionId: string = env.WHATSAPP_CONNECTION_ID || 'conn_test';
+    let deliveryIntentDoc: any = null;
 
     const session = await mongoose.startSession();
     try {
       await session.withTransaction(async () => {
-        // Step A: Lock & Validate TenantControlGate (Consistent Lock Order: 1)
-        let tenantGate = await TenantControlGateModel.findOne({ tenantId }).session(session);
+        // Step A: Lock & Conditionally Update TenantControlGate (Consistent Lock Order: 1, Spec p.25)
+        let tenantGate = await TenantControlGateModel.findOneAndUpdate(
+          { tenantId, globalPause: false },
+          { $inc: { gateVersion: 1 } },
+          { session, new: true }
+        );
         if (!tenantGate) {
+          const existing = await TenantControlGateModel.findOne({ tenantId }).session(session);
+          if (existing && existing.globalPause) {
+            throw new Error('CAMPAIGN_OR_GLOBAL_PAUSED');
+          }
           const created = await TenantControlGateModel.create(
-            [{ id: generateId('tg'), tenantId, globalPause: false, gateVersion: 1 }],
+            [{ id: generateId('tg'), tenantId, globalPause: false, gateVersion: 2 }],
             { session }
           );
           tenantGate = created[0];
         }
-        if (tenantGate.globalPause) {
-          throw new Error('CAMPAIGN_OR_GLOBAL_PAUSED');
-        }
 
-        // Step B: Lock & Validate CampaignControlGate (Consistent Lock Order: 2)
-        let campaignGate = await CampaignControlGateModel.findOne({
-          tenantId,
-          campaignId: execution.campaignId
-        }).session(session);
-
+        // Step B: Lock & Conditionally Update CampaignControlGate (Consistent Lock Order: 2, Spec p.25)
+        let campaignGate = await CampaignControlGateModel.findOneAndUpdate(
+          {
+            tenantId,
+            campaignId: execution.campaignId,
+            paused: false,
+            pauseGeneration: execution.pauseGeneration
+          },
+          { $inc: { gateVersion: 1 } },
+          { session, new: true }
+        );
         if (!campaignGate) {
+          const existing = await CampaignControlGateModel.findOne({
+            tenantId,
+            campaignId: execution.campaignId
+          }).session(session);
+          if (existing) {
+            throw new Error('CAMPAIGN_OR_GLOBAL_PAUSED');
+          }
           const created = await CampaignControlGateModel.create(
-            [{ id: generateId('cg'), tenantId, campaignId: execution.campaignId, paused: false, pauseGeneration: 0 }],
+            [{
+              id: generateId('cg'),
+              tenantId,
+              campaignId: execution.campaignId,
+              paused: false,
+              pauseGeneration: execution.pauseGeneration,
+              gateVersion: 2
+            }],
             { session }
           );
           campaignGate = created[0];
-        }
-        if (campaignGate.paused || campaignGate.pauseGeneration !== execution.pauseGeneration) {
-          throw new Error('CAMPAIGN_OR_GLOBAL_PAUSED');
         }
 
         // Step C: Lock & Reserve Destination Contact Gate (Consistent Lock Order: 3)
@@ -298,7 +321,17 @@ export async function processClaimedExecution(
           }
         }
 
-        // Step D: Freeze or reuse Delivery Intent
+        // Step D: Resolve Tenant Connection & Freeze Delivery Intent (Spec p.27)
+        const tenantConnection = await TenantConnectionModel.findOne({ tenantId, status: 'ACTIVE' }).session(session);
+        if (tenantConnection?.connectionId) {
+          resolvedConnectionId = tenantConnection.connectionId;
+        } else if (process.env.NODE_ENV === 'test' || env.NODE_ENV === 'test' || env.WHATSAPP_MODE === 'mock') {
+          resolvedConnectionId = env.WHATSAPP_CONNECTION_ID || 'conn_test';
+        } else {
+          logger.error({ tenantId }, 'No active WhatsApp connection found for tenant (fail-closed)');
+          throw new Error('BLOCKED_NO_TENANT_CONNECTION');
+        }
+
         deliveryIntentDoc = await CampaignDeliveryIntentModel.findOne({
           tenantId,
           executionId
@@ -312,7 +345,7 @@ export async function processClaimedExecution(
                 tenantId,
                 executionId,
                 deliveryKey: executionId,
-                connectionId: env.WHATSAPP_CONNECTION_ID,
+                connectionId: resolvedConnectionId,
                 customerId: customer.id,
                 recipientVersion: 1,
                 encryptedRecipient: encryptText(customer.phone),
@@ -419,6 +452,22 @@ export async function processClaimedExecution(
         return 'SKIPPED';
       }
 
+      if (errMsg === 'BLOCKED_NO_TENANT_CONNECTION') {
+        await CampaignExecutionModel.updateOne(
+          { id: executionId, tenantId },
+          {
+            $set: {
+              state: 'BLOCKED',
+              outcomeReason: 'BLOCKED_NO_TENANT_CONNECTION',
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          }
+        );
+        return 'BLOCKED';
+      }
+
       // Lease lost or expired CAS conflict
       return 'FAILED';
     }
@@ -428,7 +477,7 @@ export async function processClaimedExecution(
     const sendResult = await adapter.sendCampaignStep({
       executionId,
       deliveryKey: executionId,
-      connectionId: env.WHATSAPP_CONNECTION_ID,
+      connectionId: resolvedConnectionId,
       customerId: customer.id,
       recipientVersion: 1,
       template: {

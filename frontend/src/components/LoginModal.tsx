@@ -9,8 +9,8 @@ interface LoginModalProps {
 }
 
 export const LoginModal: React.FC<LoginModalProps> = ({ onSuccess }) => {
-  const [username, setUsername] = useState('owner@padmavati.com');
-  const [password, setPassword] = useState('HeritageOwner2026!');
+  const [username, setUsername] = useState('');
+  const [password, setPassword] = useState('');
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -28,17 +28,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onSuccess }) => {
     }
   };
 
-  const handleSelectRole = (role: 'owner' | 'staff') => {
-    if (role === 'owner') {
-      setUsername('owner@padmavati.com');
-      setPassword('HeritageOwner2026!');
-    } else {
-      setUsername('staff@padmavati.com');
-      setPassword('HeritageStaff2026!');
-    }
-    setError(null);
-  };
-
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/60 backdrop-blur-xs p-4">
       <div className="bg-[#FAF8F5] border border-[#EAE4DC] rounded-2xl shadow-2xl max-w-md w-full p-6 text-[#271E1B]">
@@ -49,34 +38,6 @@ export const LoginModal: React.FC<LoginModalProps> = ({ onSuccess }) => {
           </div>
           <h2 className="font-serif text-xl font-bold text-[#431217]">GroVastra Boutique OS</h2>
           <p className="text-xs text-[#6B5E59] mt-1">Sign in with verified boutique credentials</p>
-        </div>
-
-        {/* Quick Role Selection Buttons for Dev/Demo */}
-        <div className="flex gap-2 mb-4">
-          <button
-            type="button"
-            onClick={() => handleSelectRole('owner')}
-            className={`flex-1 py-1.5 px-2.5 rounded-lg text-xs font-semibold border transition-all flex items-center justify-center gap-1.5 ${
-              username === 'owner@padmavati.com'
-                ? 'bg-[#5C1D24] text-white border-[#5C1D24] shadow-xs'
-                : 'bg-white text-[#431217] border-[#EAE4DC] hover:border-[#D4AF37]'
-            }`}
-          >
-            <Shield className="w-3.5 h-3.5 text-[#F3E0B5]" />
-            Owner (Full Access)
-          </button>
-          <button
-            type="button"
-            onClick={() => handleSelectRole('staff')}
-            className={`flex-1 py-1.5 px-2.5 rounded-lg text-xs font-semibold border transition-all flex items-center justify-center gap-1.5 ${
-              username === 'staff@padmavati.com'
-                ? 'bg-[#5C1D24] text-white border-[#5C1D24] shadow-xs'
-                : 'bg-white text-[#431217] border-[#EAE4DC] hover:border-[#D4AF37]'
-            }`}
-          >
-            <User className="w-3.5 h-3.5 text-[#D4AF37]" />
-            Staff (Holds &amp; Activity)
-          </button>
         </div>
 
         {error && (

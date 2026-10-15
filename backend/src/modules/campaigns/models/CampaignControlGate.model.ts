@@ -6,6 +6,7 @@ export interface ICampaignControlGate extends Document {
   campaignId: string;
   paused: boolean;
   pauseGeneration: number;
+  gateVersion: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -16,7 +17,8 @@ const CampaignControlGateSchema = new Schema<ICampaignControlGate>(
     tenantId: { type: String, required: true },
     campaignId: { type: String, required: true },
     paused: { type: Boolean, required: true, default: false },
-    pauseGeneration: { type: Number, required: true, default: 0 }
+    pauseGeneration: { type: Number, required: true, default: 0 },
+    gateVersion: { type: Number, required: true, default: 1 }
   },
   {
     timestamps: true,

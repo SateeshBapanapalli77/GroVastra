@@ -61,7 +61,11 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
   async function apiPost(path: string, body: any, headers: Record<string, string> = {}) {
     const res = await fetch(`${baseUrl}${path}`, {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json', ...headers },
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': generateId('idemp'),
+        ...headers
+      },
       body: JSON.stringify(body)
     });
     const json = await res.json().catch(() => null);
@@ -71,7 +75,11 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
   async function apiPatch(path: string, body: any, headers: Record<string, string> = {}) {
     const res = await fetch(`${baseUrl}${path}`, {
       method: 'PATCH',
-      headers: { 'Content-Type': 'application/json', ...headers },
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': generateId('idemp'),
+        ...headers
+      },
       body: JSON.stringify(body)
     });
     const json = await res.json().catch(() => null);

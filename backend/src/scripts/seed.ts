@@ -143,15 +143,19 @@ async function seed() {
   logger.info({ count: products.length }, 'Seeded Inventory products');
 
   // 3. Seed Boutique Staff Credentials
+  const crypto = await import('crypto');
   const { UserModel, hashPassword } = await import('../modules/auth/models/User.model');
   await UserModel.deleteMany({ tenantId });
+
+  const ownerPassword = process.env.SEED_OWNER_PASSWORD || crypto.randomBytes(12).toString('hex') + 'A1!';
+  const staffPassword = process.env.SEED_STAFF_PASSWORD || crypto.randomBytes(12).toString('hex') + 'B1!';
 
   const users = [
     {
       id: 'usr_owner_01',
       tenantId,
       username: 'owner@padmavati.com',
-      passwordHash: hashPassword('HeritageOwner2026!'),
+      passwordHash: hashPassword(ownerPassword),
       name: 'Padmavati Sundar',
       role: 'BOUTIQUE_OWNER' as const,
       shopName: 'Padmavati Handlooms'
@@ -160,7 +164,7 @@ async function seed() {
       id: 'usr_staff_01',
       tenantId,
       username: 'staff@padmavati.com',
-      passwordHash: hashPassword('HeritageStaff2026!'),
+      passwordHash: hashPassword(staffPassword),
       name: 'Anjali Sharma',
       role: 'STAFF' as const,
       shopName: 'Padmavati Handlooms'
@@ -168,7 +172,16 @@ async function seed() {
   ];
 
   await UserModel.insertMany(users);
-  logger.info({ count: users.length }, 'Seeded Boutique Owner and Staff credentials');
+  logger.info(
+    {
+      count: users.length,
+      credentials: {
+        owner: { username: 'owner@padmavati.com', password: ownerPassword },
+        staff: { username: 'staff@padmavati.com', password: staffPassword }
+      }
+    },
+    'Seeded Boutique Owner and Staff credentials'
+  );
 
   logger.info('Database seed complete!');
   await disconnectDatabase();

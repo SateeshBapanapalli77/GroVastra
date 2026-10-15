@@ -61,10 +61,23 @@ export function clearAuth() {
 
 async function request<T = any>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const token = getAuthToken();
+  const method = (options.method || 'GET').toUpperCase();
+  const isMutation = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method);
+
+  const existingHeaders = (options.headers as Record<string, string>) || {};
+  const hasIdempotency = Boolean(
+    existingHeaders['Idempotency-Key'] ||
+    existingHeaders['idempotency-key'] ||
+    existingHeaders['x-idempotency-key']
+  );
+
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...(options.headers as Record<string, string> || {})
+    ...(isMutation && !hasIdempotency
+      ? { 'Idempotency-Key': `idemp_${Date.now()}_${Math.random().toString(36).slice(2, 10)}` }
+      : {}),
+    ...existingHeaders
   };
 
   const res = await fetch(`${API_BASE}${endpoint}`, {
@@ -74,7 +87,11 @@ async function request<T = any>(endpoint: string, options: RequestInit = {}): Pr
 
   const data = await res.json();
   if (!res.ok) {
-    throw new Error(data.error || `Request failed with status ${res.status}`);
+    const error: any = new Error(data.error || `Request failed with status ${res.status}`);
+    error.status = res.status;
+    error.statusCode = res.status;
+    error.data = data;
+    throw error;
   }
   return data as T;
 }
@@ -151,10 +168,10 @@ export const api = {
     });
   },
 
-  updateDraft: async (id: string, draftData: any): Promise<{ success: boolean; campaign: any; draftVersion: any }> => {
+  updateDraft: async (id: string, draftData: any, expectedVersion?: number): Promise<{ success: boolean; campaign: any; draftVersion: any }> => {
     return request(`/campaigns/${id}/draft`, {
       method: 'PATCH',
-      body: JSON.stringify(draftData)
+      body: JSON.stringify(expectedVersion !== undefined ? { ...draftData, expectedVersion } : draftData)
     });
   },
 

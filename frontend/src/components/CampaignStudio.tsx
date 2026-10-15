@@ -110,6 +110,12 @@ export const CampaignStudio: React.FC<{
   const [dryRunDone, setDryRunDone] = useState(false);
   const [isActivating, setIsActivating] = useState(false);
 
+  // Autosave and version concurrency state (Spec p.26, C16)
+  const [draftVersion, setDraftVersion] = useState<number>(1);
+  const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'conflict' | 'idle'>('idle');
+  const [versionConflict, setVersionConflict] = useState<string | null>(null);
+  const [lastSavedAt, setLastSavedAt] = useState<string | null>(null);
+
   const wizardSteps = [
     { num: 1, title: 'Trigger & Timing', icon: Calendar },
     { num: 2, title: 'Audience Criteria', icon: Users },
@@ -117,6 +123,20 @@ export const CampaignStudio: React.FC<{
     { num: 4, title: 'Sending Safeguards', icon: ShieldCheck },
     { num: 5, title: 'Review & Dry Run', icon: Rocket }
   ];
+
+  const handleReloadDraft = async () => {
+    if (!createdCampaignId) return;
+    try {
+      const camp = await api.getCampaign(createdCampaignId);
+      if (camp?.campaign) {
+        setDraftVersion(camp.campaign.draftVersion || 1);
+        setVersionConflict(null);
+        setSaveStatus('saved');
+      }
+    } catch (err: any) {
+      alert(`Failed to reload draft: ${err.message}`);
+    }
+  };
 
   const handleRunDryRun = async () => {
     setIsRunningDryRun(true);
@@ -132,28 +152,45 @@ export const CampaignStudio: React.FC<{
         setCreatedCampaignId(campId);
       }
 
-      // 2. Sync draft configuration to backend
-      await api.updateDraft(campId, {
-        name: campaignName,
-        trigger: { type: 'ANNUAL_DATE', field: triggerField, leapDayPolicy: leapPolicy },
-        audience: {
-          mode: audienceMode,
-          rules: audienceMode === 'RULE_BASED' ? { all: [{ field: 'preferences.weave', op: 'in', value: selectedWeaves }] } : undefined
-        },
-        steps: steps.map((s) => ({
-          stepId: s.stepId,
-          offsetDays: s.offsetDays,
-          localTime: s.localTime,
-          prerequisite: s.prerequisite,
-          templateRef: { id: s.templateId, revision: s.templateRevision, language: 'en' },
-          bindings: s.bindings,
-          stopOnReply: s.stopOnReply,
-          stopOnGoal: s.stopOnGoal,
-          maxLatenessMinutes: 120
-        })),
-        priority,
-        timezone
-      });
+      // 2. Sync draft configuration to backend with optimistic version concurrency
+      setSaveStatus('saving');
+      try {
+        const updateRes = await api.updateDraft(campId, {
+          name: campaignName,
+          trigger: { type: 'ANNUAL_DATE', field: triggerField, leapDayPolicy: leapPolicy },
+          audience: {
+            mode: audienceMode,
+            rules: audienceMode === 'RULE_BASED' ? { all: [{ field: 'preferences.weave', op: 'in', value: selectedWeaves }] } : undefined
+          },
+          steps: steps.map((s) => ({
+            stepId: s.stepId,
+            offsetDays: s.offsetDays,
+            localTime: s.localTime,
+            prerequisite: s.prerequisite,
+            templateRef: { id: s.templateId, revision: s.templateRevision, language: 'en' },
+            bindings: s.bindings,
+            stopOnReply: s.stopOnReply,
+            stopOnGoal: s.stopOnGoal,
+            maxLatenessMinutes: 120
+          })),
+          priority,
+          timezone
+        }, draftVersion);
+
+        if (updateRes?.draftVersion?.version) {
+          setDraftVersion(updateRes.draftVersion.version);
+        }
+        setSaveStatus('saved');
+        setLastSavedAt(new Date().toLocaleTimeString());
+        setVersionConflict(null);
+      } catch (err: any) {
+        if (err.status === 409 || err.statusCode === 409) {
+          setSaveStatus('conflict');
+          setVersionConflict(err.message || 'Draft version conflict (409): Modified concurrently by another user.');
+          return;
+        }
+        throw err;
+      }
 
       // 3. Execute dry run against MongoDB patrons
       const dryRunRes = await api.runDryRun(campId);
@@ -196,9 +233,15 @@ export const CampaignStudio: React.FC<{
             <ChevronRight className="w-3.5 h-3.5 text-[#988B86]" />
             <span className="font-semibold text-[#271E1B]">{campaignName}</span>
           </div>
-          <h1 className="font-serif text-2xl font-bold text-[#431217] mt-1">
-            Campaign Setup Wizard
-          </h1>
+
+          <div className="flex items-center gap-3 mt-1.5">
+            <h1 className="font-serif text-2xl font-bold text-[#431217]">
+              Campaign Setup Wizard
+            </h1>
+            {saveStatus === 'saving' && <span className="text-[11px] text-amber-700 bg-amber-50 px-2 py-0.5 rounded border border-amber-200">Saving draft...</span>}
+            {saveStatus === 'saved' && <span className="text-[11px] text-emerald-700 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200">Autosaved {lastSavedAt}</span>}
+            {saveStatus === 'conflict' && <span className="text-[11px] text-red-700 bg-red-50 px-2 py-0.5 rounded border border-red-200 font-bold">409 Conflict</span>}
+          </div>
           <p className="text-xs text-[#6B5E59]">
             Follow the 5-step milestone process to configure, preview, and activate this automation
           </p>
@@ -211,6 +254,24 @@ export const CampaignStudio: React.FC<{
           Exit Wizard
         </button>
       </div>
+
+      {/* 409 Conflict Banner */}
+      {versionConflict && (
+        <div className="p-4 bg-red-50 border border-red-200 rounded-xl flex items-center justify-between text-xs text-red-800 shadow-xs animate-in fade-in">
+          <div className="flex items-center gap-3">
+            <AlertCircle className="w-5 h-5 text-red-600 shrink-0" />
+            <div>
+              <span className="font-bold">Concurrency Conflict (HTTP 409):</span> {versionConflict}
+            </div>
+          </div>
+          <button
+            onClick={handleReloadDraft}
+            className="px-3 py-1.5 bg-red-700 hover:bg-red-800 text-white font-semibold rounded-lg text-xs shadow-xs"
+          >
+            Reload Latest Draft
+          </button>
+        </div>
+      )}
 
       {/* 5-Step Stepper Header */}
       <div className="bg-white p-4 rounded-2xl border border-[#EAE4DC] shadow-xs">

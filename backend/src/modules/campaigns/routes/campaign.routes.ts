@@ -8,6 +8,7 @@ import { CampaignExecutionModel } from '../models/CampaignExecution.model';
 import { CampaignDryRunModel } from '../models/CampaignDryRun.model';
 import { TenantSettingsModel, REQUIRED_SETTINGS_NOTICE } from '../models/TenantSettings.model';
 import { TenantControlGateModel } from '../models/TenantControlGate.model';
+import { CampaignControlGateModel } from '../models/CampaignControlGate.model';
 import { TenantConnectionModel } from '../models/TenantConnection.model';
 import { AuditLogModel } from '../models/AuditLog.model';
 import { evaluateCampaignDryRun } from '../engine/dryRun';
@@ -615,6 +616,16 @@ campaignRouter.post('/campaigns/:id/pause', requireRole(['BOUTIQUE_OWNER', 'STOR
     campaign.pauseGeneration += 1;
     await campaign.save();
 
+    // Monotonically increment gateVersion and record pause in CampaignControlGateModel (Spec p.25, B11, B12)
+    await CampaignControlGateModel.findOneAndUpdate(
+      { tenantId, campaignId: campaign.id },
+      {
+        $set: { paused: true, pauseGeneration: campaign.pauseGeneration },
+        $inc: { gateVersion: 1 }
+      },
+      { upsert: true, new: true }
+    );
+
     // Invalidate in-flight evaluation leases
     await CampaignExecutionModel.updateMany(
       { campaignId: campaign.id, tenantId, state: 'EVALUATING' },
@@ -636,6 +647,16 @@ campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STO
     campaign.status = 'ACTIVE';
     campaign.pauseGeneration += 1;
     await campaign.save();
+
+    // Monotonically increment gateVersion and record unpause in CampaignControlGateModel (Spec p.25, B11, B12)
+    await CampaignControlGateModel.findOneAndUpdate(
+      { tenantId, campaignId: campaign.id },
+      {
+        $set: { paused: false, pauseGeneration: campaign.pauseGeneration },
+        $inc: { gateVersion: 1 }
+      },
+      { upsert: true, new: true }
+    );
 
     // Re-stamp all pending executions with the new pauseGeneration so they are re-enabled
     await CampaignExecutionModel.updateMany(

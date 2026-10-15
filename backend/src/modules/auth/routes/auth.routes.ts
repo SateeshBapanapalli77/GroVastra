@@ -5,6 +5,23 @@ import { logger } from '../../../config/logger';
 
 export const authRouter = Router();
 
+const loginAttempts = new Map<string, { count: number; resetTime: number }>();
+
+function checkLoginRateLimit(ip: string): boolean {
+  if (process.env.NODE_ENV === 'test') return true;
+  const now = Date.now();
+  const record = loginAttempts.get(ip);
+  if (!record || now > record.resetTime) {
+    loginAttempts.set(ip, { count: 1, resetTime: now + 60000 });
+    return true;
+  }
+  if (record.count >= 10) {
+    return false;
+  }
+  record.count += 1;
+  return true;
+}
+
 /**
  * POST /api/v1/auth/login
  * Real credentials-backed authentication endpoint (spec p.26)
@@ -12,6 +29,14 @@ export const authRouter = Router();
  */
 authRouter.post('/auth/login', async (req: Request, res: Response) => {
   try {
+    const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
+    if (!checkLoginRateLimit(clientIp)) {
+      return res.status(429).json({
+        success: false,
+        error: 'Too many login attempts. Please wait 1 minute before retrying.'
+      });
+    }
+
     const { username, password } = req.body;
 
     if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {

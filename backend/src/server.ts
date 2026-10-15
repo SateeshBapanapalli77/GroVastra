@@ -10,7 +10,22 @@ import { authRouter } from './modules/auth/routes/auth.routes';
 const app = express();
 
 // Security and HTTP Logging
-app.use(cors());
+const allowedOrigins = process.env.CORS_ALLOWED_ORIGINS
+  ? process.env.CORS_ALLOWED_ORIGINS.split(',').map((o) => o.trim())
+  : ['http://localhost:3000', 'http://127.0.0.1:3000'];
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(origin) || env.NODE_ENV === 'test') {
+        callback(null, true);
+      } else {
+        callback(new Error('Blocked by CORS policy'));
+      }
+    },
+    credentials: true
+  })
+);
 app.use(
   pinoHttp({
     logger,

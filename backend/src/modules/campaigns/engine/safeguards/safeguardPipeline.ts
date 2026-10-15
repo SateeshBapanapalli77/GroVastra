@@ -8,7 +8,7 @@ import { TenantControlGateModel } from '../../models/TenantControlGate.model';
 import { CampaignControlGateModel } from '../../models/CampaignControlGate.model';
 import { CustomerModel, ICustomer } from '../../../crm/models/Customer.model';
 import { ProductModel } from '../../../inventory/models/Product.model';
-import { getApprovedTemplate } from '../../adapters/templateCatalogue';
+import { getApprovedTemplate, resolveApprovedTemplate } from '../../adapters/templateCatalogue';
 import { decryptText, sha256 } from '../../../../shared/utils/crypto';
 import { normalizeE164 } from '../../../../shared/utils/phone';
 import { logger } from '../../../../config/logger';
@@ -112,7 +112,7 @@ export async function executePreflightSafeguards(
   }
 
   // 6. Template Readiness Gate (Spec p.19, p.27, p.32 test C02, C19)
-  const template = getApprovedTemplate(stepDef.templateRef.id);
+  const template = await resolveApprovedTemplate(stepDef.templateRef.id, tenantId);
   if (!template) {
     return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
   }

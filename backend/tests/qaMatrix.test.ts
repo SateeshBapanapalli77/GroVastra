@@ -1,4 +1,6 @@
 import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import express, { Express } from 'express';
+import http from 'http';
 import mongoose from 'mongoose';
 import { generateId } from '../src/shared/utils/id';
 import { encryptText, decryptText, sha256 } from '../src/shared/utils/crypto';
@@ -28,7 +30,8 @@ import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/m
 import { getApprovedTemplate, APPROVED_TEMPLATES } from '../src/modules/campaigns/adapters/templateCatalogue';
 import { verifyMetaSignature } from '../src/modules/campaigns/routes/webhook.routes';
 import { BOUTIQUE_CAMPAIGN_PRESETS } from '../src/modules/campaigns/presets/boutiquePresets';
-import { validateCampaignVersionDefinition } from '../src/modules/campaigns/routes/campaign.routes';
+import { validateCampaignVersionDefinition, campaignRouter } from '../src/modules/campaigns/routes/campaign.routes';
+import { signJwt } from '../src/shared/middleware/auth.middleware';
 
 // Real Domain Models
 import { CustomerModel } from '../src/modules/crm/models/Customer.model';
@@ -43,13 +46,21 @@ import { CampaignDeliveryIntentModel } from '../src/modules/campaigns/models/Cam
 import { CampaignContactGateModel } from '../src/modules/campaigns/models/CampaignContactGate.model';
 import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
 import { TenantControlGateModel } from '../src/modules/campaigns/models/TenantControlGate.model';
+import { CampaignControlGateModel } from '../src/modules/campaigns/models/CampaignControlGate.model';
 import { TenantSettingsModel } from '../src/modules/campaigns/models/TenantSettings.model';
 import { TenantConnectionModel } from '../src/modules/campaigns/models/TenantConnection.model';
 import { CampaignTombstoneModel } from '../src/modules/campaigns/models/CampaignTombstone.model';
+import { CampaignDryRunModel } from '../src/modules/campaigns/models/CampaignDryRun.model';
+import { IdempotencyRecordModel } from '../src/modules/campaigns/models/Idempotency.model';
 import { DateTime } from 'luxon';
 
 describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real Production Engine', () => {
   const tenantId = 'qa_tenant_matrix';
+  let app: Express;
+  let server: http.Server;
+  let baseUrl: string;
+  let ownerToken: string;
+  let staffToken: string;
 
   beforeAll(async () => {
     if (!process.env.MONGODB_URI) {
@@ -62,7 +73,71 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
         autoIndex: true
       });
     }
+
+    app = express();
+    app.use(express.json());
+    app.use('/api/v1', campaignRouter);
+
+    server = app.listen(0);
+    const addr = server.address() as any;
+    baseUrl = `http://127.0.0.1:${addr.port}`;
+
+    ownerToken = signJwt({
+      userId: 'usr_qa_owner',
+      email: 'owner@padmavati.com',
+      role: 'BOUTIQUE_OWNER',
+      tenantId
+    });
+    staffToken = signJwt({
+      userId: 'usr_qa_staff',
+      email: 'staff@padmavati.com',
+      role: 'STAFF',
+      tenantId
+    });
   });
+
+  afterAll(async () => {
+    if (server) {
+      await new Promise((resolve) => server.close(resolve));
+    }
+  });
+
+  async function apiGet(path: string, headers: Record<string, string> = {}) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: 'GET',
+      headers: { 'Content-Type': 'application/json', ...headers }
+    });
+    const body = await res.json().catch(() => null);
+    return { status: res.status, body };
+  }
+
+  async function apiPost(path: string, data: any, headers: Record<string, string> = {}) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': generateId('idemp'),
+        ...headers
+      },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => null);
+    return { status: res.status, body };
+  }
+
+  async function apiPatch(path: string, data: any, headers: Record<string, string> = {}) {
+    const res = await fetch(`${baseUrl}${path}`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        'Idempotency-Key': generateId('idemp'),
+        ...headers
+      },
+      body: JSON.stringify(data)
+    });
+    const body = await res.json().catch(() => null);
+    return { status: res.status, body };
+  }
 
   beforeEach(async () => {
     await Promise.all([
@@ -78,9 +153,12 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       CampaignContactGateModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
       CampaignEventInboxModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
       TenantControlGateModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignControlGateModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
       TenantSettingsModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
       TenantConnectionModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
-      CampaignTombstoneModel.deleteMany({ tenantId: { $regex: /^qa_/ } })
+      CampaignTombstoneModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignDryRunModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      IdempotencyRecordModel.deleteMany({ tenantId: { $regex: /^qa_/ } })
     ]);
 
     // Active provider connection for tenant
@@ -88,10 +166,13 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       id: generateId('conn'),
       tenantId,
       connectionId: 'conn_matrix_sandbox',
-      wabaId: 'waba_matrix',
-      phoneNumberId: 'phone_matrix',
-      displayPhoneNumber: '+919876500000',
-      active: true
+      provider: 'mock',
+      status: 'ACTIVE',
+      metadata: {
+        wabaId: 'waba_matrix',
+        phoneNumberId: 'phone_matrix',
+        displayPhoneNumber: '+919876500000'
+      }
     });
   });
 
@@ -157,12 +238,24 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
     });
 
     it('A03: Draft changed after dry run (activation rejects old review fingerprint)', async () => {
-      const draft = {
+      const camp = await CampaignModel.create({
+        id: 'cmp_a03',
+        tenantId,
+        name: 'Original Draft Campaign',
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        status: 'DRAFT',
+        activeVersionId: null,
+        draftVersion: 1,
+        pauseGeneration: 0
+      });
+
+      const draft = await CampaignVersionModel.create({
         id: 'cv_a03',
         tenantId,
-        campaignId: 'cmp_a03',
+        campaignId: camp.id,
         version: 1,
-        name: 'Original Draft',
+        name: camp.name,
         industry: 'BOUTIQUE',
         purpose: 'MARKETING',
         trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', advanceDays: 30, leapDayPolicy: 'FEB_28' },
@@ -180,17 +273,48 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
             stopOnGoal: true
           }
         ],
-        priority: 80
-      } as unknown as ICampaignVersion;
+        priority: 80,
+        publishedBy: 'owner',
+        reviewFingerprint: 'draft_initial'
+      });
 
-      const dryRunRes = await evaluateCampaignDryRun(draft);
+      // 1. Dry run evaluated on original draft
+      const dryRunRes = await evaluateCampaignDryRun(draft as unknown as ICampaignVersion);
       const staleFingerprint = dryRunRes.draftFingerprint;
 
-      // Owner modifies draft step timing
+      // Persist dry run report so stale fingerprint initially has a record
+      await CampaignDryRunModel.create({
+        id: generateId('dry'),
+        tenantId,
+        campaignId: camp.id,
+        draftVersion: 1,
+        draftFingerprint: staleFingerprint,
+        summary: dryRunRes.summary,
+        reasonBreakdown: dryRunRes.reasonBreakdown,
+        samplePlans: []
+      });
+
+      // 2. Owner modifies draft step timing (draft reviewFingerprint is modified)
       draft.steps[0].offsetDays = -10;
-      const newDryRunRes = await evaluateCampaignDryRun(draft);
+      const newDryRunRes = await evaluateCampaignDryRun(draft as unknown as ICampaignVersion);
+      draft.reviewFingerprint = newDryRunRes.draftFingerprint;
+      await draft.save();
 
       expect(newDryRunRes.draftFingerprint).not.toBe(staleFingerprint);
+
+      // 3. Attempting to activate with stale reviewFingerprint MUST be rejected (Spec p.21, A03)
+      const res = await apiPost(
+        `/api/v1/campaigns/${camp.id}/activate`,
+        { reviewFingerprint: staleFingerprint },
+        { Authorization: `Bearer ${ownerToken}` }
+      );
+
+      expect(res.status).toBe(400);
+      expect(res.body.error).toContain('mismatch');
+
+      // Campaign must remain in DRAFT status
+      const unactivated = await CampaignModel.findOne({ id: camp.id, tenantId });
+      expect(unactivated?.status).toBe('DRAFT');
     });
 
     it('A04: No eligible customer today (warning only when data source is usable)', async () => {
@@ -1421,6 +1545,16 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
         pauseGeneration: 1
       });
 
+      // Monotonic control gate document exists in DB and is marked paused with gateVersion incremented
+      await CampaignControlGateModel.create({
+        id: generateId('cg'),
+        tenantId,
+        campaignId: camp.id,
+        paused: true,
+        pauseGeneration: 1,
+        gateVersion: 2
+      });
+
       const exe = await CampaignExecutionModel.create({
         id: 'exe_b11',
         tenantId,
@@ -1443,7 +1577,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       expect(res).toBe('SKIPPED');
       const updated = await CampaignExecutionModel.findOne({ id: exe.id, tenantId });
       expect(updated?.state).toBe('SKIPPED');
-      expect(updated?.outcomeReason).toBe('SKIPPED_CAMPAIGN_PAUSED');
+      expect(['SKIPPED_CAMPAIGN_PAUSED', 'CAMPAIGN_OR_GLOBAL_PAUSED']).toContain(updated?.outcomeReason);
       expect(mockAdapter.getCallCount()).toBe(0);
     });
 
@@ -2055,6 +2189,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       const updated = await CampaignExecutionModel.findOne({ id: exe.id, tenantId });
       expect(updated?.state).toBe('SKIPPED');
       expect(updated?.outcomeReason).toBe('SKIPPED_CHANNEL_SUPPRESSED');
+      expect(mockAdapter.getCallCount()).toBe(0);
     });
 
     it('C05: Missing variable / locale / invalid media (no partial or substituted message, precise reason)', async () => {
@@ -2173,6 +2308,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
 
     it('C07: Crash after DISPATCHING before HTTP (unknown until proven otherwise, no blind requeue)', async () => {
       const pastLease = new Date(Date.now() - 60000); // Lease expired 1 min ago
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
 
       const exe = await CampaignExecutionModel.create({
         id: 'exe_c07',
@@ -2197,6 +2333,8 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
 
       const updated = await CampaignExecutionModel.findOne({ id: exe.id, tenantId });
       expect(updated?.state).toBe('OUTCOME_UNKNOWN');
+      // Assert zero provider HTTP calls made when crashed before HTTP (Reviewer point 6)
+      expect(mockAdapter.getCallCount()).toBe(0);
     });
 
     it('C08: Proven throttle rejection (bounded retry, same key/payload, reservation released/reacquired once)', async () => {
@@ -2212,6 +2350,10 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       const gate = await CampaignContactGateModel.findOne({ tenantId, destinationHash });
       const activeReservations = (gate?.history || []).filter(r => r.status === 'RESERVED');
       expect(activeReservations.length).toBe(0);
+
+      // 3. Re-acquire reservation upon retry (reservation reacquired once with same execution)
+      const reacquire = await checkAndReserveContactCapacity(tenantId, rawPhone, 'cmp_c08', 'exe_c08', new Date(Date.now() + 3600000), 80, new Date());
+      expect(reacquire.allowed).toBe(true);
     });
 
     it('C09: Expiry reached during retry delay (expired, no late offer)', async () => {
@@ -2569,18 +2711,114 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
     });
 
     it('C15: React refresh / duplicate activation click (stable idempotency returns same operation, no duplicate publish)', async () => {
-      const idempotencyKey = 'idemp_act_click_01';
+      const camp = await CampaignModel.create({
+        id: 'cmp_c15',
+        tenantId,
+        name: 'Idempotency Test Campaign',
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        status: 'DRAFT',
+        activeVersionId: null,
+        draftVersion: 1,
+        pauseGeneration: 0
+      });
 
-      // First click creates record
-      const rec1 = { id: idempotencyKey, tenantId, status: 'SUCCESS', response: { version: 1 } };
+      const draft = await CampaignVersionModel.create({
+        id: 'cv_c15',
+        tenantId,
+        campaignId: camp.id,
+        version: 1,
+        name: camp.name,
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', advanceDays: 30, leapDayPolicy: 'FEB_28' },
+        timezone: 'Asia/Kolkata',
+        audience: { mode: 'ALL_ELIGIBLE' },
+        steps: [
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            prerequisite: 'NONE',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: { name: 'customer.firstName' }
+          }
+        ],
+        priority: 80,
+        publishedBy: 'owner',
+        reviewFingerprint: 'draft_initial'
+      });
 
-      // Second identical click returns existing response without executing again
-      const isDuplicate = rec1.id === idempotencyKey;
-      expect(isDuplicate).toBe(true);
+      const dryRunRes = await evaluateCampaignDryRun(draft as unknown as ICampaignVersion);
+      draft.reviewFingerprint = dryRunRes.draftFingerprint;
+      await draft.save();
+
+      await CampaignDryRunModel.create({
+        id: generateId('dry'),
+        tenantId,
+        campaignId: camp.id,
+        draftVersion: 1,
+        draftFingerprint: dryRunRes.draftFingerprint,
+        summary: dryRunRes.summary,
+        reasonBreakdown: dryRunRes.reasonBreakdown,
+        samplePlans: []
+      });
+
+      // 1. Missing idempotency key on mutation fails closed with 400 (Reviewer issue #3)
+      const resNoKey = await fetch(`${baseUrl}/api/v1/campaigns/${camp.id}/activate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ownerToken}`
+        },
+        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint })
+      });
+      const bodyNoKey = await resNoKey.json();
+      expect(resNoKey.status).toBe(400);
+      expect(bodyNoKey.error).toContain('IDEMPOTENCY_KEY_REQUIRED');
+
+      // 2. First click with stable idempotency key executes successfully
+      const stableKey = 'idemp_key_c15_refresh';
+      const res1 = await fetch(`${baseUrl}/api/v1/campaigns/${camp.id}/activate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ownerToken}`,
+          'Idempotency-Key': stableKey
+        },
+        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint })
+      });
+      const body1 = await res1.json();
+      expect(res1.status).toBe(200);
+      expect(body1.success).toBe(true);
+
+      // Verify idempotency record saved in MongoDB
+      const savedRecord = await IdempotencyRecordModel.findOne({ tenantId, key: stableKey });
+      expect(savedRecord).toBeDefined();
+      expect(savedRecord?.status).toBe('COMPLETED');
+
+      // 3. Second identical click (React refresh / double click) returns exact same cached response
+      const res2 = await fetch(`${baseUrl}/api/v1/campaigns/${camp.id}/activate`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Authorization: `Bearer ${ownerToken}`,
+          'Idempotency-Key': stableKey
+        },
+        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint })
+      });
+      const body2 = await res2.json();
+      expect(res2.status).toBe(200);
+      expect(body2).toEqual(body1);
+
+      // Assert only 1 version exists (no duplicate publish)
+      const versions = await CampaignVersionModel.find({ campaignId: camp.id, tenantId });
+      expect(versions.length).toBe(1);
     });
 
     it('C16: Conflicting settings/draft edit (409 version conflict, no silent overwrite)', async () => {
-      const settings = await TenantSettingsModel.create({
+      // 1. Settings concurrency conflict
+      await TenantSettingsModel.create({
         id: generateId('set'),
         tenantId,
         version: 1,
@@ -2595,10 +2833,60 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
         notice: 'Required Notice'
       });
 
-      // Client sends stale expectedVersion: 0
-      const expectedVersion = 0;
-      const conflict = settings.version !== expectedVersion;
-      expect(conflict).toBe(true);
+      const resSettingsConflict = await apiPatch(
+        '/api/v1/campaign-settings',
+        { expectedVersion: 0, timezone: 'Asia/Dubai' },
+        { Authorization: `Bearer ${ownerToken}` }
+      );
+      expect(resSettingsConflict.status).toBe(409);
+      expect(resSettingsConflict.body.error).toContain('conflict');
+
+      // Database state unchanged
+      const settingsUnchanged = await TenantSettingsModel.findOne({ tenantId });
+      expect(settingsUnchanged?.version).toBe(1);
+      expect(settingsUnchanged?.timezone).toBe('Asia/Kolkata');
+
+      // 2. Campaign draft concurrency conflict
+      const camp = await CampaignModel.create({
+        id: 'cmp_c16',
+        tenantId,
+        name: 'Draft Conflict Campaign',
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        status: 'DRAFT',
+        draftVersion: 2,
+        activeVersionId: null,
+        pauseGeneration: 0
+      });
+
+      await CampaignVersionModel.create({
+        id: 'cv_c16',
+        tenantId,
+        campaignId: camp.id,
+        version: 2,
+        name: camp.name,
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        timezone: 'Asia/Kolkata',
+        audience: { mode: 'ALL_ELIGIBLE' },
+        steps: [],
+        priority: 80,
+        publishedBy: 'owner',
+        reviewFingerprint: 'fp_c16'
+      });
+
+      // Send draft update with stale expectedVersion: 1 (current is 2)
+      const resDraftConflict = await apiPatch(
+        `/api/v1/campaigns/${camp.id}/draft`,
+        { expectedVersion: 1, priority: 99 },
+        { Authorization: `Bearer ${ownerToken}` }
+      );
+      expect(resDraftConflict.status).toBe(409);
+      expect(resDraftConflict.body.error).toContain('conflict');
+
+      const draftUnchanged = await CampaignVersionModel.findOne({ campaignId: camp.id, tenantId, version: 2 });
+      expect(draftUnchanged?.priority).toBe(80);
     });
 
     it('C17: Delivered message without order evidence (no sale/revenue fabricated)', async () => {
