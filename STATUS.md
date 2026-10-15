@@ -19,21 +19,21 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 
 | Requirement | Exists | Wired and running | Proven by test (test ID) |
 | :--- | :--- | :--- | :--- |
-| **P0.a**: `POST /api/v1/webhooks/orders` internal credential auth & tenant extraction | In Progress | No | Pending P0.a commit |
-| **P0.a**: Tenant-scoped queries on order goal updates (no unscoped `updateMany`) | In Progress | No | Pending P0.a commit |
-| **P0.a**: Remove hardcoded fallback tenant & invented `netPaise` defaults | In Progress | No | Pending P0.a commit |
-| **P0.a**: Occasion matching via `occasionRef` or explicit staff goal (A12, C17, C18) | In Progress | No | Pending P0.a commit |
-| **P0.a**: Step-level `stopOnGoal` respected (do not skip when `stopOnGoal: false`) | In Progress | No | Pending P0.a commit |
-| **P0.b**: `POST /internal/campaign-events` per-producer, per-tenant credentials scoped by event family | Partial | Partial | Pending P0.b commit |
-| **P0.b**: Durable event persistence (`RECEIVED`) before HTTP ACK | Yes | Yes | Pending B03 test |
-| **P0.b**: Event rescan worker for unprocessed `RECEIVED` events (crash recovery B03) | Partial | Partial | Pending B03 test |
-| **P0.b**: Entity version check: reject stale entity versions | Partial | Partial | Pending P0.b commit |
-| **P0.b**: Schema validation sending unparseable/unknown events to visible `QUARANTINE` | Partial | Partial | Pending P0.b commit |
-| **P0.c**: Inbound WhatsApp reply connection-to-tenant mapping & tenant-scoped customer lookup | Partial | Partial | Pending P0.c commit |
-| **P0.c**: E.164 phone normalization utility replacing naive regex | No | No | Pending P0.c commit |
-| **P0.d**: Real credentials login endpoint returning scoped JWT | No | No | Pending P0.d commit |
-| **P0.d**: Frontend: remove hardcoded `x-tenant-id` and hardcoded shop names | No | No | Pending P0.d commit |
-| **P0.d**: Role-based access control (Staff activity/holds vs Owner/Admin campaigns & policy) | No | No | Pending P0.d commit |
+| **P0.a**: `POST /api/v1/webhooks/orders` internal credential auth & tenant extraction | Yes | Yes | `p0Security.test.ts` (401 on unauth, 403 on wrong family) |
+| **P0.a**: Tenant-scoped queries on order goal updates (no unscoped `updateMany`) | Yes | Yes | `p0Security.test.ts` (tenant-scoped updateMany, 403 on cross-tenant) |
+| **P0.a**: Remove hardcoded fallback tenant & invented `netPaise` defaults | Yes | Yes | `p0Security.test.ts` (strict credential tenant, netPaise preserved) |
+| **P0.a**: Occasion matching via `occasionRef` or explicit staff goal (A12, C17, C18) | Yes | Yes | `p0Security.test.ts` (A12, C17 occasion matching) |
+| **P0.a**: Step-level `stopOnGoal` respected (do not skip when `stopOnGoal: false`) | Yes | Yes | `p0Security.test.ts` (greeting step preserved in SCHEDULED) |
+| **P0.b**: `POST /internal/campaign-events` per-producer, per-tenant credentials scoped by event family | Yes | Yes | `p0Security.test.ts` (401 unauth, 403 family mismatch) |
+| **P0.b**: Durable event persistence (`RECEIVED`) before HTTP ACK | Yes | Yes | `p0Security.test.ts` (persisted as RECEIVED before 201 ACK) |
+| **P0.b**: Event rescan worker for unprocessed `RECEIVED` events (crash recovery B03) | Yes | Yes | `p0Security.test.ts` (B03 simulated crash recovery to PROCESSED) |
+| **P0.b**: Entity version check: reject stale entity versions | Yes | Yes | `p0Security.test.ts` (version 3 rejected after version 5) |
+| **P0.b**: Schema validation sending unparseable/unknown events to visible `QUARANTINE` | Yes | Yes | `p0Security.test.ts` (422 QUARANTINE on malformed schema) |
+| **P0.c**: Inbound WhatsApp reply connection-to-tenant mapping & tenant-scoped customer lookup | Yes | Yes | `p0Security.test.ts` (connection-to-tenant lookup & reply hold) |
+| **P0.c**: E.164 phone normalization utility replacing naive regex | Yes | Yes | `phone.test.ts` (8/8 unit tests passing) |
+| **P0.d**: Real credentials login endpoint returning scoped JWT | Yes | Yes | `p0Security.test.ts` (real login, pbkdf2 hash, scoped JWT) |
+| **P0.d**: Frontend: remove hardcoded `x-tenant-id` and hardcoded shop names | Yes | Yes | Frontend build clean; dynamic profile & shopName |
+| **P0.d**: Role-based access control (Staff activity/holds vs Owner/Admin campaigns & policy) | Yes | Yes | `p0Security.test.ts` (403 on STAFF modifying campaigns) |
 
 ---
 

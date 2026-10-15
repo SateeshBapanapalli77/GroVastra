@@ -99,7 +99,7 @@ campaignRouter.get('/campaigns', async (req: Request, res: Response) => {
  * POST /api/v1/campaigns
  * Create a new campaign from a preset
  */
-campaignRouter.post('/campaigns', async (req: Request, res: Response) => {
+campaignRouter.post('/campaigns', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
   try {
     const tenantId = (req as any).tenantId;
     const { presetId, name } = req.body;
@@ -198,7 +198,10 @@ campaignRouter.get('/campaigns/:id', async (req: Request, res: Response) => {
  * PATCH /api/v1/campaigns/:id/draft
  * Update draft configuration (Trigger, Audience, Steps, Rules)
  */
-campaignRouter.patch('/campaigns/:id/draft', async (req: Request, res: Response) => {
+campaignRouter.patch(
+  '/campaigns/:id/draft',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  async (req: Request, res: Response) => {
   try {
     const tenantId = (req as any).tenantId;
     const { name, trigger, audience, steps, priority, timezone } = req.body;

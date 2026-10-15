@@ -1,7 +1,16 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1';
-const DEFAULT_TENANT = process.env.NEXT_PUBLIC_DEFAULT_TENANT || 'shop_padmavati_handlooms';
 
 let cachedToken: string | null = null;
+let cachedUser: UserProfile | null = null;
+
+export interface UserProfile {
+  id: string;
+  username: string;
+  name: string;
+  role: 'BOUTIQUE_OWNER' | 'STORE_MANAGER' | 'STAFF' | 'SYSTEM';
+  tenantId: string;
+  shopName: string;
+}
 
 export function setAuthToken(token: string) {
   cachedToken = token;
@@ -18,11 +27,42 @@ export function getAuthToken(): string | null {
   return null;
 }
 
+export function setStoredUser(user: UserProfile) {
+  cachedUser = user;
+  if (typeof window !== 'undefined') {
+    localStorage.setItem('grovastra_auth_user', JSON.stringify(user));
+  }
+}
+
+export function getStoredUser(): UserProfile | null {
+  if (cachedUser) return cachedUser;
+  if (typeof window !== 'undefined') {
+    const raw = localStorage.getItem('grovastra_auth_user');
+    if (raw) {
+      try {
+        cachedUser = JSON.parse(raw);
+        return cachedUser;
+      } catch {
+        return null;
+      }
+    }
+  }
+  return null;
+}
+
+export function clearAuth() {
+  cachedToken = null;
+  cachedUser = null;
+  if (typeof window !== 'undefined') {
+    localStorage.removeItem('grovastra_auth_token');
+    localStorage.removeItem('grovastra_auth_user');
+  }
+}
+
 async function request<T = any>(endpoint: string, options: RequestInit = {}): Promise<T> {
   const token = getAuthToken();
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
-    'x-tenant-id': DEFAULT_TENANT,
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
     ...(options.headers as Record<string, string> || {})
   };
@@ -70,6 +110,31 @@ export interface ActivityItem {
 }
 
 export const api = {
+  // Authentication
+  login: async (username: string, password: string): Promise<{ success: boolean; token: string; user: UserProfile }> => {
+    const res = await request('/auth/login', {
+      method: 'POST',
+      body: JSON.stringify({ username, password })
+    });
+    if (res.token) {
+      setAuthToken(res.token);
+      setStoredUser(res.user);
+    }
+    return res;
+  },
+
+  getMe: async (): Promise<{ success: boolean; user: UserProfile }> => {
+    const res = await request('/auth/me');
+    if (res.user) {
+      setStoredUser(res.user);
+    }
+    return res;
+  },
+
+  logout: () => {
+    clearAuth();
+  },
+
   // Campaigns
   getCampaigns: async (): Promise<{ success: boolean; campaigns: CampaignSummary[] }> => {
     return request('/campaigns');
@@ -103,6 +168,13 @@ export const api = {
     return request(`/campaigns/${id}/activate`, {
       method: 'POST',
       body: JSON.stringify({ reviewFingerprint })
+    });
+  },
+
+  publishRevision: async (id: string, expectedVersion: number, reviewFingerprint: string, steps?: any[]): Promise<{ success: boolean }> => {
+    return request(`/campaigns/${id}/publish-revision`, {
+      method: 'POST',
+      body: JSON.stringify({ expectedVersion, reviewFingerprint, steps })
     });
   },
 

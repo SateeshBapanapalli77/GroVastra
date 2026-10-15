@@ -1,6 +1,6 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-export type EventProcessingStatus = 'RECEIVED' | 'PROCESSING' | 'PROCESSED' | 'FAILED';
+export type EventProcessingStatus = 'RECEIVED' | 'PROCESSING' | 'PROCESSED' | 'FAILED' | 'QUARANTINE';
 
 export interface ICampaignEventInbox extends Document {
   id: string;
@@ -37,7 +37,7 @@ const CampaignEventInboxSchema = new Schema<ICampaignEventInbox>(
     status: {
       type: String,
       required: true,
-      enum: ['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED'],
+      enum: ['RECEIVED', 'PROCESSING', 'PROCESSED', 'FAILED', 'QUARANTINE'],
       default: 'RECEIVED'
     },
     processedAt: { type: Date, default: null },

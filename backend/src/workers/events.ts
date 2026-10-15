@@ -3,6 +3,7 @@ import { CampaignEventInboxModel, ICampaignEventInbox } from '../modules/campaig
 import { evaluateRestockEvent } from '../modules/campaigns/engine/restockStrategy';
 import { evaluateEnquiryEvent } from '../modules/campaigns/engine/enquiryStrategy';
 import { evaluateAlterationReadyEvent } from '../modules/campaigns/engine/boutiqueServiceStrategy';
+import { evaluateOrderCompletedGoal } from '../modules/campaigns/engine/orderGoalEvaluator';
 import { env } from '../config/env';
 import { logger } from '../config/logger';
 
@@ -54,6 +55,14 @@ export async function processNextPendingEvent(
       await evaluateEnquiryEvent(event as any);
     } else if (event.type === 'alteration.completed') {
       await evaluateAlterationReadyEvent(event as any);
+    } else if (event.type === 'order.completed') {
+      await evaluateOrderCompletedGoal({
+        tenantId: event.tenantId,
+        customerId: event.customerId,
+        orderId: event.entityId,
+        occasionRef: event.data?.occasionRef,
+        netPaise: event.data?.netPaise
+      });
     }
 
     event.status = 'PROCESSED';

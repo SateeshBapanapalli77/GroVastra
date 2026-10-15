@@ -142,6 +142,34 @@ async function seed() {
   await ProductModel.insertMany(products);
   logger.info({ count: products.length }, 'Seeded Inventory products');
 
+  // 3. Seed Boutique Staff Credentials
+  const { UserModel, hashPassword } = await import('../modules/auth/models/User.model');
+  await UserModel.deleteMany({ tenantId });
+
+  const users = [
+    {
+      id: 'usr_owner_01',
+      tenantId,
+      username: 'owner@padmavati.com',
+      passwordHash: hashPassword('HeritageOwner2026!'),
+      name: 'Padmavati Sundar',
+      role: 'BOUTIQUE_OWNER' as const,
+      shopName: 'Padmavati Handlooms'
+    },
+    {
+      id: 'usr_staff_01',
+      tenantId,
+      username: 'staff@padmavati.com',
+      passwordHash: hashPassword('HeritageStaff2026!'),
+      name: 'Anjali Sharma',
+      role: 'STAFF' as const,
+      shopName: 'Padmavati Handlooms'
+    }
+  ];
+
+  await UserModel.insertMany(users);
+  logger.info({ count: users.length }, 'Seeded Boutique Owner and Staff credentials');
+
   logger.info('Database seed complete!');
   await disconnectDatabase();
 }

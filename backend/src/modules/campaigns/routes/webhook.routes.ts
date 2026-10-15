@@ -8,6 +8,10 @@ import { eventBus } from '../../../shared/events/eventBus';
 import { generateId } from '../../../shared/utils/id';
 import { logger } from '../../../config/logger';
 import { env } from '../../../config/env';
+import { normalizeE164 } from '../../../shared/utils/phone';
+import { resolveTenantForConnection } from '../services/connectionRegistry';
+import { requireInternalAuth } from '../../../shared/middleware/internalAuth.middleware';
+import { evaluateOrderCompletedGoal } from '../engine/orderGoalEvaluator';
 import crypto from 'crypto';
 
 export const webhookRouter = Router();
@@ -205,11 +209,23 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
           // Process Inbound Customer Replies -> Triggers stopOnReply weaver hold!
           if (Array.isArray(value.messages)) {
-            const tenantId = (req as any).tenantId || env.DEFAULT_TENANT_ID;
+            const phoneNumberId = value.metadata?.phone_number_id;
+            const tenantId = await resolveTenantForConnection(phoneNumberId);
+            if (!tenantId) {
+              logger.warn({ phoneNumberId }, 'Inbound WhatsApp reply rejected: no tenant mapped to connection');
+              continue;
+            }
+
             for (const msg of value.messages) {
               const rawFrom = msg.from; // e.g. '919876543210'
               const textBody = msg.text?.body || msg.button?.text || '';
-              const normalizedPhone = rawFrom.startsWith('+') ? rawFrom : `+${rawFrom}`;
+              let normalizedPhone: string;
+              try {
+                normalizedPhone = normalizeE164(rawFrom);
+              } catch {
+                logger.warn('Invalid phone format received in WhatsApp message');
+                continue;
+              }
 
               // Strictly tenant-scoped customer lookup by E.164 phone
               const customer = await CustomerModel.findOne({
@@ -224,7 +240,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 );
 
                 logger.info(
-                  { customerId: customer.id, tenantId, phone: normalizedPhone },
+                  { customerId: customer.id, tenantId },
                   'Inbound WhatsApp message received: activated human weaver hold on enrollments'
                 );
 
@@ -279,8 +295,20 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     }
 
     if (customerPhone && messageText) {
-      const normalizedPhone = customerPhone.startsWith('+') ? customerPhone : `+${customerPhone}`;
-      const tenantId = (req as any).tenantId || env.DEFAULT_TENANT_ID;
+      let normalizedPhone: string;
+      try {
+        normalizedPhone = normalizeE164(customerPhone);
+      } catch {
+        return res.status(400).json({ success: false, error: 'Invalid customer phone number' });
+      }
+
+      const connectionId = body.connectionId;
+      const tenantId = (req as any).tenantId || (connectionId ? await resolveTenantForConnection(connectionId) : null);
+      if (!tenantId) {
+        logger.warn('Flat customer reply rejected: missing or unmapped tenant context');
+        return res.status(400).json({ success: false, error: 'Tenant context could not be resolved from connection' });
+      }
+
       const customer = await CustomerModel.findOne({
         tenantId,
         phone: normalizedPhone
@@ -322,36 +350,85 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
 /**
  * POST /api/v1/internal/campaign-events
- * Authenticated internal ingestion endpoint writing durably to campaignEventInbox and publishing to eventBus
+ * Authenticated domain-event ingestion with per-producer, per-tenant credentials (spec p.24, p.26)
+ * - Scope: scoped strictly by tenant and event family
+ * - Tenant: taken from verified credential, never from header/body
+ * - Quarantine: invalid schemas and stale entity versions rejected to QUARANTINE
+ * - Durability: persisted before ACK, PROCESSED marked only after durable processing (B03)
  */
-webhookRouter.post('/internal/campaign-events', async (req: Request, res: Response) => {
+webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-events'), async (req: Request, res: Response) => {
   try {
-    // 1. Authenticate Internal Service Key (fail closed & constant-time)
-    const internalKey =
-      (req.headers['x-internal-api-key'] as string) ||
-      (req.headers['authorization'] as string)?.replace(/^Bearer\s+/i, '');
-
-    const configuredKey = env.INTERNAL_API_KEY || process.env.INTERNAL_API_KEY;
-
-    if (!internalKey || !configuredKey || !timingSafeCompare(internalKey, configuredKey)) {
-      logger.warn({ ip: req.ip, path: req.path }, 'Unauthorized attempt to access /internal/campaign-events');
-      return res.status(401).json({ success: false, error: 'Unauthorized internal service call' });
-    }
-
-    // 2. Resolve Tenant Identity from Authenticated Context
-    const tenantId = (req.headers['x-tenant-id'] as string) || req.body.tenantId;
-    const { eventId, type, producer, entityId, entityVersion, occurredAt, customerId, data } = req.body;
-
-    if (!type || !tenantId) {
-      return res.status(400).json({ success: false, error: 'type and tenantId are required' });
-    }
+    const tenantId = req.tenantId!;
+    const { schemaVersion, eventId, type, producer, entityId, entityVersion, occurredAt, customerId, data } = req.body;
 
     const id = eventId || generateId('evt');
     const producerName = producer || 'internal';
     const parsedOccurredAt = occurredAt ? new Date(occurredAt) : new Date();
     const parsedEntityVersion = typeof entityVersion === 'number' ? entityVersion : 1;
 
-    // 3. Durable & Atomic Ingestion via Compound Unique Index { tenantId, producer, eventId }
+    // 1. Schema Validation (Spec p.24: "incompatible schema produces a visible quarantine state")
+    const isValidSchema =
+      (schemaVersion === 1 || schemaVersion === undefined) &&
+      typeof type === 'string' &&
+      !isNaN(parsedOccurredAt.getTime()) &&
+      typeof entityId === 'string';
+
+    if (!isValidSchema) {
+      logger.warn({ id, tenantId, type }, 'Incompatible event schema sent to QUARANTINE');
+      await CampaignEventInboxModel.create({
+        id,
+        tenantId,
+        producer: producerName,
+        eventId: id,
+        type: type || 'unknown.schema',
+        entityId: entityId || id,
+        entityVersion: parsedEntityVersion,
+        occurredAt: isNaN(parsedOccurredAt.getTime()) ? new Date() : parsedOccurredAt,
+        receivedAt: new Date(),
+        customerId: customerId || undefined,
+        data: data || {},
+        status: 'QUARANTINE',
+        errorMessage: 'INCOMPATIBLE_SCHEMA: Invalid or unrecognized event schema structure'
+      });
+      return res.status(422).json({
+        success: false,
+        status: 'QUARANTINE',
+        error: 'Event sent to quarantine: incompatible or unknown event schema'
+      });
+    }
+
+    // 2. Reject Stale Entity Versions (Spec p.24: "An older event cannot restore a state superseded by a newer entity version")
+    const latestEvent = await CampaignEventInboxModel.findOne({
+      tenantId,
+      producer: producerName,
+      entityId: entityId || id
+    }).sort({ entityVersion: -1 });
+
+    if (latestEvent && latestEvent.entityVersion > parsedEntityVersion) {
+      logger.warn({ entityId, version: parsedEntityVersion, latest: latestEvent.entityVersion }, 'Stale entity version rejected to QUARANTINE');
+      await CampaignEventInboxModel.create({
+        id,
+        tenantId,
+        producer: producerName,
+        eventId: id,
+        type,
+        entityId: entityId || id,
+        entityVersion: parsedEntityVersion,
+        occurredAt: parsedOccurredAt,
+        receivedAt: new Date(),
+        customerId: customerId || undefined,
+        data: data || {},
+        status: 'QUARANTINE',
+        errorMessage: `STALE_ENTITY_VERSION: Incoming version ${parsedEntityVersion} is older than processed version ${latestEvent.entityVersion}`
+      });
+      return res.status(409).json({
+        success: false,
+        status: 'QUARANTINE',
+        error: `Stale entity version ${parsedEntityVersion} superseded by ${latestEvent.entityVersion}`
+      });
+    }
+
+    // 3. Durable & Atomic Ingestion (Persist as RECEIVED before ACK)
     let inboxEvent;
     try {
       inboxEvent = await CampaignEventInboxModel.create({
@@ -370,45 +447,46 @@ webhookRouter.post('/internal/campaign-events', async (req: Request, res: Respon
       });
     } catch (err: any) {
       if (err.code === 11000) {
-        // Atomic duplicate catch: check existing processing state
+        // Atomic duplicate catch: return existing state idempotently
         const existing = await CampaignEventInboxModel.findOne({ tenantId, producer: producerName, eventId: id });
-        if (existing && existing.status === 'PROCESSED') {
-          return res.status(200).json({
-            success: true,
-            message: 'Event already ingested and processed (idempotent duplicate)',
-            eventId: id,
-            status: 'PROCESSED'
-          });
-        }
-        // If existing is still RECEIVED or FAILED, continue to durable dispatch below
-        inboxEvent = existing;
-      } else {
-        throw err;
+        return res.status(200).json({
+          success: true,
+          message: 'Event already ingested (idempotent duplicate)',
+          eventId: id,
+          status: existing?.status || 'PROCESSED'
+        });
       }
+      throw err;
     }
 
-    // 4. Durable Event Bus Dispatch (only marks PROCESSED after dispatch)
-    await eventBus.publish({
-      schemaVersion: 1,
-      producer: producerName,
-      eventId: id,
-      tenantId,
-      type,
-      entityId: entityId || id,
-      entityVersion: parsedEntityVersion,
-      occurredAt: parsedOccurredAt,
-      receivedAt: new Date(),
-      customerId: customerId || undefined,
-      data: data || {}
-    });
+    // Acknowledge receipt durably stored
+    res.status(201).json({ success: true, eventId: id, status: 'RECEIVED' });
 
-    if (inboxEvent) {
-      inboxEvent.status = 'PROCESSED';
-      inboxEvent.processedAt = new Date();
-      await inboxEvent.save();
+    // 4. Asynchronous durable processing (publish to eventBus, mark PROCESSED after completion)
+    try {
+      await eventBus.publish({
+        schemaVersion: 1,
+        producer: producerName,
+        eventId: id,
+        tenantId,
+        type,
+        entityId: entityId || id,
+        entityVersion: parsedEntityVersion,
+        occurredAt: parsedOccurredAt,
+        receivedAt: new Date(),
+        customerId: customerId || undefined,
+        data: data || {}
+      });
+
+      if (inboxEvent) {
+        inboxEvent.status = 'PROCESSED';
+        inboxEvent.processedAt = new Date();
+        await inboxEvent.save();
+      }
+    } catch (publishErr: any) {
+      logger.error({ publishErr, eventId: id }, 'Event dispatch error; remains RECEIVED for worker rescan');
+      // Intentionally keep as RECEIVED so worker rescans and processes it (Crash safety B03)
     }
-
-    res.status(201).json({ success: true, eventId: id, status: 'PROCESSED' });
   } catch (err: any) {
     logger.error({ err }, 'Error ingesting internal campaign event');
     res.status(500).json({ success: false, error: err.message });
@@ -417,47 +495,58 @@ webhookRouter.post('/internal/campaign-events', async (req: Request, res: Respon
 
 /**
  * POST /api/v1/webhooks/orders
- * Ingests completed order event -> triggers stopOnGoal completion!
+ * Authenticated order webhook triggering stopOnGoal completion strictly per spec p.11, p.16 (A12, C17, C18)
+ * - Authentication: Internal credential required; tenantId taken from credential
+ * - Scope: All queries scoped strictly by tenantId
+ * - No invented defaults: netPaise is never defaulted to a made-up price
+ * - Occasion matching: only sets goal on enrollments whose occasion matches order's occasionRef
+ * - Step stopOnGoal: does NOT skip steps that have stopOnGoal=false
  */
-webhookRouter.post('/webhooks/orders', async (req: Request, res: Response) => {
+webhookRouter.post('/webhooks/orders', requireInternalAuth('orders'), async (req: Request, res: Response) => {
   try {
-    const { orderId, customerId, tenantId, netPaise } = req.body;
+    const tenantId = req.tenantId!; // Strictly from verified internal credential
+    const { orderId, customerId, occasionRef, netPaise } = req.body;
 
-    if (!customerId) {
-      return res.status(400).json({ success: false, error: 'customerId is required' });
+    if (!orderId || !customerId) {
+      return res.status(400).json({ success: false, error: 'orderId and customerId are required' });
     }
 
-    const updated = await CampaignEnrollmentModel.updateMany(
-      { customerId, status: 'ACTIVE' },
-      {
-        $set: {
-          goalReachedAt: new Date(),
-          goalOrderRef: orderId || 'ord_direct'
-        }
-      }
-    );
+    // 1. Evaluate goal attribution strictly per spec p.11, p.16
+    const { matchedCount, updatedEnrollments } = await evaluateOrderCompletedGoal({
+      tenantId,
+      customerId,
+      orderId,
+      occasionRef,
+      netPaise: typeof netPaise === 'number' ? netPaise : undefined
+    });
 
-    logger.info(
-      { customerId, orderId, modifiedCount: updated.modifiedCount },
-      'Order completed; recorded goal reached on active enrollments'
-    );
-
+    // 2. Publish order.completed event with actual netPaise (no fabricated default)
     await eventBus.publish({
       schemaVersion: 1,
       producer: 'orders',
       eventId: generateId('evt'),
-      tenantId: tenantId || 'shop_padmavati_handlooms',
+      tenantId,
       type: 'order.completed',
-      entityId: orderId || 'ord_001',
+      entityId: orderId,
       entityVersion: 1,
       occurredAt: new Date(),
       receivedAt: new Date(),
       customerId,
-      data: { netPaise: netPaise || 3850000, orderId }
+      data: {
+        orderId,
+        occasionRef,
+        ...(typeof netPaise === 'number' ? { netPaise } : {})
+      }
     });
 
-    res.json({ success: true, updatedEnrollments: updated.modifiedCount });
+    res.json({
+      success: true,
+      updatedEnrollments: matchedCount,
+      enrollmentIds: updatedEnrollments
+    });
   } catch (err: any) {
+    logger.error({ err }, 'Error processing orders webhook');
     res.status(500).json({ success: false, error: err.message });
   }
 });
+

@@ -5,6 +5,7 @@ import { env } from './config/env';
 import { logger } from './config/logger';
 import { connectDatabase } from './config/database';
 import { campaignRouter, webhookRouter } from './modules/campaigns';
+import { authRouter } from './modules/auth/routes/auth.routes';
 
 const app = express();
 
@@ -39,9 +40,10 @@ app.get('/api/v1/health', (req, res) => {
   });
 });
 
-// Mount Campaign Module APIs & Webhook Ingress
-app.use('/api/v1', campaignRouter);
+// Mount Webhook Ingress, Auth & Campaign Module APIs
 app.use('/api/v1', webhookRouter);
+app.use('/api/v1', authRouter);
+app.use('/api/v1', campaignRouter);
 
 async function startServer() {
   try {

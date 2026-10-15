@@ -8,3 +8,4 @@ export * from './CampaignEventInbox.model';
 export * from './CampaignCheckpoint.model';
 export * from './CampaignCustomerFact.model';
 export * from './CampaignDryRun.model';
+export * from './TenantConnection.model';

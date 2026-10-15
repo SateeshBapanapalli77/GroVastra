@@ -14,12 +14,15 @@ import {
   Activity
 } from 'lucide-react';
 
+import { UserProfile } from '../lib/api';
+
 interface SidebarProps {
   currentTab: 'campaigns' | 'activity' | 'templates' | 'customers' | 'settings';
   onSelectTab: (tab: 'campaigns' | 'activity' | 'templates' | 'customers' | 'settings') => void;
+  user?: UserProfile | null;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, user }) => {
   return (
     <aside className="w-64 border-r border-[#EAE4DC] bg-[#FAF8F5] flex flex-col justify-between shrink-0 select-none min-h-screen">
       <div>
@@ -44,10 +47,10 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab }) => 
             <div className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
             <div className="truncate">
               <div className="text-xs font-semibold text-[#271E1B] truncate">
-                GroVastra Boutique
+                {user?.shopName || 'Heritage Boutique'}
               </div>
               <div className="text-[10px] text-[#6B5E59] truncate">
-                Flagship Store • Hyderabad
+                {user?.role ? user.role.replace('_', ' ') : 'Verified Tenant'}
               </div>
             </div>
           </div>
