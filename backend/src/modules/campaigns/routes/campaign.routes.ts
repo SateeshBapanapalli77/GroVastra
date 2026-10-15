@@ -18,6 +18,11 @@ import { generateId } from '../../../shared/utils/id';
 import { maskPhone } from '../../../shared/utils/phone';
 import { requireAuth, requireRole } from '../../../shared/middleware/auth.middleware';
 import { requireIdempotency } from '../../../shared/middleware/idempotency.middleware';
+import {
+  generateOwnerOverviewReport,
+  getCustomerTimeline,
+  getMonitoringAlerts
+} from '../engine/ownerReporting';
 
 export const campaignRouter = Router();
 
@@ -644,6 +649,98 @@ campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STO
   }
 });
 
+export async function validateCampaignVersionDefinition(version: any, tenantId: string) {
+  const errors: Array<{ fieldPath: string; message: string; resolutionOwner: 'BOUTIQUE_OWNER' | 'INTEGRATION_DEVELOPER' }> = [];
+  const warnings: Array<{ fieldPath: string; message: string; resolutionOwner: string }> = [];
+
+  // 1. Audience validation
+  const audVal = validateAudienceConfig(version.audience);
+  if (!audVal.valid && audVal.errors.length > 0) {
+    for (const err of audVal.errors) {
+      errors.push({
+        fieldPath: 'audience',
+        message: err,
+        resolutionOwner: 'BOUTIQUE_OWNER'
+      });
+    }
+  }
+
+  // 2. Channel Connection Readiness check (Spec A05)
+  const connection = await TenantConnectionModel.findOne({ tenantId, active: true });
+  if (!connection) {
+    errors.push({
+      fieldPath: 'connectionId',
+      message: 'No active WhatsApp channel connection found for this boutique.',
+      resolutionOwner: 'INTEGRATION_DEVELOPER'
+    });
+  }
+
+  // 3. Step validation
+  if (!version.steps || version.steps.length === 0) {
+    errors.push({
+      fieldPath: 'steps',
+      message: 'Campaign must have at least one execution step configured.',
+      resolutionOwner: 'BOUTIQUE_OWNER'
+    });
+  } else {
+    for (const step of version.steps) {
+      const template = getApprovedTemplate(step.templateRef?.id);
+      if (!template) {
+        errors.push({
+          fieldPath: `steps.${step.stepId}.templateRef.id`,
+          message: `Template '${step.templateRef?.id}' is missing or not in the approved catalogue.`,
+          resolutionOwner: 'INTEGRATION_DEVELOPER'
+        });
+      } else if (template.status === 'PAUSED') {
+        errors.push({
+          fieldPath: `steps.${step.stepId}.templateRef.id`,
+          message: `Template '${step.templateRef?.id}' is paused by the WhatsApp provider.`,
+          resolutionOwner: 'INTEGRATION_DEVELOPER'
+        });
+      } else {
+        const rawBindings = step.bindings instanceof Map
+          ? Object.fromEntries(step.bindings.entries())
+          : (step.bindings || {});
+
+        for (const varKey of template.variableKeys) {
+          const bound = rawBindings[varKey];
+          if (!bound && varKey !== 'name' && varKey !== 'shop') {
+            errors.push({
+              fieldPath: `steps.${step.stepId}.bindings.${varKey}`,
+              message: `Template variable '${varKey}' is not mapped to a customer or store attribute.`,
+              resolutionOwner: 'BOUTIQUE_OWNER'
+            });
+          }
+        }
+      }
+
+      if (!step.localTime || !/^\d{2}:\d{2}$/.test(step.localTime)) {
+        errors.push({
+          fieldPath: `steps.${step.stepId}.localTime`,
+          message: `Invalid localTime '${step.localTime}'. Must be in HH:mm format.`,
+          resolutionOwner: 'BOUTIQUE_OWNER'
+        });
+      }
+    }
+  }
+
+  const eligibleCount = await CustomerModel.countDocuments({
+    tenantId,
+    status: 'ACTIVE',
+    channelSuppressed: false,
+    optedInMarketing: true
+  });
+  if (eligibleCount === 0) {
+    warnings.push({
+      fieldPath: 'audience.customers',
+      message: 'No eligible customers currently in CRM. Future customers will qualify when added.',
+      resolutionOwner: 'BOUTIQUE_OWNER'
+    });
+  }
+
+  return { valid: errors.length === 0, errors, warnings };
+}
+
 /**
  * POST /api/v1/campaigns/:id/validate
  * Validates campaign configuration, step approved templates, parameter bindings, and channel readiness (A05)
@@ -662,98 +759,8 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
       return res.status(400).json({ success: false, error: 'No campaign version found to validate' });
     }
 
-    const errors: Array<{ fieldPath: string; message: string; resolutionOwner: 'BOUTIQUE_OWNER' | 'INTEGRATION_DEVELOPER' }> = [];
-    const warnings: Array<{ fieldPath: string; message: string; resolutionOwner: string }> = [];
+    const { valid: isValid, errors, warnings } = await validateCampaignVersionDefinition(version, tenantId);
 
-    // 1. Audience validation
-    const audVal = validateAudienceConfig(version.audience);
-    if (!audVal.valid && audVal.errors.length > 0) {
-      for (const err of audVal.errors) {
-        errors.push({
-          fieldPath: 'audience',
-          message: err,
-          resolutionOwner: 'BOUTIQUE_OWNER'
-        });
-      }
-    }
-
-    // 2. Channel Connection Readiness check (Spec A05)
-    const connection = await TenantConnectionModel.findOne({ tenantId, active: true });
-    if (!connection) {
-      errors.push({
-        fieldPath: 'connectionId',
-        message: 'No active WhatsApp channel connection found for this boutique.',
-        resolutionOwner: 'INTEGRATION_DEVELOPER'
-      });
-    }
-
-    // 3. Step validation
-    if (!version.steps || version.steps.length === 0) {
-      errors.push({
-        fieldPath: 'steps',
-        message: 'Campaign must have at least one execution step configured.',
-        resolutionOwner: 'BOUTIQUE_OWNER'
-      });
-    } else {
-      for (const step of version.steps) {
-        const template = getApprovedTemplate(step.templateRef?.id);
-        if (!template) {
-          errors.push({
-            fieldPath: `steps.${step.stepId}.templateRef.id`,
-            message: `Template '${step.templateRef?.id}' is missing or not in the approved catalogue.`,
-            resolutionOwner: 'INTEGRATION_DEVELOPER'
-          });
-        } else if (template.status === 'PAUSED') {
-          errors.push({
-            fieldPath: `steps.${step.stepId}.templateRef.id`,
-            message: `Template '${step.templateRef?.id}' is paused by the WhatsApp provider.`,
-            resolutionOwner: 'INTEGRATION_DEVELOPER'
-          });
-        } else {
-          // Check variable bindings for required keys
-          const rawBindings = step.bindings instanceof Map
-            ? Object.fromEntries(step.bindings.entries())
-            : (step.bindings || {});
-
-          for (const varKey of template.variableKeys) {
-            const bound = rawBindings[varKey];
-            if (!bound && varKey !== 'name' && varKey !== 'shop') {
-              errors.push({
-                fieldPath: `steps.${step.stepId}.bindings.${varKey}`,
-                message: `Template variable '${varKey}' is not mapped to a customer or store attribute.`,
-                resolutionOwner: 'BOUTIQUE_OWNER'
-              });
-            }
-          }
-        }
-
-        // Timing validation
-        if (!step.localTime || !/^\d{2}:\d{2}$/.test(step.localTime)) {
-          errors.push({
-            fieldPath: `steps.${step.stepId}.localTime`,
-            message: `Invalid localTime '${step.localTime}'. Must be in HH:mm format.`,
-            resolutionOwner: 'BOUTIQUE_OWNER'
-          });
-        }
-      }
-    }
-
-    // Check eligible customers today (Spec A04)
-    const eligibleCount = await CustomerModel.countDocuments({
-      tenantId,
-      status: 'ACTIVE',
-      channelSuppressed: false,
-      optedInMarketing: true
-    });
-    if (eligibleCount === 0) {
-      warnings.push({
-        fieldPath: 'audience.customers',
-        message: 'No eligible customers currently in CRM. Future customers will qualify when added.',
-        resolutionOwner: 'BOUTIQUE_OWNER'
-      });
-    }
-
-    const isValid = errors.length === 0;
     if (isValid) {
       campaign.status = 'VALIDATED';
       await campaign.save();
@@ -1254,3 +1261,47 @@ campaignRouter.get('/customers', async (req: Request, res: Response) => {
 campaignRouter.get('/templates', async (_req: Request, res: Response) => {
   res.json({ success: true, templates: APPROVED_TEMPLATES });
 });
+
+/**
+ * GET /api/v1/campaigns/reports/owner-overview
+ * Owner reporting overview with single-attribution net sales and reason precedence (Spec p.28, p.34)
+ */
+campaignRouter.get('/campaigns/reports/owner-overview', async (req: Request, res: Response) => {
+  try {
+    const tenantId = req.tenantId!;
+    const report = await generateOwnerOverviewReport(tenantId);
+    res.json({ success: true, report });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/v1/campaigns/reports/customer-timeline/:customerId
+ * Customer lifecycle and execution timeline with masked recipient phone (Spec p.28)
+ */
+campaignRouter.get('/campaigns/reports/customer-timeline/:customerId', async (req: Request, res: Response) => {
+  try {
+    const tenantId = req.tenantId!;
+    const customerId = Array.isArray(req.params.customerId) ? req.params.customerId[0] : req.params.customerId;
+    const timeline = await getCustomerTimeline(tenantId, customerId);
+    res.json({ success: true, customerId, timeline });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/v1/campaigns/monitoring/alerts
+ * Operational alerts: planner lag, due-step age, event backlog, unknown outcomes, template blocks, stalled checkpoints (Spec p.28, p.34)
+ */
+campaignRouter.get('/campaigns/monitoring/alerts', async (req: Request, res: Response) => {
+  try {
+    const tenantId = req.tenantId!;
+    const alertsReport = await getMonitoringAlerts(tenantId);
+    res.json({ success: true, monitoring: alertsReport });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+

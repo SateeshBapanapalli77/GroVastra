@@ -126,11 +126,31 @@ export async function executeDueStepDispatch(
  * WhatsApp delivery adapter, and delivery status correlation.
  */
 export async function processClaimedExecution(
-  execution: ICampaignExecution,
+  executionOrId: ICampaignExecution | string,
   adapter: IWhatsAppDeliveryAdapter = getWhatsAppDeliveryAdapter(),
   serverNow: Date = new Date()
 ): Promise<'ACCEPTED' | 'SKIPPED' | 'DEFERRED' | 'OUTCOME_UNKNOWN' | 'RETRY_WAIT' | 'BLOCKED' | 'FAILED'> {
+  let execution: ICampaignExecution | null = null;
+  if (typeof executionOrId === 'string') {
+    execution = await CampaignExecutionModel.findOne({ id: executionOrId });
+  } else {
+    execution = executionOrId;
+  }
+  if (!execution) return 'FAILED';
+
   const { tenantId, id: executionId } = execution;
+  const leaseToken = execution.lease?.token;
+
+  const baseCasQuery: any = {
+    id: executionId,
+    tenantId,
+    claimVersion: execution.claimVersion,
+    planRevision: execution.planRevision
+  };
+  if (leaseToken) {
+    baseCasQuery['lease.token'] = leaseToken;
+    baseCasQuery['lease.until'] = { $gt: serverNow };
+  }
 
   try {
     // 1. Run Preflight Safeguards
@@ -138,14 +158,7 @@ export async function processClaimedExecution(
 
     if (outcome.status === 'SKIP') {
       const skipped = await CampaignExecutionModel.findOneAndUpdate(
-        {
-          id: executionId,
-          tenantId,
-          claimVersion: execution.claimVersion,
-          planRevision: execution.planRevision,
-          'lease.token': execution.lease.token,
-          'lease.until': { $gt: serverNow }
-        },
+        baseCasQuery,
         {
           $set: {
             state: 'SKIPPED',
@@ -169,14 +182,7 @@ export async function processClaimedExecution(
 
     if (outcome.status === 'DEFER') {
       const deferred = await CampaignExecutionModel.findOneAndUpdate(
-        {
-          id: executionId,
-          tenantId,
-          claimVersion: execution.claimVersion,
-          planRevision: execution.planRevision,
-          'lease.token': execution.lease.token,
-          'lease.until': { $gt: serverNow }
-        },
+        baseCasQuery,
         {
           $set: {
             state: 'DEFERRED',
@@ -201,14 +207,7 @@ export async function processClaimedExecution(
 
     if (outcome.status === 'BLOCKED') {
       const blocked = await CampaignExecutionModel.findOneAndUpdate(
-        {
-          id: executionId,
-          tenantId,
-          claimVersion: execution.claimVersion,
-          planRevision: execution.planRevision,
-          'lease.token': execution.lease.token,
-          'lease.until': { $gt: serverNow }
-        },
+        baseCasQuery,
         {
           $set: {
             state: 'BLOCKED',
@@ -610,8 +609,12 @@ export async function processClaimedExecution(
     return 'FAILED';
   } catch (err) {
     logger.error({ err, executionId }, 'Unexpected error in dispatch execution; releasing lease');
+    const leaseReleaseQuery: any = { id: executionId };
+    if (execution.lease?.token) {
+      leaseReleaseQuery['lease.token'] = execution.lease.token;
+    }
     await CampaignExecutionModel.findOneAndUpdate(
-      { id: executionId, 'lease.token': execution.lease.token },
+      leaseReleaseQuery,
       {
         $set: {
           'lease.token': null,

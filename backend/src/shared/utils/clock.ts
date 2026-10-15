@@ -59,9 +59,12 @@ export function resolveNextAnnualOccurrence(
   day: number,   // 1-31
   timezone: string = 'Asia/Kolkata',
   leapDayPolicy: LeapDayPolicy = 'FEB_28',
-  clock: IClock = defaultClock,
+  clockOrDate: IClock | Date = defaultClock,
   lookbackDays: number = 0
 ): { localDate: string; occurrenceYear: number; occurrenceId: string } {
+  const clock: IClock = clockOrDate instanceof Date
+    ? new SettableTestClock(clockOrDate.toISOString())
+    : (clockOrDate && typeof (clockOrDate as any).now === 'function' ? clockOrDate : defaultClock);
   const currentNow = clock.now().setZone(timezone);
   const currentYear = currentNow.year;
   const cutoff = currentNow.startOf('day').minus({ days: lookbackDays });

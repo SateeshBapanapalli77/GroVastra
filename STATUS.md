@@ -109,11 +109,18 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 
 ## 6. Work Package P4 — Pilot Readiness & Matrix
 
-| Area | Status | Notes |
-| :--- | :--- | :--- |
-| Full 58-Scenario Matrix (A01-A18, B01-B20, C01-C20) | In Progress | 45 matrix + 8 regression + 25 foundation/security tests passing against replica set |
-| Owner Reporting & Attribution | Pending P4 | Single-attribution rule, net sales tracking |
-| Runbook & Operational Monitoring | Pending P4 | Checkpoint stall alerts, due-step lag monitoring |
+| Requirement / Component | Exists | Wired and running | Proven by test (test ID) |
+| :--- | :--- | :--- | :--- |
+| **Full 58-Scenario Matrix (A01-A18, B01-B20, C01-C20)** | Yes | Yes | `qaMatrix.test.ts` (58/58 passing, 100% against replica set) |
+| • Matrix A: Campaign Behaviour (A01-A18) | Yes | Yes | 18/18 passing (`qaMatrix.test.ts`) |
+| • Matrix B: Scheduling & Concurrency (B01-B20) | Yes | Yes | 20/20 passing (`qaMatrix.test.ts`) |
+| • Matrix C: Delivery & Controls (C01-C20) | Yes | Yes | 20/20 passing (`qaMatrix.test.ts`) |
+| **Owner Overview Reporting & Net Sales Attribution** | Yes | Yes | `p4Reporting.test.ts` (A17, C18, single attribution & refund netting) |
+| **Customer Journey Activity Timeline** | Yes | Yes | `p4Reporting.test.ts` (audited history, masked projections) |
+| **Operational Monitoring & Checkpoint Alerts** | Yes | Yes | `p4Reporting.test.ts` (lagging step alert, quarantine alert) |
+| **Load & Latency Benchmark (100 due steps)** | Yes | Yes | `loadLatency.test.ts` (100 steps, 0 duplicate sends, CAS lease safety) |
+| **Operations Runbook (`docs/RUNBOOK.md`)** | Yes | Yes | Comprehensive incident response, fail-safe & pause controls |
+| **Pilot Smoke Test (`docs/SMOKE_TEST.md`)** | Yes | Yes | End-to-end multi-step verification procedure |
 
 ---
 

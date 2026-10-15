@@ -17,7 +17,7 @@ export interface OrderCompletedEventData {
  * - Respects each step's stopOnGoal: does NOT skip steps that have stopOnGoal=false (e.g. birthday greetings).
  */
 export async function evaluateOrderCompletedGoal(params: OrderCompletedEventData): Promise<{ matchedCount: number; updatedEnrollments: string[] }> {
-  const { tenantId, customerId, orderId, occasionRef } = params;
+  const { tenantId, customerId, orderId, occasionRef, netPaise } = params;
 
   if (!customerId || !occasionRef) {
     logger.info({ orderId, customerId, occasionRef }, 'Order without customer or occasionRef ignored for campaign goal attribution');
@@ -45,7 +45,8 @@ export async function evaluateOrderCompletedGoal(params: OrderCompletedEventData
     {
       $set: {
         goalReachedAt: new Date(),
-        goalOrderRef: orderId
+        goalOrderRef: orderId,
+        ...(typeof netPaise === 'number' ? { goalNetPaise: netPaise } : {})
       }
     }
   );

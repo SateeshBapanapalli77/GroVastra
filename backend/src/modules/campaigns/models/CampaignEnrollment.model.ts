@@ -20,6 +20,7 @@ export interface ICampaignEnrollment extends Document {
   replyHoldAt: Date | null;
   goalReachedAt: Date | null;
   goalOrderRef?: string;
+  goalNetPaise?: number;
   correctionGroupId?: string;
   matchExplanation?: string;
   createdAt: Date;
@@ -54,6 +55,7 @@ const CampaignEnrollmentSchema = new Schema<ICampaignEnrollment>(
     replyHoldAt: { type: Date, default: null },
     goalReachedAt: { type: Date, default: null },
     goalOrderRef: { type: String },
+    goalNetPaise: { type: Number },
     correctionGroupId: { type: String },
     matchExplanation: { type: String }
   },

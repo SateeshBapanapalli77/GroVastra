@@ -230,3 +230,11 @@ export async function updateContactReservationStatus(
     session ? { session } : {}
   );
 }
+
+export async function releaseContactReservation(
+  tenantId: string,
+  executionId: string,
+  destinationPhone: string
+): Promise<void> {
+  return updateContactReservationStatus(tenantId, destinationPhone, executionId, 'RELEASED');
+}

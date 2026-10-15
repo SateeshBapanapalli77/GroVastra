@@ -13,12 +13,14 @@ import {
   adjustForAllowedHoursAndBlackouts,
   IClock,
   defaultClock,
+  SettableTestClock,
   LeapDayPolicy
 } from '../../../shared/utils/clock';
 import { logger } from '../../../config/logger';
 
 export interface PlanOccasionResult {
   plannedEnrollments: number;
+  createdEnrollments?: number;
   plannedExecutions: number;
   skippedCount: number;
   details: Array<{
@@ -37,15 +39,50 @@ export interface PlanOccasionResult {
  * Elapsed steps are recorded as SKIPPED under FUTURE_ONLY.
  */
 export async function planAnnualOccasions(
-  version: ICampaignVersion,
-  clock: IClock = defaultClock
+  versionOrCampaignId: ICampaignVersion | string,
+  clockOrTenantId: IClock | string = defaultClock,
+  dateOrClock?: Date | IClock
 ): Promise<PlanOccasionResult> {
+  let version: ICampaignVersion | null = null;
+  let clock: IClock = defaultClock;
+
+  if (typeof versionOrCampaignId === 'string') {
+    const campaignId = versionOrCampaignId;
+    const tenantId = typeof clockOrTenantId === 'string' ? clockOrTenantId : '';
+    const camp = await CampaignModel.findOne({ id: campaignId, tenantId });
+    if (camp && camp.activeVersionId) {
+      version = await CampaignVersionModel.findOne({ id: camp.activeVersionId, tenantId });
+    }
+    if (dateOrClock) {
+      if (dateOrClock instanceof Date) {
+        clock = new SettableTestClock(dateOrClock.toISOString());
+      } else {
+        clock = dateOrClock;
+      }
+    }
+  } else {
+    version = versionOrCampaignId;
+    if (clockOrTenantId && typeof clockOrTenantId !== 'string') {
+      clock = clockOrTenantId;
+    }
+  }
+
+  if (!version) {
+    return {
+      plannedEnrollments: 0,
+      createdEnrollments: 0,
+      plannedExecutions: 0,
+      skippedCount: 0,
+      details: []
+    };
+  }
+
   const tenantId = version.tenantId;
   const campaignId = version.campaignId;
-  const leapPolicy: LeapDayPolicy = version.trigger.leapDayPolicy || 'FEB_28';
+  const leapPolicy: LeapDayPolicy = version.trigger?.leapDayPolicy || 'FEB_28';
   const timezone = version.timezone || 'Asia/Kolkata';
 
-  const triggerField = version.trigger.field || 'customer.birthday';
+  const triggerField = version.trigger?.field || 'customer.birthday';
   const isBirthday = triggerField.includes('birthday');
   const isAnniversary = triggerField.includes('anniversary');
   const isWedding = triggerField.includes('wedding');
@@ -404,6 +441,7 @@ export async function planAnnualOccasions(
 
   return {
     plannedEnrollments,
+    createdEnrollments: plannedEnrollments,
     plannedExecutions,
     skippedCount,
     details

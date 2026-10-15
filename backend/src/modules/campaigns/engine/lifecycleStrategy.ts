@@ -19,15 +19,31 @@ export interface CustomerFactUpdateParams {
 /**
  * Updates or creates CampaignCustomerFact record upon order completion (Spec p.14, A13, B17)
  */
-export async function updateCustomerPurchaseFact(params: CustomerFactUpdateParams) {
-  const { tenantId, customerId, orderId, purchaseAt } = params;
+export async function updateCustomerPurchaseFact(
+  tenantIdOrParams: string | CustomerFactUpdateParams,
+  customerId?: string,
+  data?: { orderId: string; purchaseAt: Date; netPaise?: number }
+) {
+  let params: CustomerFactUpdateParams;
+  if (typeof tenantIdOrParams === 'string') {
+    params = {
+      tenantId: tenantIdOrParams,
+      customerId: customerId!,
+      orderId: data!.orderId,
+      purchaseAt: data!.purchaseAt,
+      netPaise: data!.netPaise || 0
+    };
+  } else {
+    params = tenantIdOrParams;
+  }
+  const { tenantId, customerId: targetCustomerId, orderId, purchaseAt } = params;
 
-  let fact = await CampaignCustomerFactModel.findOne({ tenantId, customerId });
+  let fact = await CampaignCustomerFactModel.findOne({ tenantId, customerId: targetCustomerId });
   if (!fact) {
     fact = new CampaignCustomerFactModel({
       id: generateId('fact'),
       tenantId,
-      customerId,
+      customerId: targetCustomerId,
       lastQualifyingOrderId: orderId,
       lastQualifyingPurchaseAt: purchaseAt,
       nextEvaluationAt: new Date(purchaseAt.getTime() + 90 * 24 * 3600 * 1000), // Default 90d lookahead

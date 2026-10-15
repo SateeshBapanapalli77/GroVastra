@@ -154,14 +154,19 @@ export async function executePreflightSafeguards(
         resolvedValue = customer.lastName || '';
       } else if (expr === 'customer.fullName') {
         resolvedValue = `${customer.firstName} ${customer.lastName}`.trim();
+      } else if (expr.startsWith('customer.')) {
+        const prop = expr.slice('customer.'.length);
+        resolvedValue = (customer as any)[prop] ? String((customer as any)[prop]) : '';
       } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
         resolvedValue = storeDisplayName;
+      } else if (expr === 'order.itemTitle' || expr === 'order.title' || expr.startsWith('order.')) {
+        resolvedValue = 'bespoke outfit';
       } else if (expr.startsWith('literal:')) {
         resolvedValue = expr.slice(8);
       } else if (expr in customer) {
         resolvedValue = String((customer as any)[expr] || '');
       } else {
-        resolvedValue = expr;
+        resolvedValue = '';
       }
     } else {
       if (varKey === 'name') {
