@@ -406,6 +406,7 @@ export async function planAnnualOccasions(
               localDate: timing.localDate,
               localTime: timing.localTime,
               timezone,
+              priority: version.priority || 50,
               planRevision: enrollment.planRevision,
               claimVersion: 0,
               pauseGeneration: campaign?.pauseGeneration ?? 0,

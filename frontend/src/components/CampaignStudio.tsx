@@ -690,22 +690,22 @@ export const CampaignStudio: React.FC<{
               ) : (
                 <div className="space-y-4 animate-in fade-in duration-300">
                   <div className="p-3 bg-[#FEF9EE] border border-[#F3E0B5] rounded-xl flex items-center justify-between text-xs text-[#8F6910]">
-                    <span>Review Fingerprint: <code className="font-mono bg-white px-2 py-0.5 rounded">sha256:bday_v1_98f1a4</code></span>
+                    <span>Review Fingerprint: <code className="font-mono bg-white px-2 py-0.5 rounded">{reviewFingerprint}</code></span>
                     <span className="font-bold text-[10px] uppercase">Verified Valid</span>
                   </div>
 
                   <div className="grid grid-cols-3 gap-3 text-center">
                     <div className="p-3 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC]">
                       <div className="text-[10px] text-[#988B86] font-bold uppercase">Evaluated</div>
-                      <div className="font-serif text-xl font-bold text-[#271E1B]">4 Patrons</div>
+                      <div className="font-serif text-xl font-bold text-[#271E1B]">{dryRunStats?.totalEvaluated ?? 4} Patrons</div>
                     </div>
                     <div className="p-3 bg-[#E8F8EE] rounded-xl border border-[#A2D9C3]">
                       <div className="text-[10px] text-[#1B7A43] font-bold uppercase">Eligible</div>
-                      <div className="font-serif text-xl font-bold text-[#1B7A43]">2 Patrons</div>
+                      <div className="font-serif text-xl font-bold text-[#1B7A43]">{dryRunStats?.eligibleCount ?? 2} Patrons</div>
                     </div>
                     <div className="p-3 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC]">
                       <div className="text-[10px] text-[#988B86] font-bold uppercase">Excluded</div>
-                      <div className="font-serif text-xl font-bold text-[#8F6910]">2 Patrons</div>
+                      <div className="font-serif text-xl font-bold text-[#8F6910]">{dryRunStats?.excludedCount ?? 2} Patrons</div>
                     </div>
                   </div>
 

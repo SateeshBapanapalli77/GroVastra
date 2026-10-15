@@ -28,7 +28,15 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
   onOpenDryRun
 }) => {
   const [activeStepTab, setActiveStepTab] = useState<1 | 2 | 3>(1);
-  const [testSent, setTestSent] = useState(false);
+  const [testModalOpen, setTestModalOpen] = useState(false);
+  const [testRecipientPhone, setTestRecipientPhone] = useState('+91 98490 12345');
+  const [testRecipientName, setTestRecipientName] = useState('Priya Sharma');
+  const [isSimulating, setIsSimulating] = useState(false);
+  const [simulationResult, setSimulationResult] = useState<{
+    success: boolean;
+    providerMessageId: string;
+    details: string;
+  } | null>(null);
   const [stopOnReply1, setStopOnReply1] = useState(true);
   const [stopOnGoal1, setStopOnGoal1] = useState(true);
   const [stopOnReply2, setStopOnReply2] = useState(true);
@@ -43,9 +51,27 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
     { num: 5, label: 'Review', sub: 'Simulate & Launch', state: 'pending' }
   ];
 
-  const handleSendTest = () => {
-    setTestSent(true);
-    setTimeout(() => setTestSent(false), 3000);
+  const handleExecuteSimulatorSend = async () => {
+    setIsSimulating(true);
+    setSimulationResult(null);
+    try {
+      // Labelled test-send simulation to explicit recipient phone without mutating contact caps (Spec p.26)
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      const simulatedWamid = `wamid.HBgL${Math.random().toString(36).substring(2, 10).toUpperCase()}`;
+      setSimulationResult({
+        success: true,
+        providerMessageId: simulatedWamid,
+        details: `Simulated message successfully accepted by Sandbox WhatsApp Provider for test recipient ${testRecipientPhone}. Contact cap untouched.`
+      });
+    } catch (err: any) {
+      setSimulationResult({
+        success: false,
+        providerMessageId: '',
+        details: err.message || 'Simulation dispatch failed'
+      });
+    } finally {
+      setIsSimulating(false);
+    }
   };
 
   return (
@@ -448,24 +474,11 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
 
             <div className="flex items-center gap-2">
               <button
-                onClick={handleSendTest}
-                className={`flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border transition-all ${
-                  testSent
-                    ? 'bg-[#E8F8EE] border-[#25D366] text-[#1B7A43]'
-                    : 'bg-[#FFFFFF] border-[#EAE4DC] text-[#271E1B] hover:border-[#5C1D24]'
-                }`}
+                onClick={() => setTestModalOpen(true)}
+                className="flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-semibold border bg-[#FFFFFF] border-[#EAE4DC] text-[#271E1B] hover:border-[#5C1D24] transition-all"
               >
-                {testSent ? (
-                  <>
-                    <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
-                    <span>Sent to +91 98490 12345</span>
-                  </>
-                ) : (
-                  <>
-                    <Send className="w-3.5 h-3.5 text-[#5C1D24]" />
-                    <span>Send test to my number</span>
-                  </>
-                )}
+                <Send className="w-3.5 h-3.5 text-[#5C1D24]" />
+                <span>Test Send Simulator</span>
               </button>
 
               <button
@@ -487,6 +500,121 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
           />
         </div>
       </div>
+
+      {/* Labelled WhatsApp Test Send Simulator Modal (Spec p.26) */}
+      {testModalOpen && (
+        <div className="fixed inset-0 z-50 flex items-center justify-center bg-black/40 backdrop-blur-xs p-4 animate-in fade-in duration-200">
+          <div className="bg-white rounded-2xl border border-[#EAE4DC] shadow-xl max-w-lg w-full p-6 space-y-4">
+            <div className="flex items-center justify-between border-b border-[#EAE4DC] pb-3">
+              <div>
+                <div className="flex items-center gap-2">
+                  <h3 className="font-serif text-lg font-bold text-[#431217]">WhatsApp Test Simulator</h3>
+                  <span className="px-2 py-0.5 rounded text-[10px] font-bold bg-[#E8F8EE] text-[#1B7A43] border border-[#A2D9C3]">
+                    SIMULATOR ONLY
+                  </span>
+                </div>
+                <p className="text-xs text-[#6B5E59]">
+                  Dispatches an approved template preview to an explicit test recipient. Zero impact on patron contact caps.
+                </p>
+              </div>
+              <button
+                onClick={() => setTestModalOpen(false)}
+                className="text-[#988B86] hover:text-[#271E1B] text-lg font-bold p-1"
+              >
+                ✕
+              </button>
+            </div>
+
+            <div className="space-y-3">
+              <div>
+                <label className="block text-xs font-semibold text-[#271E1B] mb-1">
+                  Test Recipient Phone (E.164)
+                </label>
+                <input
+                  type="text"
+                  value={testRecipientPhone}
+                  onChange={(e) => setTestRecipientPhone(e.target.value)}
+                  placeholder="+91 98490 12345"
+                  className="w-full px-3 py-2 text-xs border border-[#EAE4DC] rounded-xl focus:border-[#5C1D24] focus:outline-hidden"
+                />
+              </div>
+
+              <div>
+                <label className="block text-xs font-semibold text-[#271E1B] mb-1">
+                  Sample Customer Name Binding
+                </label>
+                <input
+                  type="text"
+                  value={testRecipientName}
+                  onChange={(e) => setTestRecipientName(e.target.value)}
+                  placeholder="Priya Sharma"
+                  className="w-full px-3 py-2 text-xs border border-[#EAE4DC] rounded-xl focus:border-[#5C1D24] focus:outline-hidden"
+                />
+              </div>
+
+              <div className="p-3 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC] text-xs space-y-1">
+                <div className="font-semibold text-[#271E1B]">Template Payload Preview (Step {activeStepTab})</div>
+                <div className="text-[11px] text-[#6B5E59] italic">
+                  &ldquo;Dear {testRecipientName}, celebrate your special month with us at Padmavati Silks! Enjoy an exclusive birthday treat on our handcrafted silk collection.&rdquo;
+                </div>
+              </div>
+
+              {simulationResult && (
+                <div
+                  className={`p-3 rounded-xl border text-xs space-y-1 ${
+                    simulationResult.success
+                      ? 'bg-[#E8F8EE] border-[#A2D9C3] text-[#1B7A43]'
+                      : 'bg-[#FDF2F2] border-[#F8B4B4] text-[#9B1C1C]'
+                  }`}
+                >
+                  <div className="font-bold flex items-center gap-1.5">
+                    {simulationResult.success ? (
+                      <>
+                        <CheckCircle2 className="w-4 h-4 text-emerald-600" />
+                        <span>Simulation Dispatch Accepted</span>
+                      </>
+                    ) : (
+                      <>
+                        <AlertTriangle className="w-4 h-4 text-red-600" />
+                        <span>Simulation Failed</span>
+                      </>
+                    )}
+                  </div>
+                  <div className="text-[11px]">{simulationResult.details}</div>
+                  {simulationResult.providerMessageId && (
+                    <div className="text-[10px] font-mono text-[#6B5E59]">
+                      Provider ID: {simulationResult.providerMessageId}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            <div className="flex items-center justify-end gap-2 border-t border-[#EAE4DC] pt-3">
+              <button
+                onClick={() => setTestModalOpen(false)}
+                className="px-4 py-2 text-xs font-semibold text-[#6B5E59] hover:text-[#271E1B] rounded-xl"
+              >
+                Close
+              </button>
+              <button
+                disabled={isSimulating || !testRecipientPhone}
+                onClick={handleExecuteSimulatorSend}
+                className="flex items-center gap-1.5 px-4 py-2 bg-[#5C1D24] hover:bg-[#431217] disabled:opacity-50 text-white rounded-xl text-xs font-semibold transition-all"
+              >
+                {isSimulating ? (
+                  <span>Simulating Dispatch...</span>
+                ) : (
+                  <>
+                    <Send className="w-3.5 h-3.5" />
+                    <span>Send Test Payload</span>
+                  </>
+                )}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

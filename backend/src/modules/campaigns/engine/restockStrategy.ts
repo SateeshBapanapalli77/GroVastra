@@ -6,6 +6,8 @@ import { CampaignEnrollmentModel } from '../models/CampaignEnrollment.model';
 import { CampaignExecutionModel } from '../models/CampaignExecution.model';
 import { DomainEvent } from '../../../shared/events/types';
 import { generateId } from '../../../shared/utils/id';
+import { DateTime } from 'luxon';
+import { adjustForAllowedHoursAndBlackouts } from '../../../shared/utils/clock';
 import { logger } from '../../../config/logger';
 
 export interface RestockMatchResult {
@@ -67,7 +69,9 @@ export async function evaluateRestockEvent(
   let createdEnrollments = 0;
   let createdExecutions = 0;
 
-  const dayString = new Date(occurredAt).toISOString().slice(0, 10);
+  const timezone = version.timezone || 'Asia/Kolkata';
+  const localDt = DateTime.fromJSDate(new Date(occurredAt), { zone: timezone });
+  const dayString = localDt.toFormat('yyyy-MM-dd');
   const occurrenceId = `restock:${sku}:${dayString}`;
 
   for (const req of openRequests) {
@@ -133,8 +137,13 @@ export async function evaluateRestockEvent(
     });
 
     if (!existingExecution) {
-      const dueAt = new Date(); // Due immediately upon stock arrival
-      const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 180) * 60 * 1000);
+      const baseDueAt = new Date();
+      const usefulDurationMs = Math.max((stepDef.maxLatenessMinutes || 180) * 60 * 1000, 24 * 60 * 60 * 1000);
+      const tentativeExpires = new Date(baseDueAt.getTime() + usefulDurationMs);
+      const adjustment = adjustForAllowedHoursAndBlackouts(baseDueAt, tentativeExpires, timezone);
+      const finalDueAt = adjustment.valid ? adjustment.adjustedDueAt : baseDueAt;
+      const expiresAt = new Date(finalDueAt.getTime() + usefulDurationMs);
+      const finalLocalDt = DateTime.fromJSDate(finalDueAt, { zone: timezone });
 
       await CampaignExecutionModel.create({
         id: generateId('exe'),
@@ -142,13 +151,15 @@ export async function evaluateRestockEvent(
         enrollmentId,
         campaignId: activeCampaign.id,
         stepId: stepDef.stepId,
-        dueAt,
+        dueAt: finalDueAt,
         expiresAt,
-        localDate: dayString,
-        localTime: '11:00',
-        timezone: version.timezone || 'Asia/Kolkata',
+        localDate: finalLocalDt.toFormat('yyyy-MM-dd'),
+        localTime: finalLocalDt.toFormat('HH:mm'),
+        timezone,
+        priority: version.priority || 60,
         planRevision: 1,
         state: 'SCHEDULED',
+        outcomeReason: undefined,
         prerequisite: 'NONE',
         deliveryIntentId: null,
         lease: { token: null, until: null, claimedBy: null }

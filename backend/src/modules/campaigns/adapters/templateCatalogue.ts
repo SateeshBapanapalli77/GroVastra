@@ -186,14 +186,23 @@ export function getApprovedTemplate(templateId: string): ApprovedTemplate | null
   return APPROVED_TEMPLATES[templateId] || null;
 }
 
-export async function resolveApprovedTemplate(templateId: string, tenantId?: string): Promise<ApprovedTemplate | null> {
+export async function resolveApprovedTemplate(
+  templateId: string,
+  tenantId?: string,
+  revision?: number,
+  language?: string
+): Promise<ApprovedTemplate | null> {
   try {
     const { TemplateCatalogModel } = await import('../models/TemplateCatalog.model');
     if (tenantId) {
-      const dbTemplate = await TemplateCatalogModel.findOne({
+      const query: any = {
         id: templateId,
         $or: [{ tenantId }, { tenantId: null }]
-      }).lean();
+      };
+      if (revision !== undefined) query.revision = revision;
+      if (language !== undefined) query.language = language;
+
+      const dbTemplate = await TemplateCatalogModel.findOne(query).lean();
 
       if (dbTemplate) {
         return {
@@ -214,10 +223,28 @@ export async function resolveApprovedTemplate(templateId: string, tenantId?: str
           }
         };
       }
+
+      // If DB template collection is actively seeded for this tenant or globally, fail closed if not found
+      const dbCount = await TemplateCatalogModel.countDocuments({
+        $or: [{ tenantId }, { tenantId: null }]
+      });
+      if (dbCount > 0) {
+        return null;
+      }
     }
   } catch {
-    // If DB is disconnected or during standalone unit tests, use catalogue
+    // If DB is disconnected or during standalone unit tests, use fallback catalogue
   }
 
-  return APPROVED_TEMPLATES[templateId] || null;
+  const staticTmpl = APPROVED_TEMPLATES[templateId] || null;
+  if (!staticTmpl) return null;
+
+  if (revision !== undefined && staticTmpl.revision !== revision) {
+    return null;
+  }
+  if (language !== undefined && staticTmpl.language !== language) {
+    return null;
+  }
+
+  return staticTmpl;
 }

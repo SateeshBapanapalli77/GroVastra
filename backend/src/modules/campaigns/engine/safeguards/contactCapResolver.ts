@@ -100,7 +100,17 @@ export async function checkAndReserveContactCapacity(
       return false;
     });
 
+    let canDisplace = false;
     if (displaceable) {
+      // Safety guarantee: Never displace an execution that is already in DISPATCHING (in-flight HTTP call)
+      // or already terminal/accepted. Only pre-submission reservations can be displaced.
+      const targetExec = await CampaignExecutionModel.findOne({ id: displaceable.executionId, tenantId }).session(session || null);
+      if (targetExec && targetExec.state !== 'DISPATCHING' && targetExec.state !== 'PROVIDER_ACCEPTED') {
+        canDisplace = true;
+      }
+    }
+
+    if (displaceable && canDisplace) {
       logger.info(
         {
           candidateExecutionId: executionId,

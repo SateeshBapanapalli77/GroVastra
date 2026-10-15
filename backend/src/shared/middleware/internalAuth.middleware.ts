@@ -55,8 +55,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       });
     }
 
-    // 3. Validate role and event family
-    if (payload.role !== 'SYSTEM' && payload.role !== 'BOUTIQUE_OWNER') {
+    // 3. Validate role and mandatory event family (Finding 7)
+    if (payload.role !== 'SYSTEM') {
       logger.warn({ role: payload.role, userId: payload.userId }, 'Internal service credential lacks SYSTEM permissions');
       return res.status(403).json({
         success: false,
@@ -64,7 +64,15 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       });
     }
 
-    if (requiredEventFamily && payload.eventFamily && payload.eventFamily !== '*' && payload.eventFamily !== requiredEventFamily) {
+    if (!payload.eventFamily) {
+      logger.warn({ userId: payload.userId }, 'Internal service credential missing mandatory eventFamily claim');
+      return res.status(403).json({
+        success: false,
+        error: 'Forbidden: Internal service credential must be scoped with a mandatory eventFamily claim'
+      });
+    }
+
+    if (requiredEventFamily && payload.eventFamily !== '*' && payload.eventFamily !== requiredEventFamily) {
       logger.warn(
         { credentialFamily: payload.eventFamily, requiredFamily: requiredEventFamily },
         'Internal service credential event family mismatch'

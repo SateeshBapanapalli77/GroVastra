@@ -11,6 +11,7 @@ import { ProductModel } from '../../../inventory/models/Product.model';
 import { getApprovedTemplate, resolveApprovedTemplate } from '../../adapters/templateCatalogue';
 import { decryptText, sha256 } from '../../../../shared/utils/crypto';
 import { normalizeE164 } from '../../../../shared/utils/phone';
+import { adjustForAllowedHoursAndBlackouts } from '../../../../shared/utils/clock';
 import { logger } from '../../../../config/logger';
 
 export type PipelineOutcome =
@@ -111,12 +112,14 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_REPLY_HOLD' };
   }
 
-  // 6. Template Readiness Gate (Spec p.19, p.27, p.32 test C02, C19)
-  const template = await resolveApprovedTemplate(stepDef.templateRef.id, tenantId);
-  if (!template) {
-    return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
-  }
-  if (template.status === 'PAUSED') {
+  // 6. Template Readiness Gate (Spec p.8, p.19, p.27, p.32 test C02, C19)
+  const template = await resolveApprovedTemplate(
+    stepDef.templateRef.id,
+    tenantId,
+    stepDef.templateRef.revision,
+    stepDef.templateRef.language
+  );
+  if (!template || template.status === 'PAUSED') {
     return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
   }
 
@@ -135,8 +138,40 @@ export async function executePreflightSafeguards(
     }
   }
 
-  // 9. Resolve Parameter Bindings (Spec p.19, C05)
-  const storeDisplayName = (version as any).brandName || campaign?.name || '';
+  // 9. Resolve Parameter Bindings (Spec p.8, p.19, C05)
+  // Authoritative shop name resolution (Finding 3): Never campaign name!
+  let storeDisplayName = (version as any).brandName || '';
+  if (!storeDisplayName) {
+    const { TenantSettingsModel } = await import('../../models/TenantSettings.model');
+    const tSettings = await TenantSettingsModel.findOne({ tenantId }).lean();
+    if (tSettings && (tSettings as any).storeName) {
+      storeDisplayName = (tSettings as any).storeName;
+    }
+  }
+  if (!storeDisplayName) {
+    const { TenantConnectionModel } = await import('../../models/TenantConnection.model');
+    const tConn = await TenantConnectionModel.findOne({ tenantId, status: 'ACTIVE' }).lean();
+    if (tConn?.metadata?.wabaAccountName || tConn?.metadata?.storeName) {
+      storeDisplayName = tConn.metadata.wabaAccountName || tConn.metadata.storeName;
+    }
+  }
+  if (!storeDisplayName) {
+    storeDisplayName = 'Padmavati Silks'; // Default boutique brand identity fallback
+  }
+
+  const { OrderModel } = await import('../../../orders/models/Order.model');
+  let orderDoc: any = null;
+  let boutiqueJobDoc: any = null;
+  if (enrollment.sourceRef?.type === 'ORDER_EVENT') {
+    orderDoc = await OrderModel.findOne({ tenantId, id: enrollment.sourceRef.id }).lean();
+    const { BoutiqueJobModel } = await import('../../../crm/models/BoutiqueJob.model');
+    boutiqueJobDoc = await BoutiqueJobModel.findOne({ tenantId, id: enrollment.sourceRef.id }).lean();
+  }
+  let productDoc: any = null;
+  if (enrollment.sourceRef?.type === 'STOCK_EVENT') {
+    productDoc = await ProductModel.findOne({ tenantId, sku: enrollment.sourceRef.id }).lean();
+  }
+
   const parameters: Record<string, string> = {};
   const rawBindings = stepDef.bindings instanceof Map
     ? Object.fromEntries(stepDef.bindings.entries())
@@ -148,31 +183,46 @@ export async function executePreflightSafeguards(
 
     if (rawExpr) {
       const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
+      // Strict allowlist: ONLY customer name, shop, validated offer, event date, product, order
       if (expr === 'customer.firstName') {
         resolvedValue = customer.firstName || '';
       } else if (expr === 'customer.lastName') {
         resolvedValue = customer.lastName || '';
       } else if (expr === 'customer.fullName') {
         resolvedValue = `${customer.firstName} ${customer.lastName}`.trim();
-      } else if (expr.startsWith('customer.')) {
-        const prop = expr.slice('customer.'.length);
-        resolvedValue = (customer as any)[prop] ? String((customer as any)[prop]) : '';
-      } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
+      } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName' || expr === 'shop' || expr === 'store') {
         resolvedValue = storeDisplayName;
-      } else if (expr === 'order.itemTitle' || expr === 'order.title' || expr.startsWith('order.')) {
-        resolvedValue = 'bespoke outfit';
+      } else if (expr === 'order.itemTitle' || expr === 'order.title' || expr === 'order.item' || expr === 'product.title' || expr === 'item' || expr === 'outfit') {
+        resolvedValue = boutiqueJobDoc?.itemTitle || productDoc?.title || (orderDoc ? (orderDoc.items?.[0]?.title || `Boutique Order #${orderDoc.id.slice(-6)}`) : '');
+      } else if (expr === 'product.sku') {
+        resolvedValue = productDoc?.sku || '';
+      } else if (expr === 'product.price') {
+        resolvedValue = productDoc ? `₹${(productDoc.pricePaise / 100).toLocaleString('en-IN')}` : '';
+      } else if (expr === 'order.id') {
+        resolvedValue = orderDoc?.id || boutiqueJobDoc?.id || '';
+      } else if (expr === 'order.amount' || expr === 'order.netPaise') {
+        resolvedValue = orderDoc ? `₹${(orderDoc.netPaise / 100).toLocaleString('en-IN')}` : '';
+      } else if (expr === 'event.date' || expr === 'event.localDate' || expr === 'occasion.date') {
+        resolvedValue = enrollment.occasionLocalDate || '';
+      } else if (expr === 'offer.code' || expr === 'offer') {
+        resolvedValue = (version as any).offerCode || '';
       } else if (expr.startsWith('literal:')) {
         resolvedValue = expr.slice(8);
-      } else if (expr in customer) {
-        resolvedValue = String((customer as any)[expr] || '');
       } else {
-        resolvedValue = '';
+        // Disallow arbitrary customer.* or expr in customer!
+        logger.warn({ expr, varKey }, 'Blocked unallowlisted variable binding');
+        return { status: 'BLOCKED', reason: 'BLOCKED_MISSING_VARIABLE_BINDING' };
       }
     } else {
+      // Default mappings by key name if not explicitly bound
       if (varKey === 'name') {
         resolvedValue = customer.firstName || '';
-      } else if (varKey === 'shop') {
+      } else if (varKey === 'shop' || varKey === 'store') {
         resolvedValue = storeDisplayName;
+      } else if (varKey === 'item' || varKey === 'outfit') {
+        resolvedValue = boutiqueJobDoc?.itemTitle || productDoc?.title || (orderDoc ? `Boutique Order #${orderDoc.id.slice(-6)}` : '');
+      } else if (varKey === 'offer') {
+        resolvedValue = (version as any).offerCode || '';
       }
     }
 
@@ -216,34 +266,78 @@ export async function executePreflightSafeguards(
 
   // 9. Prerequisite Check (Page 8 & 19, test C13)
   if (stepDef.prerequisite === 'PREVIOUS_ACCEPTED') {
-    const priorExecutions = await CampaignExecutionModel.find({
-      tenantId,
-      enrollmentId
-    }).lean();
+    const stepIndex = version.steps.findIndex((s) => s.stepId === stepId);
+    if (stepIndex > 0) {
+      const prevStepDef = version.steps[stepIndex - 1];
+      const priorExecutions = await CampaignExecutionModel.find({
+        tenantId,
+        enrollmentId
+      }).lean();
 
-    const priorAccepted = priorExecutions.some(
-      (e) => e.stepId !== stepId && ['PROVIDER_ACCEPTED', 'DELIVERED', 'READ'].includes(e.state)
-    );
-
-    if (!priorAccepted) {
-      const priorTerminalFailure = priorExecutions.some(
-        (e) => e.stepId !== stepId && ['SKIPPED', 'FAILED', 'OUTCOME_UNKNOWN'].includes(e.state)
-      );
-
-      if (priorTerminalFailure) {
+      const prevExecution = priorExecutions.find((e) => e.stepId === prevStepDef.stepId);
+      if (!prevExecution) {
+        // Previous step has not executed yet; defer
+        const retryDue = new Date(serverNow.getTime() + 15 * 60 * 1000);
+        if (retryDue < expiresAt) {
+          return {
+            status: 'DEFER',
+            reason: 'WAITING_PREREQUISITE',
+            nextDueAt: retryDue
+          };
+        }
         return { status: 'SKIP', reason: 'SKIPPED_PREREQUISITE_NOT_MET' };
       }
 
-      // Prior step might still be in progress; defer
-      const retryDue = new Date(serverNow.getTime() + 15 * 60 * 1000);
-      if (retryDue < expiresAt) {
+      const prevAccepted = ['PROVIDER_ACCEPTED', 'DELIVERED', 'READ'].includes(prevExecution.state);
+      if (!prevAccepted) {
+        const prevTerminalFailure = ['SKIPPED', 'FAILED', 'OUTCOME_UNKNOWN', 'BLOCKED'].includes(prevExecution.state);
+        if (prevTerminalFailure) {
+          return { status: 'SKIP', reason: 'SKIPPED_PREREQUISITE_NOT_MET' };
+        }
+
+        // Prior step might still be in progress (e.g. SCHEDULED, EVALUATING, DISPATCHING, DEFERRED, RETRY_WAIT); defer
+        const retryDue = new Date(serverNow.getTime() + 15 * 60 * 1000);
+        if (retryDue < expiresAt) {
+          return {
+            status: 'DEFER',
+            reason: 'WAITING_PREREQUISITE',
+            nextDueAt: retryDue
+          };
+        }
+        return { status: 'SKIP', reason: 'SKIPPED_PREREQUISITE_NOT_MET' };
+      }
+    }
+  }
+
+  // 10. Allowed Send Hours & Blackout Preflight Check (Spec p.17, p.33, Finding 5)
+  // Per spec Reason Precedence (Spec p.33), allowed hours & blackouts are evaluated after content readiness & prerequisite checks.
+  // Transactional / ORDER_SERVICE campaigns are operational updates exempt from marketing send windows (Spec p.27).
+  if (version.purpose === 'MARKETING') {
+    const { TenantSettingsModel } = await import('../../models/TenantSettings.model');
+    const tSettings = await TenantSettingsModel.findOne({ tenantId }).lean();
+    if (tSettings && (tSettings.blackouts?.length || tSettings.allowedHours)) {
+      const allowedHours = tSettings.allowedHours || { start: '10:00', end: '19:00' };
+      const blackouts = tSettings.blackouts || [];
+      const tz = tSettings.timezone || version.timezone || 'Asia/Kolkata';
+
+      const hoursCheck = adjustForAllowedHoursAndBlackouts(
+        serverNow,
+        expiresAt,
+        tz,
+        allowedHours,
+        blackouts
+      );
+
+      if (!hoursCheck.valid) {
+        return { status: 'SKIP', reason: hoursCheck.reason || 'SKIPPED_BLACKOUT_EXPIRED' };
+      }
+      if (hoursCheck.adjustedDueAt.getTime() > serverNow.getTime()) {
         return {
           status: 'DEFER',
-          reason: 'WAITING_PREREQUISITE',
-          nextDueAt: retryDue
+          reason: 'DEFERRED_ALLOWED_HOURS',
+          nextDueAt: hoursCheck.adjustedDueAt
         };
       }
-      return { status: 'SKIP', reason: 'SKIPPED_PREREQUISITE_NOT_MET' };
     }
   }
 

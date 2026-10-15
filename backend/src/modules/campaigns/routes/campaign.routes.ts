@@ -554,7 +554,7 @@ campaignRouter.post(
         }
       }
 
-      const connection = await TenantConnectionModel.findOne({ tenantId, active: true });
+      const connection = await TenantConnectionModel.findOne({ tenantId, status: 'ACTIVE' });
       if (!connection) {
         return res.status(422).json({
           success: false,
@@ -658,10 +658,42 @@ campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STO
       { upsert: true, new: true }
     );
 
-    // Re-stamp all pending executions with the new pauseGeneration so they are re-enabled
+    const serverNow = new Date();
+
+    // 1. Skip missed steps that became overdue while paused (Spec p.9, p.17 FUTURE_ONLY)
     await CampaignExecutionModel.updateMany(
-      { campaignId: campaign.id, tenantId, state: { $in: ['SCHEDULED', 'DEFERRED'] } },
-      { $set: { pauseGeneration: campaign.pauseGeneration, 'lease.token': null, 'lease.until': null } }
+      {
+        campaignId: campaign.id,
+        tenantId,
+        state: { $in: ['SCHEDULED', 'DEFERRED'] },
+        dueAt: { $lt: serverNow }
+      },
+      {
+        $set: {
+          state: 'SKIPPED',
+          outcomeReason: 'SKIPPED_STEP_EXPIRED',
+          'lease.token': null,
+          'lease.until': null,
+          'lease.claimedBy': null
+        }
+      }
+    );
+
+    // 2. Re-stamp all future pending and retry executions with the new pauseGeneration (Finding 6)
+    await CampaignExecutionModel.updateMany(
+      {
+        campaignId: campaign.id,
+        tenantId,
+        state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] }
+      },
+      {
+        $set: {
+          pauseGeneration: campaign.pauseGeneration,
+          'lease.token': null,
+          'lease.until': null,
+          'lease.claimedBy': null
+        }
+      }
     );
 
     res.json({ success: true, campaign });
@@ -687,7 +719,7 @@ export async function validateCampaignVersionDefinition(version: any, tenantId: 
   }
 
   // 2. Channel Connection Readiness check (Spec A05)
-  const connection = await TenantConnectionModel.findOne({ tenantId, active: true });
+  const connection = await TenantConnectionModel.findOne({ tenantId, status: 'ACTIVE' });
   if (!connection) {
     errors.push({
       fieldPath: 'connectionId',

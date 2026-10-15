@@ -2,7 +2,8 @@ import { connectDatabase } from '../config/database';
 import {
   runDispatchCycle,
   sweepStaleDispatching,
-  sweepOutcomeUnknownExecutions
+  sweepOutcomeUnknownExecutions,
+  sweepExpiredPreSubmissionLeases
 } from '../modules/campaigns/engine/dispatchExecutor';
 import { CampaignExecutionModel } from '../modules/campaigns/models/CampaignExecution.model';
 import { CampaignModel } from '../modules/campaigns/models/Campaign.model';
@@ -15,7 +16,7 @@ import { logger } from '../config/logger';
  */
 async function getActiveTenants(): Promise<string[]> {
   const pendingTenants = await CampaignExecutionModel.distinct('tenantId', {
-    state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT', 'DISPATCHING', 'OUTCOME_UNKNOWN'] }
+    state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT', 'DISPATCHING', 'OUTCOME_UNKNOWN', 'EVALUATING'] }
   });
 
   if (pendingTenants.length > 0) {
@@ -38,11 +39,16 @@ export async function startExecutorLoop(once: boolean = false): Promise<void> {
     try {
       const tenants = await getActiveTenants();
       for (const tenantId of tenants) {
-        // Order matters: crash-stuck dispatches become UNKNOWN, then reconcile from evidence, then claim new work.
+        // Order matters:
+        // 1. Recover expired pre-submission evaluating leases (Finding 1)
+        // 2. Crash-stuck dispatches become UNKNOWN
+        // 3. Reconcile from evidence
+        // 4. Claim new work in priority order
+        const preRecovered = await sweepExpiredPreSubmissionLeases(tenantId);
         const stale = await sweepStaleDispatching(tenantId);
         const recon = await sweepOutcomeUnknownExecutions(tenantId);
-        if (stale.movedToUnknown || recon.reconciledAccepted || recon.reconciledDelivered) {
-          logger.warn({ tenantId, ...stale, ...recon }, 'Sweeper changed execution states');
+        if (preRecovered.recoveredCount || stale.movedToUnknown || recon.reconciledAccepted || recon.reconciledDelivered) {
+          logger.warn({ tenantId, ...preRecovered, ...stale, ...recon }, 'Sweeper changed execution states');
         }
 
         // Fair-share batch of up to 10 per tenant per cycle

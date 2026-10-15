@@ -53,9 +53,17 @@ export async function claimNextDueExecution(
   const claimed = await CampaignExecutionModel.findOneAndUpdate(
     {
       tenantId,
-      state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] },
-      dueAt: { $lte: serverNow },
-      $or: [{ 'lease.until': null }, { 'lease.until': { $lte: serverNow } }]
+      $or: [
+        {
+          state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] },
+          dueAt: { $lte: serverNow },
+          $or: [{ 'lease.until': null }, { 'lease.until': { $lte: serverNow } }]
+        },
+        {
+          state: 'EVALUATING',
+          'lease.until': { $lte: serverNow }
+        }
+      ]
     },
     {
       $set: {
@@ -67,7 +75,7 @@ export async function claimNextDueExecution(
       $inc: { claimVersion: 1 } // Increment claim fence counter; planRevision unchanged
     },
     {
-      sort: { dueAt: 1 },
+      sort: { priority: -1, dueAt: 1 },
       new: true
     }
   );
@@ -347,7 +355,7 @@ export async function processClaimedExecution(
                 deliveryKey: executionId,
                 connectionId: resolvedConnectionId,
                 customerId: customer.id,
-                recipientVersion: 1,
+                recipientVersion: customer.version || 1,
                 encryptedRecipient: encryptText(customer.phone),
                 templateRef: {
                   id: stepDef.templateRef.id,
@@ -403,6 +411,12 @@ export async function processClaimedExecution(
 
       const errMsg = txErr.message || '';
       logger.warn({ executionId, error: errMsg }, 'Submission transaction aborted and rolled back');
+
+      if (errMsg === 'LEASE_LOST_BEFORE_DISPATCH') {
+        // CAS failed because lease token changed, was stolen, or expired.
+        // Stale worker must NOT overwrite the other worker's active evaluation/lease in DB!
+        return 'FAILED';
+      }
 
       if (errMsg === 'CAMPAIGN_OR_GLOBAL_PAUSED') {
         await CampaignExecutionModel.updateOne(
@@ -468,10 +482,52 @@ export async function processClaimedExecution(
         return 'BLOCKED';
       }
 
+      // Safe cleanup for failed or aborted transaction: ensure EVALUATING lease is released (Finding 1)
+      await CampaignExecutionModel.updateOne(
+        { id: executionId, tenantId, state: 'EVALUATING' },
+        {
+          $set: {
+            state: 'DEFERRED',
+            outcomeReason: `TRANSIENT_FAILURE_${errMsg.slice(0, 32)}`,
+            dueAt: new Date(serverNow.getTime() + 60 * 1000),
+            'lease.token': null,
+            'lease.until': null,
+            'lease.claimedBy': null
+          }
+        }
+      );
+
       // Lease lost or expired CAS conflict
       return 'FAILED';
     }
     await session.endSession();
+
+    // Spec p.27: Recheck dispatch deadline after transaction commit and before POST
+    const prePostNow = new Date();
+    if (prePostNow >= execution.expiresAt) {
+      logger.warn(
+        { executionId, expiresAt: execution.expiresAt, prePostNow },
+        'Execution expired after transaction commit before POST; cancelling send'
+      );
+      await CampaignExecutionModel.findOneAndUpdate(
+        { id: executionId, tenantId, state: 'DISPATCHING' },
+        {
+          $set: {
+            state: 'SKIPPED',
+            outcomeReason: 'SKIPPED_STEP_EXPIRED',
+            'lease.token': null,
+            'lease.until': null,
+            'lease.claimedBy': null
+          }
+        }
+      );
+      if (deliveryIntentDoc) {
+        deliveryIntentDoc.state = 'EXPIRED';
+        await deliveryIntentDoc.save();
+      }
+      await updateContactReservationStatus(tenantId, customer.phone, executionId, 'RELEASED');
+      return 'SKIPPED';
+    }
 
     // 3. Provider HTTP Call Outside the DB Transaction (Strict Rule, Handoff p.25)
     const sendResult = await adapter.sendCampaignStep({
@@ -479,7 +535,7 @@ export async function processClaimedExecution(
       deliveryKey: executionId,
       connectionId: resolvedConnectionId,
       customerId: customer.id,
-      recipientVersion: 1,
+      recipientVersion: customer.version || 1,
       template: {
         id: stepDef.templateRef.id,
         revision: stepDef.templateRef.revision,
@@ -856,3 +912,32 @@ export async function sweepOutcomeUnknownExecutions(
   }
   return result;
 }
+
+/**
+ * Sweeper: Reclaims expired pre-submission leases for executions stuck in EVALUATING (Spec p.25, Finding 1).
+ * When a worker crashes after claiming or transient failure occurs, this resets them to SCHEDULED
+ * with cleared leases so they are immediately eligible for claim and execution.
+ */
+export async function sweepExpiredPreSubmissionLeases(
+  tenantId: string,
+  serverNow: Date = new Date()
+): Promise<{ recoveredCount: number }> {
+  const result = await CampaignExecutionModel.updateMany(
+    {
+      tenantId,
+      state: 'EVALUATING',
+      'lease.until': { $lte: serverNow }
+    },
+    {
+      $set: {
+        state: 'SCHEDULED',
+        'lease.token': null,
+        'lease.until': null,
+        'lease.claimedBy': null
+      }
+    }
+  );
+
+  return { recoveredCount: result.modifiedCount };
+}
+

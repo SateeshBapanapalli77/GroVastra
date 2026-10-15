@@ -5,6 +5,8 @@ import { CampaignEnrollmentModel } from '../models/CampaignEnrollment.model';
 import { CampaignExecutionModel } from '../models/CampaignExecution.model';
 import { DomainEvent } from '../../../shared/events/types';
 import { generateId } from '../../../shared/utils/id';
+import { DateTime } from 'luxon';
+import { adjustForAllowedHoursAndBlackouts } from '../../../shared/utils/clock';
 import { logger } from '../../../config/logger';
 
 export interface ServiceStrategyResult {
@@ -82,6 +84,24 @@ export async function evaluateAlterationReadyEvent(
 
   let enrolled = false;
   if (!enrollment) {
+    if (jobId && itemTitle) {
+      const { BoutiqueJobModel } = await import('../../crm/models/BoutiqueJob.model');
+      await BoutiqueJobModel.findOneAndUpdate(
+        { id: jobId, tenantId },
+        {
+          $set: {
+            id: jobId,
+            tenantId,
+            customerId,
+            itemTitle,
+            status: 'READY_FOR_PICKUP',
+            readyAt: occurredAt || new Date()
+          }
+        },
+        { upsert: true, new: true }
+      );
+    }
+
     enrollment = await CampaignEnrollmentModel.create({
       id: generateId('enr'),
       tenantId,
@@ -118,8 +138,10 @@ export async function evaluateAlterationReadyEvent(
 
   if (!existingExecution) {
     executionId = generateId('exe');
+    const timezone = version.timezone || 'Asia/Kolkata';
     const dueAt = new Date();
     const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 240) * 60 * 1000);
+    const localDt = DateTime.fromJSDate(dueAt, { zone: timezone });
 
     await CampaignExecutionModel.create({
       id: executionId,
@@ -129,11 +151,13 @@ export async function evaluateAlterationReadyEvent(
       stepId: stepDef.stepId,
       dueAt,
       expiresAt,
-      localDate: dueAt.toISOString().slice(0, 10),
-      localTime: '11:00',
-      timezone: version.timezone || 'Asia/Kolkata',
+      localDate: localDt.toFormat('yyyy-MM-dd'),
+      localTime: localDt.toFormat('HH:mm'),
+      timezone,
+      priority: version.priority || 70,
       planRevision: 1,
       state: 'SCHEDULED',
+      outcomeReason: undefined,
       prerequisite: 'NONE',
       deliveryIntentId: null,
       lease: { token: null, until: null, claimedBy: null }
@@ -217,8 +241,10 @@ export async function evaluateFittingAppointmentEvent(
 
   if (!existingExecution) {
     executionId = generateId('exe');
+    const timezone = version.timezone || 'Asia/Kolkata';
     const dueAt = new Date();
     const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 240) * 60 * 1000);
+    const localDt = DateTime.fromJSDate(dueAt, { zone: timezone });
 
     await CampaignExecutionModel.create({
       id: executionId,
@@ -228,11 +254,13 @@ export async function evaluateFittingAppointmentEvent(
       stepId: stepDef.stepId,
       dueAt,
       expiresAt,
-      localDate: dueAt.toISOString().slice(0, 10),
-      localTime: '10:00',
-      timezone: version.timezone || 'Asia/Kolkata',
+      localDate: localDt.toFormat('yyyy-MM-dd'),
+      localTime: localDt.toFormat('HH:mm'),
+      timezone,
+      priority: version.priority || 70,
       planRevision: 1,
       state: 'SCHEDULED',
+      outcomeReason: undefined,
       prerequisite: 'NONE',
       deliveryIntentId: null,
       lease: { token: null, until: null, claimedBy: null }
@@ -306,8 +334,16 @@ export async function evaluateDeliveryUpdateEvent(
   };
 
   const executionId = generateId('exe');
+  const timezone = version.timezone || 'Asia/Kolkata';
+  const localDt = DateTime.now().setZone(timezone);
+  const localDate = localDt.toFormat('yyyy-MM-dd');
+  const localTime = localDt.toFormat('HH:mm');
   const dueAt = new Date();
   const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 240) * 60 * 1000);
+  const adjustment = adjustForAllowedHoursAndBlackouts(dueAt, expiresAt, timezone);
+  const finalDueAt = adjustment.valid ? adjustment.adjustedDueAt : dueAt;
+  const state = adjustment.valid ? 'SCHEDULED' : 'SKIPPED';
+  const outcomeReason = adjustment.valid ? undefined : (adjustment.reason || 'SKIPPED_BLACKOUT_EXPIRED');
 
   await CampaignExecutionModel.create({
     id: executionId,
@@ -315,13 +351,15 @@ export async function evaluateDeliveryUpdateEvent(
     enrollmentId: enrollment.id,
     campaignId: activeCampaign.id,
     stepId: stepDef.stepId,
-    dueAt,
+    dueAt: finalDueAt,
     expiresAt,
-    localDate: dueAt.toISOString().slice(0, 10),
-    localTime: '10:30',
-    timezone: version.timezone || 'Asia/Kolkata',
+    localDate,
+    localTime,
+    timezone,
+    priority: version.priority || 70,
     planRevision: 1,
-    state: 'SCHEDULED',
+    state,
+    outcomeReason,
     prerequisite: 'NONE',
     deliveryIntentId: null,
     lease: { token: null, until: null, claimedBy: null }

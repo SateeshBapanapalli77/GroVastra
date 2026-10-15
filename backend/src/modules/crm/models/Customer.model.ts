@@ -30,6 +30,7 @@ export interface ICustomer extends Document {
     recipientLabel?: string;
     budgetPaise?: number;
   }>;
+  version: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -38,6 +39,7 @@ const CustomerSchema = new Schema<ICustomer>(
   {
     id: { type: String, required: true, unique: true },
     tenantId: { type: String, required: true, index: true },
+    version: { type: Number, required: true, default: 1 },
     firstName: { type: String, required: true },
     lastName: { type: String, required: true },
     phone: { type: String, required: true },

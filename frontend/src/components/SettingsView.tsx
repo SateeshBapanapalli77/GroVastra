@@ -53,7 +53,7 @@ export const SettingsView: React.FC = () => {
   const cap24h = settings?.caps?.rolling24Hours ?? 1;
   const cap7d = settings?.caps?.rolling7Days ?? 3;
   const tz = settings?.timezone || 'Asia/Kolkata';
-  const notice = settings?.notice || 'Global policies and contact caps protect store patrons from spam and enforce Meta platform compliance. Edits require Store Owner authorization.';
+  const notice = settings?.notice || 'This module runs auto campaigns using an existing WhatsApp connection and approved templates. WhatsApp setup and template approval are managed by the integration developer.';
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6 animate-in fade-in duration-300">

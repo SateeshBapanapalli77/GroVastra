@@ -25,6 +25,7 @@ export interface ICampaignExecution extends Document {
   localDate: string; // 'YYYY-MM-DD'
   localTime: string; // '10:00'
   timezone: string; // 'Asia/Kolkata'
+  priority: number; // Inherited from campaignVersion.priority (default 50, e.g. Birthday=80, Festival=50)
   planRevision: number; // Date-plan replan counter only (Page 20 & 25)
   claimVersion: number; // Worker claim fence counter (increments on claim)
   pauseGeneration: number; // Fencing token matching campaign.pauseGeneration
@@ -57,6 +58,7 @@ const CampaignExecutionSchema = new Schema<ICampaignExecution>(
     localDate: { type: String, required: true },
     localTime: { type: String, required: true },
     timezone: { type: String, required: true, default: 'Asia/Kolkata' },
+    priority: { type: Number, required: true, default: 50, index: true },
     planRevision: { type: Number, required: true, default: 1 },
     claimVersion: { type: Number, required: true, default: 0 },
     pauseGeneration: { type: Number, required: true, default: 0 },
@@ -109,9 +111,12 @@ CampaignExecutionSchema.index(
   { unique: true }
 );
 
-// Poller Index for worker claims: Page 25 specification
+// Poller Index for worker claims: Page 25 specification with priority arbitration
 CampaignExecutionSchema.index(
-  { state: 1, dueAt: 1, _id: 1 }
+  { tenantId: 1, state: 1, priority: -1, dueAt: 1, _id: 1 }
+);
+CampaignExecutionSchema.index(
+  { state: 1, priority: -1, dueAt: 1, _id: 1 }
 );
 
 CampaignExecutionSchema.index({ tenantId: 1, campaignId: 1, state: 1 });
