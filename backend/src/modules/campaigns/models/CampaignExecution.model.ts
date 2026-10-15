@@ -5,6 +5,8 @@ export type ExecutionState =
   | 'EVALUATING'
   | 'DISPATCHING'
   | 'PROVIDER_ACCEPTED'
+  | 'DELIVERED'
+  | 'READ'
   | 'OUTCOME_UNKNOWN'
   | 'SKIPPED'
   | 'DEFERRED'
@@ -33,6 +35,8 @@ export interface ICampaignExecution extends Document {
   outcomeReason?: string; // Precedence reason e.g. 'SKIPPED_GOAL_REACHED', 'SKIPPED_CONTACT_CAP'
   retryCount: number;
   retryAt?: Date | null;
+  deliveredAt?: Date | null;
+  readAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -58,6 +62,8 @@ const CampaignExecutionSchema = new Schema<ICampaignExecution>(
         'EVALUATING',
         'DISPATCHING',
         'PROVIDER_ACCEPTED',
+        'DELIVERED',
+        'READ',
         'OUTCOME_UNKNOWN',
         'SKIPPED',
         'DEFERRED',
@@ -79,7 +85,9 @@ const CampaignExecutionSchema = new Schema<ICampaignExecution>(
     },
     outcomeReason: { type: String },
     retryCount: { type: Number, default: 0 },
-    retryAt: { type: Date, default: null }
+    retryAt: { type: Date, default: null },
+    deliveredAt: { type: Date, default: null },
+    readAt: { type: Date, default: null }
   },
   {
     timestamps: true,

@@ -17,6 +17,8 @@ import {
   Settings
 } from 'lucide-react';
 
+import { api } from '../lib/api';
+
 interface CampaignCard {
   id: string;
   name: string;
@@ -32,49 +34,51 @@ export const CampaignsList: React.FC<{
   onOpenStudio: (type: 'birthday' | 'anniversary') => void;
 }> = ({ onOpenStudio }) => {
   const [filterTab, setFilterTab] = useState<'ALL' | 'ACTIVE' | 'DRAFT'>('ALL');
+  const [campaigns, setCampaigns] = useState<CampaignCard[]>([]);
+  const [loading, setLoading] = useState(true);
 
-  const [campaigns, setCampaigns] = useState<CampaignCard[]>([
-    {
-      id: 'cmp_birthday_01',
-      name: 'Birthday Boutique Shopping',
-      type: 'birthday',
-      status: 'ACTIVE',
-      nextExecution: 'Tomorrow at 10:00 AM IST',
-      enrolledCount: 2,
-      priority: 80,
-      steps: [
-        { label: 'Invitation', offset: 'D-14' },
-        { label: 'Follow-up', offset: 'D-7' },
-        { label: 'Greeting', offset: 'D0' }
-      ]
-    },
-    {
-      id: 'cmp_anniversary_02',
-      name: 'Wedding Anniversary Celebration',
-      type: 'anniversary',
-      status: 'DRAFT',
-      nextExecution: 'Pending Activation',
-      enrolledCount: 0,
-      priority: 80,
-      steps: [
-        { label: 'Private Preview', offset: 'D-21' },
-        { label: 'Reminder', offset: 'D-7' }
-      ]
+  const loadCampaigns = async () => {
+    try {
+      setLoading(true);
+      const res = await api.getCampaigns();
+      if (res && res.campaigns) {
+        const mapped: CampaignCard[] = res.campaigns.map((c) => ({
+          id: c.id,
+          name: c.name,
+          type: c.name.toLowerCase().includes('anniversary') ? 'anniversary' : 'birthday',
+          status: c.status as any,
+          nextExecution: c.status === 'ACTIVE' ? 'Scheduled (Polling Active)' : 'Pending Activation',
+          enrolledCount: c.enrolledCount || 0,
+          priority: c.activeVersion?.priority || 80,
+          steps: (c.activeVersion?.steps || []).map((s: any) => ({
+            label: s.stepId,
+            offset: `D${s.offsetDays >= 0 ? '+' : ''}${s.offsetDays}`
+          }))
+        }));
+        setCampaigns(mapped);
+      }
+    } catch (err: any) {
+      console.warn('Backend offline or empty; fallback to initial view', err.message);
+    } finally {
+      setLoading(false);
     }
-  ]);
+  };
 
-  const togglePause = (id: string) => {
-    setCampaigns((prev) =>
-      prev.map((c) => {
-        if (c.id === id) {
-          return {
-            ...c,
-            status: c.status === 'ACTIVE' ? 'PAUSED' : 'ACTIVE'
-          };
-        }
-        return c;
-      })
-    );
+  React.useEffect(() => {
+    loadCampaigns();
+  }, []);
+
+  const togglePause = async (id: string, currentStatus: string) => {
+    try {
+      if (currentStatus === 'ACTIVE') {
+        await api.pauseCampaign(id);
+      } else {
+        await api.resumeCampaign(id);
+      }
+      await loadCampaigns();
+    } catch (err: any) {
+      alert(`Error toggling campaign status: ${err.message}`);
+    }
   };
 
   const filteredCampaigns = campaigns.filter((c) => {
@@ -241,7 +245,7 @@ export const CampaignsList: React.FC<{
               <div className="flex items-center gap-2">
                 {camp.status !== 'DRAFT' && (
                   <button
-                    onClick={() => togglePause(camp.id)}
+                    onClick={() => togglePause(camp.id, camp.status)}
                     className="p-2 border border-[#EAE4DC] hover:border-[#5C1D24] text-[#6B5E59] rounded-xl hover:bg-[#FAF8F5] transition-colors"
                     title={camp.status === 'ACTIVE' ? 'Pause Campaign' : 'Resume Campaign'}
                   >

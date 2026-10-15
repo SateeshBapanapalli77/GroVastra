@@ -3,9 +3,10 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface IContactReservation {
   executionId: string;
   campaignId: string;
+  priority: number;
   reservedAt: Date;
   expiresAt: Date;
-  status: 'RESERVED' | 'ACCEPTED' | 'UNKNOWN' | 'RELEASED';
+  status: 'RESERVED' | 'ACCEPTED' | 'UNKNOWN' | 'RELEASED' | 'DISPLACED';
 }
 
 export interface ICampaignContactGate extends Document {
@@ -22,12 +23,13 @@ const ContactReservationSchema = new Schema<IContactReservation>(
   {
     executionId: { type: String, required: true },
     campaignId: { type: String, required: true },
+    priority: { type: Number, required: true, default: 50 },
     reservedAt: { type: Date, required: true },
     expiresAt: { type: Date, required: true },
     status: {
       type: String,
       required: true,
-      enum: ['RESERVED', 'ACCEPTED', 'UNKNOWN', 'RELEASED'],
+      enum: ['RESERVED', 'ACCEPTED', 'UNKNOWN', 'RELEASED', 'DISPLACED'],
       default: 'RESERVED'
     }
   },

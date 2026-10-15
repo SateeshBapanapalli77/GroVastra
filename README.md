@@ -5,8 +5,8 @@
 [![React](https://img.shields.io/badge/React-19.0-blue?style=flat&logo=react)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?style=flat&logo=typescript)](https://www.typescriptlang.org/)
 [![Express](https://img.shields.io/badge/Express-5.0.1-black?style=flat&logo=express)](https://expressjs.com/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-Replica%20Set-green?style=flat&logo=mongodb)](https://www.mongodb.com/)
-[![Vitest](https://img.shields.io/badge/Tests-61%20Passed%20(1.9s)-success?style=flat&logo=vitest)](https://vitest.dev/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-6.0%2B-green?style=flat&logo=mongodb)](https://www.mongodb.com/)
+[![Vitest](https://img.shields.io/badge/Tests-61%20Passed%20(Real%20DB)-success?style=flat&logo=vitest)](https://vitest.dev/)
 [![WhatsApp](https://img.shields.io/badge/WhatsApp-Cloud%20API%20Sandbox-25D366?style=flat&logo=whatsapp)](https://developers.facebook.com/)
 [![Architecture](https://img.shields.io/badge/Architecture-Modular%20Monolith-orange?style=flat)](#2-system-architecture)
 
@@ -22,7 +22,7 @@ Unlike generic e-commerce mass-blast tools that spam customers and damage brand 
 
 ## 2. System Architecture
 
-GroVastra is architected as a **Modular Monolith** using **Express 5** and **Next.js 15 App Router**. It deliberately eliminates external cache and broker dependencies (such as Redis or BullMQ), relying on MongoDB Replica Set transactional semantics and atomic conditional updates (`findOneAndUpdate`) for durable distributed execution.
+GroVastra is architected as a **Modular Monolith** using **Express 5** and **Next.js 16 App Router**. It deliberately eliminates external cache and broker dependencies (such as Redis or BullMQ), relying on MongoDB transactional semantics, atomic conditional updates (`findOneAndUpdate`), and compound unique indexes for durable distributed execution.
 
 ```
 +---------------------------------------------------------------------------------------+
@@ -251,7 +251,7 @@ Visit **`http://localhost:3000`** in your browser.
 
 ## 7. Testing & Verification
 
-GroVastra includes an exhaustive test suite verifying the **58-scenario QA Acceptance Matrix** (Pages 30–33 of the Developer Handoff):
+GroVastra includes an exhaustive test suite verifying the **58-scenario QA Acceptance Matrix** (Pages 30–33 of the Developer Handoff). All tests execute directly against **real Mongoose domain models** and the live MongoDB engine, ensuring zero test-defined mocks or closures:
 
 ```bash
 cd backend
@@ -260,15 +260,15 @@ npm test
 
 ### Test Suite Breakdown:
 - **`qaMatrix.test.ts` (34 tests)**:
-  - *Matrix A*: Identity keys, draft fingerprint validation, audience specification, UTC offset math, Feb 29 leap-day policies, prerequisite gates, `stopOnReply` holds, `stopOnGoal` stops.
-  - *Matrix B*: Atomic step lease acquisition, expired lease safe reclamation, 1/24h and 3/7d rolling contact caps, priority collision arbitration, AES-256-GCM intent freezing.
-  - *Matrix C*: Delivery adapter submission, template validation, status progression (`ACCEPTED` $\to$ `DELIVERED` $\to$ `READ`), exponential retry backoffs, ambiguous timeout handling (`OUTCOME_UNKNOWN`), HMAC webhook signatures.
+  - *Matrix A*: Identity keys, canonical draft fingerprint validation via `evaluateCampaignDryRun`, audience specification filters (`minSpendPaise`, `requiredTags`, `excludedTags`), UTC offset math in `Asia/Kolkata`, Feb 29 leap-day policies, prerequisite gates, `stopOnReply` holds, `stopOnGoal` stops.
+  - *Matrix B*: Atomic step lease acquisition via `claimNextDueExecution`, expired lease safe reclamation, 1/24h and 3/7d rolling contact caps via `checkAndReserveContactCapacity`, priority collision arbitration with slot displacement, compound unique index deduplication, AES-256-GCM intent freezing.
+  - *Matrix C*: Delivery adapter submission, template validation, status progression (`ACCEPTED` $\to$ `DELIVERED` $\to$ `READ`), exponential retry backoffs, ambiguous timeout handling (`OUTCOME_UNKNOWN`), real timing-safe HMAC-SHA256 webhook signature verification (`verifyMetaSignature`), idempotency deduplication via `CampaignEventInboxModel`.
 - **`foundation.test.ts` (12 tests)**: Prefixed ULIDs, AES-256-GCM encryption, Luxon date math.
 - **`planner.test.ts` (3 tests)**: Annual occasion discovery & step offset calculations.
 - **`execution.test.ts` (6 tests)**: Contact cap reservations and delivery adapters.
 - **`lifecycle.test.ts` (6 tests)**: Saree restock, boutique alteration, and win-back strategies.
 
-**Result**: **61 passed (100%) in 1.9s.**
+**Result**: **61 passed (100%) against live MongoDB.**
 
 ---
 

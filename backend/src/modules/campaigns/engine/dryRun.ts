@@ -59,6 +59,7 @@ export async function evaluateCampaignDryRun(
     steps: version.steps.map((s) => ({
       stepId: s.stepId,
       offsetDays: s.offsetDays,
+      localTime: s.localTime,
       templateId: s.templateRef.id,
       templateRevision: s.templateRef.revision,
       bindings: s.bindings,
@@ -117,23 +118,48 @@ export async function evaluateCampaignDryRun(
       continue;
     }
 
-    // 5. Audience rule predicates (if RULE_BASED)
-    if (version.audience.mode === 'RULE_BASED' && version.audience.rules) {
-      let matches = true;
-      const allRules = version.audience.rules.all || [];
-      for (const rule of allRules) {
-        if (rule.field === 'preferences.weave' && rule.op === 'in') {
-          const hasWeave = (customer.preferences?.weave || []).some((w) =>
-            (rule.value as string[]).includes(w)
-          );
-          if (!hasWeave) matches = false;
-        }
+    // 5. Audience rule predicates
+    let matchesAudience = true;
+    const aud = version.audience as any;
+
+    if (aud) {
+      if (Array.isArray(aud.requiredTags) && aud.requiredTags.length > 0) {
+        const hasAllTags = aud.requiredTags.every((t: string) => (customer.tags || []).includes(t));
+        if (!hasAllTags) matchesAudience = false;
       }
 
-      if (!matches) {
-        reasonBreakdown.AUDIENCE_RULE_MISMATCH = (reasonBreakdown.AUDIENCE_RULE_MISMATCH || 0) + 1;
-        continue;
+      if (Array.isArray(aud.excludedTags) && aud.excludedTags.length > 0) {
+        const hasExcluded = aud.excludedTags.some((t: string) => (customer.tags || []).includes(t));
+        if (hasExcluded) matchesAudience = false;
       }
+
+      if (typeof aud.minSpendPaise === 'number') {
+        const spend = customer.preferences?.budgetMaxPaise || (customer as any).totalSpendPaise || 0;
+        if (spend < aud.minSpendPaise) matchesAudience = false;
+      }
+
+      if (aud.mode === 'RULE_BASED' && aud.rules) {
+        const allRules = aud.rules.all || [];
+        for (const rule of allRules) {
+          if (rule.field === 'preferences.weave' && (rule.op === 'in' || rule.op === 'contains')) {
+            const hasWeave = (customer.preferences?.weave || []).some((w) =>
+              (rule.value as string[]).includes(w)
+            );
+            if (!hasWeave) matchesAudience = false;
+          }
+          if (rule.field === 'tags' && (rule.op === 'contains' || rule.op === 'in')) {
+            const hasTag = (customer.tags || []).some((t) =>
+              Array.isArray(rule.value) ? rule.value.includes(t) : t === rule.value
+            );
+            if (!hasTag) matchesAudience = false;
+          }
+        }
+      }
+    }
+
+    if (!matchesAudience) {
+      reasonBreakdown.AUDIENCE_RULE_MISMATCH = (reasonBreakdown.AUDIENCE_RULE_MISMATCH || 0) + 1;
+      continue;
     }
 
     // Customer is eligible!

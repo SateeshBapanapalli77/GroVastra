@@ -3,8 +3,10 @@
 import React from 'react';
 import { FileText, CheckCircle2, Lock, Tag } from 'lucide-react';
 
+import { api } from '../lib/api';
+
 export const TemplatesView: React.FC = () => {
-  const templates = [
+  const [templates, setTemplates] = React.useState<any[]>([
     {
       id: 'tpl_birthday_invite',
       name: 'Birthday Boutique Invitation',
@@ -37,7 +39,29 @@ export const TemplatesView: React.FC = () => {
       body: 'Dear {{name}}, Happy Anniversary! To make your celebration memorable, enjoy a personalized styling session and private preview at {{shop}}.',
       variables: ['name', 'shop']
     }
-  ];
+  ]);
+
+  React.useEffect(() => {
+    async function load() {
+      try {
+        const res = await api.getTemplates();
+        if (res && res.templates && res.templates.length > 0) {
+          const mapped = res.templates.map((t: any) => ({
+            id: t.id,
+            name: t.name,
+            category: t.category,
+            revision: t.revision,
+            body: t.body,
+            variables: t.variableSchema || []
+          }));
+          setTemplates(mapped);
+        }
+      } catch (err: any) {
+        console.warn('Using seeded template fallback', err.message);
+      }
+    }
+    load();
+  }, []);
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6 animate-in fade-in duration-300">
@@ -76,7 +100,7 @@ export const TemplatesView: React.FC = () => {
             <div className="flex items-center justify-between text-[11px] text-[#6B5E59] pt-1">
               <div className="flex items-center gap-1.5">
                 <Tag className="w-3 h-3 text-[#988B86]" />
-                <span>Variables: {tpl.variables.map((v) => `{{${v}}}`).join(', ')}</span>
+                <span>Variables: {tpl.variables.map((v: string) => `{{${v}}}`).join(', ')}</span>
               </div>
               <span className="text-[10px] text-[#988B86] uppercase font-bold">
                 {tpl.category}

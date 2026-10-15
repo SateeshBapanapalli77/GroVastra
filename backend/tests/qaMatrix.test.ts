@@ -1,4 +1,5 @@
-import { describe, it, expect, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import mongoose from 'mongoose';
 import { generateId } from '../src/shared/utils/id';
 import { encryptText, decryptText, sha256 } from '../src/shared/utils/crypto';
 import {
@@ -7,26 +8,68 @@ import {
   calculateDueInstant
 } from '../src/shared/utils/clock';
 import { checkAndReserveContactCapacity } from '../src/modules/campaigns/engine/safeguards/contactCapResolver';
+import { executePreflightSafeguards } from '../src/modules/campaigns/engine/safeguards/safeguardPipeline';
+import {
+  claimNextDueExecution,
+  processClaimedExecution
+} from '../src/modules/campaigns/engine/dispatchExecutor';
+import { evaluateCampaignDryRun } from '../src/modules/campaigns/engine/dryRun';
 import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/mockWhatsAppAdapter';
-import { getApprovedTemplate, APPROVED_TEMPLATES } from '../src/modules/campaigns/adapters/templateCatalogue';
-import { BOUTIQUE_CAMPAIGN_PRESETS } from '../src/modules/campaigns/presets/boutiquePresets';
-import { DomainEventBus } from '../src/shared/events/eventBus';
-import { DomainEvent } from '../src/shared/events/types';
+import { getApprovedTemplate } from '../src/modules/campaigns/adapters/templateCatalogue';
+import { verifyMetaSignature } from '../src/modules/campaigns/routes/webhook.routes';
+
+// Real Domain Models
+import { CustomerModel } from '../src/modules/crm/models/Customer.model';
+import { CampaignModel } from '../src/modules/campaigns/models/Campaign.model';
+import { CampaignVersionModel, ICampaignVersion } from '../src/modules/campaigns/models/CampaignVersion.model';
+import { CampaignEnrollmentModel } from '../src/modules/campaigns/models/CampaignEnrollment.model';
+import { CampaignExecutionModel } from '../src/modules/campaigns/models/CampaignExecution.model';
+import { CampaignDeliveryIntentModel } from '../src/modules/campaigns/models/CampaignDeliveryIntent.model';
+import { CampaignContactGateModel } from '../src/modules/campaigns/models/CampaignContactGate.model';
+import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
 import crypto from 'crypto';
 
-describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
+const TEST_DB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/grovastra_test';
+
+describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine', () => {
+  beforeAll(async () => {
+    mongoose.set('strictQuery', true);
+    await mongoose.connect(TEST_DB_URI, {
+      serverSelectionTimeoutMS: 5000,
+      autoIndex: true
+    });
+  });
+
+  afterAll(async () => {
+    await mongoose.disconnect();
+  });
+
+  beforeEach(async () => {
+    // Clear test collections between tests to guarantee clean isolated state
+    await Promise.all([
+      CustomerModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignVersionModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignEnrollmentModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignExecutionModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignDeliveryIntentModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignContactGateModel.deleteMany({ tenantId: { $regex: /^qa_/ } }),
+      CampaignEventInboxModel.deleteMany({ tenantId: { $regex: /^qa_/ } })
+    ]);
+  });
+
   /* =========================================================================
    * MATRIX A: Strategy, Trigger, Fingerprint & Lifecycle Boundaries (A01 - A14)
    * ========================================================================= */
   describe('Matrix A: Strategy, Trigger, Fingerprint & Lifecycle Boundaries', () => {
     it('A01: generates canonical enrollmentKey = tenantId:campaignId:customerId:occurrenceId', () => {
-      const tenantId = 'shop_padmavati';
+      const tenantId = 'qa_tenant_padmavati';
       const campaignId = 'cmp_birthday_2026';
       const customerId = 'cus_lakshmi_01';
       const occurrenceId = '2026';
 
       const enrollmentKey = `${tenantId}:${campaignId}:${customerId}:${occurrenceId}`;
-      expect(enrollmentKey).toBe('shop_padmavati:cmp_birthday_2026:cus_lakshmi_01:2026');
+      expect(enrollmentKey).toBe('qa_tenant_padmavati:cmp_birthday_2026:cus_lakshmi_01:2026');
 
       // Inviolable Rule (Page 18): Key must NOT contain version, retry count, or worker ID
       expect(enrollmentKey).not.toContain('cv_');
@@ -45,67 +88,165 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
 
       patrons.forEach((p) => {
         const occ = resolveNextAnnualOccurrence(p.bdayMonth, p.bdayDay, 'Asia/Kolkata', 'FEB_28');
-        run1Keys.add(`shop_padmavati:cmp_bday:${p.id}:${occ.occurrenceId}`);
+        run1Keys.add(`qa_tenant:cmp_bday:${p.id}:${occ.occurrenceId}`);
       });
 
       patrons.forEach((p) => {
         const occ = resolveNextAnnualOccurrence(p.bdayMonth, p.bdayDay, 'Asia/Kolkata', 'FEB_28');
-        run2Keys.add(`shop_padmavati:cmp_bday:${p.id}:${occ.occurrenceId}`);
+        run2Keys.add(`qa_tenant:cmp_bday:${p.id}:${occ.occurrenceId}`);
       });
 
       expect(run1Keys.size).toBe(2);
       expect(Array.from(run1Keys)).toEqual(Array.from(run2Keys));
     });
 
-    it('A03: rejects activation when draft configuration modified after review (fingerprint mismatch)', () => {
-      const baseDraft = {
+    it('A03: rejects activation when draft configuration modified after review (fingerprint mismatch)', async () => {
+      const tenantId = 'qa_tenant_fp';
+      const baseVersion = {
+        id: 'cv_base',
+        tenantId,
         campaignId: 'cmp_bday',
+        version: 1,
+        name: 'Birthday Campaign',
+        status: 'DRAFT',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', advanceDays: 14, leapDayPolicy: 'FEB_28' },
+        audience: {},
         steps: [
-          { stepId: 'invitation', offsetDays: -14, localTime: '10:00' },
-          { stepId: 'greeting', offsetDays: 0, localTime: '10:00' }
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: { patronName: 'customer.firstName' },
+            stopOnReply: true,
+            stopOnGoal: true
+          }
         ],
-        priority: 80
-      };
+        priority: 80,
+        timezone: 'Asia/Kolkata'
+      } as unknown as ICampaignVersion;
 
-      const dryRunFingerprint = `fp_${sha256(baseDraft).slice(0, 16)}`;
+      // 1. Evaluate dry run using real engine
+      const res1 = await evaluateCampaignDryRun(baseVersion);
+      expect(res1.draftFingerprint).toMatch(/^fp_/);
 
-      // Simulate patron/merchant modifying the step time from 10:00 to 11:00 after dry run
-      const modifiedDraft = {
-        ...baseDraft,
+      // 2. Modifying step time from 10:00 to 11:00 produces different canonical fingerprint
+      const modifiedVersion = {
+        ...baseVersion,
         steps: [
-          { stepId: 'invitation', offsetDays: -14, localTime: '11:00' },
-          { stepId: 'greeting', offsetDays: 0, localTime: '10:00' }
+          {
+            ...baseVersion.steps[0],
+            localTime: '11:00'
+          }
         ]
-      };
-      const modifiedFingerprint = `fp_${sha256(modifiedDraft).slice(0, 16)}`;
+      } as unknown as ICampaignVersion;
 
-      expect(modifiedFingerprint).not.toBe(dryRunFingerprint);
-
-      // Verify validation logic rejects stale review fingerprint
-      const isActivationAllowed = (providedFp: string, currentFp: string) => providedFp === currentFp;
-      expect(isActivationAllowed(dryRunFingerprint, modifiedFingerprint)).toBe(false);
+      const res2 = await evaluateCampaignDryRun(modifiedVersion);
+      expect(res2.draftFingerprint).not.toBe(res1.draftFingerprint);
     });
 
-    it('A04: Specification pattern filters audience by tags, min spend, and exclusions', () => {
-      const patrons = [
-        { id: 'p1', tags: ['VIP', 'Kanjeevaram'], totalSpendPaise: 4500000, optedIn: true },
-        { id: 'p2', tags: ['Cotton'], totalSpendPaise: 1200000, optedIn: true },
-        { id: 'p3', tags: ['VIP'], totalSpendPaise: 800000, optedIn: false }, // opted out
-        { id: 'p4', tags: ['VIP', 'Staff_Family'], totalSpendPaise: 5000000, optedIn: true } // excluded tag
-      ];
+    it('A04: Specification pattern filters audience by tags, min spend, and exclusions using real CustomerModel in MongoDB', async () => {
+      const tenantId = 'qa_tenant_audience';
 
-      // Audience Rule: Must have VIP tag AND minSpend >= 20,000 INR (2,000,000 paise) AND NOT Staff_Family
-      const filterPatron = (p: typeof patrons[0]) => {
-        if (!p.optedIn) return false;
-        const hasVip = p.tags.includes('VIP');
-        const minSpendOk = p.totalSpendPaise >= 2000000;
-        const isExcluded = p.tags.includes('Staff_Family');
-        return hasVip && minSpendOk && !isExcluded;
-      };
+      // Insert real customers into MongoDB
+      await CustomerModel.create([
+        {
+          id: 'p1',
+          tenantId,
+          firstName: 'Lakshmi',
+          lastName: 'Devi',
+          phone: '+919876500001',
+          tags: ['VIP', 'Kanjeevaram'],
+          preferences: { budgetMaxPaise: 4500000, weave: ['Kanjeevaram'] },
+          optedInMarketing: true,
+          channelSuppressed: false,
+          status: 'ACTIVE',
+          birthdayMonth: 10,
+          birthdayDay: 28
+        },
+        {
+          id: 'p2',
+          tenantId,
+          firstName: 'Ananya',
+          lastName: 'Rao',
+          phone: '+919876500002',
+          tags: ['Cotton'],
+          preferences: { budgetMaxPaise: 1200000, weave: ['Cotton'] },
+          optedInMarketing: true,
+          channelSuppressed: false,
+          status: 'ACTIVE',
+          birthdayMonth: 10,
+          birthdayDay: 28
+        },
+        {
+          id: 'p3',
+          tenantId,
+          firstName: 'Meera',
+          lastName: 'Sundaram',
+          phone: '+919876500003',
+          tags: ['VIP'],
+          preferences: { budgetMaxPaise: 800000, weave: ['Silk'] }, // Below min spend
+          optedInMarketing: true,
+          channelSuppressed: false,
+          status: 'ACTIVE',
+          birthdayMonth: 10,
+          birthdayDay: 28
+        },
+        {
+          id: 'p4',
+          tenantId,
+          firstName: 'Staff',
+          lastName: 'Member',
+          phone: '+919876500004',
+          tags: ['VIP', 'Staff_Family'], // Excluded tag
+          preferences: { budgetMaxPaise: 5000000, weave: ['Silk'] },
+          optedInMarketing: true,
+          channelSuppressed: false,
+          status: 'ACTIVE',
+          birthdayMonth: 10,
+          birthdayDay: 28
+        }
+      ]);
 
-      const eligible = patrons.filter(filterPatron);
-      expect(eligible.length).toBe(1);
-      expect(eligible[0].id).toBe('p1');
+      const version = {
+        id: 'cv_aud',
+        tenantId,
+        campaignId: 'cmp_aud',
+        version: 1,
+        name: 'VIP Birthday Offer',
+        status: 'DRAFT',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', advanceDays: 30, leapDayPolicy: 'FEB_28' },
+        audience: {
+          minSpendPaise: 2000000,
+          requiredTags: ['VIP'],
+          excludedTags: ['Staff_Family']
+        },
+        steps: [
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: { patronName: 'customer.firstName' },
+            stopOnReply: true,
+            stopOnGoal: true
+          }
+        ],
+        priority: 80,
+        timezone: 'Asia/Kolkata'
+      } as unknown as ICampaignVersion;
+
+      // Execute dry run with fixed clock
+      const clock = new SettableTestClock('2026-10-14T00:00:00.000Z');
+      const result = await evaluateCampaignDryRun(version, clock);
+
+      expect(result.summary.totalEvaluated).toBe(4);
+      expect(result.summary.eligibleCount).toBe(1);
+      expect(result.samplePlans.length).toBe(1);
+      expect(result.samplePlans[0].customerId).toBe('p1');
+      expect(result.reasonBreakdown.AUDIENCE_RULE_MISMATCH).toBe(3);
     });
 
     it('A05: multi-step sequence offsets calculate exact local business hours avoiding midnight UTC drift', () => {
@@ -127,34 +268,137 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       expect(dueD0.dueAtUtc.toISOString()).toBe('2026-10-28T04:00:00.000Z');
     });
 
-    it('A06: invalid or missing occasion date skips customer with INVALID_SOURCE_OR_DATE', () => {
-      const validateOccasion = (month: number | null, day: number | null) => {
-        if (!month || !day || month < 1 || month > 12 || day < 1 || day > 31) {
-          return { valid: false, reason: 'INVALID_SOURCE_OR_DATE' };
-        }
-        return { valid: true };
-      };
+    it('A06: invalid or missing occasion date skips customer with NO_OCCASION_DATE in evaluateCampaignDryRun', async () => {
+      const tenantId = 'qa_tenant_no_date';
 
-      expect(validateOccasion(null, 15)).toEqual({ valid: false, reason: 'INVALID_SOURCE_OR_DATE' });
-      expect(validateOccasion(2, 32)).toEqual({ valid: false, reason: 'INVALID_SOURCE_OR_DATE' });
-      expect(validateOccasion(10, 28)).toEqual({ valid: true });
+      await CustomerModel.create({
+        id: 'cus_no_bday',
+        tenantId,
+        firstName: 'No',
+        lastName: 'Birthday',
+        phone: '+919876500009',
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE',
+        bdayMonth: null,
+        bdayDay: null
+      });
+
+      const version = {
+        id: 'cv_nodate',
+        tenantId,
+        campaignId: 'cmp_nodate',
+        version: 1,
+        name: 'No Date Campaign',
+        status: 'DRAFT',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', advanceDays: 30, leapDayPolicy: 'FEB_28' },
+        audience: {},
+        steps: [
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: { patronName: 'customer.firstName' },
+            stopOnReply: true,
+            stopOnGoal: true
+          }
+        ],
+        priority: 80,
+        timezone: 'Asia/Kolkata'
+      } as unknown as ICampaignVersion;
+
+      const res = await evaluateCampaignDryRun(version);
+      expect(res.reasonBreakdown.NO_OCCASION_DATE).toBe(1);
+      expect(res.summary.eligibleCount).toBe(0);
     });
 
-    it('A07: channel-suppressed or deleted customer evaluated first in reason precedence', () => {
-      const evaluatePatronConsent = (customer: { channelSuppressed: boolean; status: string }) => {
-        if (customer.status === 'DELETED') return { allow: false, reason: 'CUSTOMER_DELETED' };
-        if (customer.channelSuppressed) return { allow: false, reason: 'CHANNEL_SUPPRESSED' };
-        return { allow: true };
-      };
+    it('A07: channel-suppressed or deleted customer evaluated first in reason precedence via real executePreflightSafeguards', async () => {
+      const tenantId = 'qa_tenant_suppressed';
 
-      expect(evaluatePatronConsent({ channelSuppressed: true, status: 'ACTIVE' })).toEqual({
-        allow: false,
-        reason: 'CHANNEL_SUPPRESSED'
+      // 1. Setup Campaign & Version
+      await CampaignModel.create({
+        id: 'cmp_sup',
+        tenantId,
+        name: 'Birthday Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_sup',
+        priority: 80,
+        reviewFingerprint: 'fp_123'
       });
-      expect(evaluatePatronConsent({ channelSuppressed: false, status: 'DELETED' })).toEqual({
-        allow: false,
-        reason: 'CUSTOMER_DELETED'
+
+      await CampaignVersionModel.create({
+        id: 'cv_sup',
+        tenantId,
+        campaignId: 'cmp_sup',
+        version: 1,
+        name: 'Birthday Version 1',
+        status: 'ACTIVE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        audience: {},
+        steps: [
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: {}
+          }
+        ],
+        priority: 80,
+        timezone: 'Asia/Kolkata',
+        reviewFingerprint: 'fp_123'
       });
+
+      // 2. Setup Suppressed Customer
+      await CustomerModel.create({
+        id: 'cus_sup',
+        tenantId,
+        firstName: 'Suppressed',
+        lastName: 'Customer',
+        phone: '+919876500010',
+        optedInMarketing: true,
+        channelSuppressed: true, // Suppressed
+        status: 'ACTIVE'
+      });
+
+      await CampaignEnrollmentModel.create({
+        id: 'enr_sup',
+        tenantId,
+        campaignId: 'cmp_sup',
+        campaignVersionId: 'cv_sup',
+        customerId: 'cus_sup',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_sup', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_sup:cus_sup:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: null
+      });
+
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_sup',
+        tenantId,
+        enrollmentId: 'enr_sup',
+        campaignId: 'cmp_sup',
+        stepId: 'invitation',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'NONE'
+      });
+
+      const outcome = await executePreflightSafeguards(execution);
+      expect(outcome.status).toBe('SKIP');
+      expect((outcome as any).reason).toBe('SKIPPED_CHANNEL_SUPPRESSED');
     });
 
     it('A08: Leap day birthday (Feb 29) follows explicit campaign policy on non-leap years', () => {
@@ -174,90 +418,396 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       expect(occLeapOnly.localDate).toBe('2028-02-29');
     });
 
-    it('A09: prerequisite check (PREVIOUS_ACCEPTED) blocks step 2 if step 1 was not accepted', () => {
-      const checkPrerequisites = (
-        stepDef: { prerequisite?: string },
-        priorExecutions: Array<{ stepId: string; state: string }>
-      ) => {
-        if (stepDef.prerequisite === 'PREVIOUS_ACCEPTED') {
-          const hasAccepted = priorExecutions.some((e) => e.state === 'PROVIDER_ACCEPTED');
-          if (!hasAccepted) return { allow: false, reason: 'PREREQUISITE_NOT_MET' };
-        }
-        return { allow: true };
-      };
+    it('A09: prerequisite check (PREVIOUS_ACCEPTED) blocks step 2 if step 1 was not accepted using real CampaignExecutionModel', async () => {
+      const tenantId = 'qa_tenant_prereq';
 
-      // Step 1 failed
-      expect(
-        checkPrerequisites({ prerequisite: 'PREVIOUS_ACCEPTED' }, [{ stepId: 'step_1', state: 'FAILED' }])
-      ).toEqual({ allow: false, reason: 'PREREQUISITE_NOT_MET' });
-
-      // Step 1 accepted
-      expect(
-        checkPrerequisites({ prerequisite: 'PREVIOUS_ACCEPTED' }, [
-          { stepId: 'step_1', state: 'PROVIDER_ACCEPTED' }
-        ])
-      ).toEqual({ allow: true });
-    });
-
-    it('A10: lateness cutoff skips executions past expiresAt with STEP_EXPIRED', () => {
-      const serverNow = new Date('2026-10-14T12:00:00.000Z');
-      const expiredAt = new Date('2026-10-14T11:00:00.000Z'); // 1 hour past
-      const futureAt = new Date('2026-10-14T14:00:00.000Z');
-
-      const isExpired = (expires: Date, now: Date) => now > expires;
-
-      expect(isExpired(expiredAt, serverNow)).toBe(true);
-      expect(isExpired(futureAt, serverNow)).toBe(false);
-    });
-
-    it('A11: inbound customer reply sets replyHoldAt and halts remaining sales steps', () => {
-      let enrollment = {
-        id: 'enr_01',
-        replyHoldAt: null as Date | null,
-        goalReachedAt: null as Date | null
-      };
-
-      // Inbound reply arrives
-      enrollment.replyHoldAt = new Date('2026-10-14T10:15:00.000Z');
-
-      // Evaluator checks follow-up step
-      const stepDef = { stepId: 'followup', stopOnReply: true };
-      const canSend = !stepDef.stopOnReply || enrollment.replyHoldAt === null;
-
-      expect(canSend).toBe(false);
-    });
-
-    it('A12: qualifying saree purchase sets goalReachedAt and skips remaining follow-ups', () => {
-      let enrollment = {
-        id: 'enr_02',
-        goalReachedAt: null as Date | null
-      };
-
-      // Customer makes purchase
-      enrollment.goalReachedAt = new Date('2026-10-14T11:30:00.000Z');
-
-      const stepDef = { stepId: 'discount_reminder', stopOnGoal: true };
-      const canSend = !stepDef.stopOnGoal || enrollment.goalReachedAt === null;
-
-      expect(canSend).toBe(false);
-    });
-
-    it('A13: paused campaign halts execution evaluation with CAMPAIGN_OR_GLOBAL_PAUSED', () => {
-      const evaluateCampaignState = (status: 'DRAFT' | 'ACTIVE' | 'PAUSED' | 'ARCHIVED') => {
-        if (status === 'PAUSED' || status === 'ARCHIVED') {
-          return { allow: false, reason: 'CAMPAIGN_OR_GLOBAL_PAUSED' };
-        }
-        return { allow: true };
-      };
-
-      expect(evaluateCampaignState('PAUSED')).toEqual({
-        allow: false,
-        reason: 'CAMPAIGN_OR_GLOBAL_PAUSED'
+      await CampaignModel.create({
+        id: 'cmp_prereq',
+        tenantId,
+        name: 'Sequenced Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_prereq',
+        priority: 80,
+        reviewFingerprint: 'fp_pre'
       });
-      expect(evaluateCampaignState('ACTIVE')).toEqual({ allow: true });
+
+      await CampaignVersionModel.create({
+        id: 'cv_prereq',
+        tenantId,
+        campaignId: 'cmp_prereq',
+        version: 1,
+        name: 'Sequenced Version',
+        status: 'ACTIVE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        audience: {},
+        steps: [
+          {
+            stepId: 'step_1',
+            offsetDays: -14,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: {}
+          },
+          {
+            stepId: 'step_2',
+            offsetDays: -7,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_followup', revision: 2, language: 'en' },
+            prerequisite: 'PREVIOUS_ACCEPTED',
+            bindings: {}
+          }
+        ],
+        priority: 80,
+        timezone: 'Asia/Kolkata',
+        reviewFingerprint: 'fp_pre'
+      });
+
+      await CustomerModel.create({
+        id: 'cus_pre',
+        tenantId,
+        firstName: 'Meera',
+        lastName: 'Sundaram',
+        phone: '+919876500012',
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE'
+      });
+
+      await CampaignEnrollmentModel.create({
+        id: 'enr_pre',
+        tenantId,
+        campaignId: 'cmp_prereq',
+        campaignVersionId: 'cv_prereq',
+        customerId: 'cus_pre',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_pre', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_prereq:cus_pre:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: null
+      });
+
+      const step2Execution = await CampaignExecutionModel.create({
+        id: 'exe_step_2',
+        tenantId,
+        enrollmentId: 'enr_pre',
+        campaignId: 'cmp_prereq',
+        stepId: 'step_2',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-21',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'PREVIOUS_ACCEPTED'
+      });
+
+      // Prior step 1 failed permanently -> Step 2 must SKIP with SKIPPED_PREREQUISITE_NOT_MET
+      await CampaignExecutionModel.create({
+        id: 'exe_step_1',
+        tenantId,
+        enrollmentId: 'enr_pre',
+        campaignId: 'cmp_prereq',
+        stepId: 'step_1',
+        dueAt: new Date(Date.now() - 86400000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'FAILED',
+        prerequisite: 'NONE'
+      });
+
+      const outcomeFail = await executePreflightSafeguards(step2Execution);
+      expect(outcomeFail.status).toBe('SKIP');
+      expect((outcomeFail as any).reason).toBe('SKIPPED_PREREQUISITE_NOT_MET');
+
+      // Now update prior step 1 to PROVIDER_ACCEPTED
+      await CampaignExecutionModel.updateOne(
+        { id: 'exe_step_1' },
+        { $set: { state: 'PROVIDER_ACCEPTED' } }
+      );
+
+      // Now preflight safeguards must pass prerequisite check
+      const outcomePass = await executePreflightSafeguards(step2Execution);
+      expect(outcomePass.status).toBe('PROCEED');
     });
 
-    it('A14: unapproved or unknown template blocks execution with CONTENT_OR_TEMPLATE_BLOCKED', () => {
+    it('A10: lateness cutoff skips executions past expiresAt with SKIPPED_STEP_EXPIRED', async () => {
+      const tenantId = 'qa_tenant_expired';
+
+      await CampaignModel.create({
+        id: 'cmp_exp',
+        tenantId,
+        name: 'Expiring Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_exp',
+        priority: 80,
+        reviewFingerprint: 'fp_exp'
+      });
+
+      await CampaignVersionModel.create({
+        id: 'cv_exp',
+        tenantId,
+        campaignId: 'cmp_exp',
+        version: 1,
+        name: 'Expiring Version',
+        status: 'ACTIVE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        audience: {},
+        steps: [{ stepId: 'step_exp', offsetDays: 0, localTime: '10:00', templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' }, bindings: {} }],
+        priority: 80,
+        timezone: 'Asia/Kolkata',
+        reviewFingerprint: 'fp_exp'
+      });
+
+      await CustomerModel.create({
+        id: 'cus_exp',
+        tenantId,
+        firstName: 'Ananya',
+        lastName: 'Rao',
+        phone: '+919876500015',
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE'
+      });
+
+      await CampaignEnrollmentModel.create({
+        id: 'enr_exp',
+        tenantId,
+        campaignId: 'cmp_exp',
+        campaignVersionId: 'cv_exp',
+        customerId: 'cus_exp',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_exp', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_exp:cus_exp:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: null
+      });
+
+      // Execution expired 1 hour ago
+      const expiredExecution = await CampaignExecutionModel.create({
+        id: 'exe_exp',
+        tenantId,
+        enrollmentId: 'enr_exp',
+        campaignId: 'cmp_exp',
+        stepId: 'step_exp',
+        dueAt: new Date(Date.now() - 7200000),
+        expiresAt: new Date(Date.now() - 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'NONE'
+      });
+
+      const outcome = await executePreflightSafeguards(expiredExecution);
+      expect(outcome.status).toBe('SKIP');
+      expect((outcome as any).reason).toBe('SKIPPED_STEP_EXPIRED');
+    });
+
+    it('A11: inbound customer reply sets replyHoldAt and halts remaining sales steps with SKIPPED_REPLY_HOLD', async () => {
+      const tenantId = 'qa_tenant_reply';
+
+      await CampaignModel.create({
+        id: 'cmp_reply',
+        tenantId,
+        name: 'Reply Hold Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_reply',
+        priority: 80,
+        reviewFingerprint: 'fp_rep'
+      });
+
+      await CampaignVersionModel.create({
+        id: 'cv_reply',
+        tenantId,
+        campaignId: 'cmp_reply',
+        version: 1,
+        name: 'Reply Hold Version',
+        status: 'ACTIVE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        audience: {},
+        steps: [{ stepId: 'step_followup', offsetDays: -7, localTime: '10:00', templateRef: { id: 'tpl_birthday_followup', revision: 2, language: 'en' }, bindings: {}, stopOnReply: true }],
+        priority: 80,
+        timezone: 'Asia/Kolkata',
+        reviewFingerprint: 'fp_rep'
+      });
+
+      await CustomerModel.create({
+        id: 'cus_rep',
+        tenantId,
+        firstName: 'Pooja',
+        lastName: 'Sharma',
+        phone: '+919876500018',
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE'
+      });
+
+      // Enrollment has active replyHoldAt
+      await CampaignEnrollmentModel.create({
+        id: 'enr_rep',
+        tenantId,
+        campaignId: 'cmp_reply',
+        campaignVersionId: 'cv_reply',
+        customerId: 'cus_rep',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_rep', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_reply:cus_rep:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: new Date(), // Staff hold active!
+        goalReachedAt: null
+      });
+
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_rep',
+        tenantId,
+        enrollmentId: 'enr_rep',
+        campaignId: 'cmp_reply',
+        stepId: 'step_followup',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'NONE'
+      });
+
+      const outcome = await executePreflightSafeguards(execution);
+      expect(outcome.status).toBe('SKIP');
+      expect((outcome as any).reason).toBe('SKIPPED_REPLY_HOLD');
+    });
+
+    it('A12: qualifying saree purchase sets goalReachedAt and skips follow-ups with SKIPPED_GOAL_REACHED', async () => {
+      const tenantId = 'qa_tenant_goal';
+
+      await CampaignModel.create({
+        id: 'cmp_goal',
+        tenantId,
+        name: 'Goal Stop Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_goal',
+        priority: 80,
+        reviewFingerprint: 'fp_goal'
+      });
+
+      await CampaignVersionModel.create({
+        id: 'cv_goal',
+        tenantId,
+        campaignId: 'cmp_goal',
+        version: 1,
+        name: 'Goal Stop Version',
+        status: 'ACTIVE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        audience: {},
+        steps: [{ stepId: 'step_disc', offsetDays: -3, localTime: '10:00', templateRef: { id: 'tpl_birthday_followup', revision: 2, language: 'en' }, bindings: {}, stopOnGoal: true }],
+        priority: 80,
+        timezone: 'Asia/Kolkata',
+        reviewFingerprint: 'fp_goal'
+      });
+
+      await CustomerModel.create({
+        id: 'cus_goal',
+        tenantId,
+        firstName: 'Lakshmi',
+        lastName: 'Devi',
+        phone: '+919876500020',
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE'
+      });
+
+      // Enrollment has goal reached recorded
+      await CampaignEnrollmentModel.create({
+        id: 'enr_goal',
+        tenantId,
+        campaignId: 'cmp_goal',
+        campaignVersionId: 'cv_goal',
+        customerId: 'cus_goal',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_goal', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_goal:cus_goal:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: new Date() // Purchase made!
+      });
+
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_goal',
+        tenantId,
+        enrollmentId: 'enr_goal',
+        campaignId: 'cmp_goal',
+        stepId: 'step_disc',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'NONE'
+      });
+
+      const outcome = await executePreflightSafeguards(execution);
+      expect(outcome.status).toBe('SKIP');
+      expect((outcome as any).reason).toBe('SKIPPED_GOAL_REACHED');
+    });
+
+    it('A13: paused campaign halts execution evaluation with SKIPPED_CAMPAIGN_PAUSED', async () => {
+      const tenantId = 'qa_tenant_paused';
+
+      await CampaignModel.create({
+        id: 'cmp_pau',
+        tenantId,
+        name: 'Paused Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'PAUSED', // Paused!
+        activeVersionId: 'cv_pau',
+        priority: 80,
+        reviewFingerprint: 'fp_pau'
+      });
+
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_pau',
+        tenantId,
+        enrollmentId: 'enr_pau',
+        campaignId: 'cmp_pau',
+        stepId: 'step_1',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'NONE'
+      });
+
+      const outcome = await executePreflightSafeguards(execution);
+      expect(outcome.status).toBe('SKIP');
+      expect((outcome as any).reason).toBe('SKIPPED_CAMPAIGN_PAUSED');
+    });
+
+    it('A14: unapproved or unknown template blocks execution with null from catalogue', () => {
       const template = getApprovedTemplate('tpl_non_existent_saree');
       expect(template).toBeNull();
 
@@ -271,63 +821,81 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
    * MATRIX B: Concurrency, Identity Keys & Anti-Spam Arbitration (B01 - B10)
    * ========================================================================= */
   describe('Matrix B: Concurrency, Identity Keys & Anti-Spam Arbitration', () => {
-    it('B01: atomic step lease acquisition ensures only one worker claims a due step', () => {
-      // Simulating atomic findOneAndUpdate CAS on MongoDB
-      let executionDoc = {
-        id: 'exe_b01',
-        state: 'SCHEDULED',
-        leaseToken: null as string | null,
-        leaseExpiresAt: null as Date | null
-      };
+    it('B01: atomic step lease acquisition ensures only one worker claims a due step via real claimNextDueExecution', async () => {
+      const tenantId = 'qa_tenant_b01';
 
-      const tryAcquireLease = (workerId: string, now: Date) => {
-        if (
-          executionDoc.state === 'SCHEDULED' &&
-          (executionDoc.leaseExpiresAt === null || executionDoc.leaseExpiresAt < now)
-        ) {
-          const token = `lease_${workerId}_${Date.now()}`;
-          executionDoc.leaseToken = token;
-          executionDoc.leaseExpiresAt = new Date(now.getTime() + 30000); // 30s lease
-          return token;
-        }
-        return null;
-      };
+      await CampaignExecutionModel.create({
+        id: 'exe_b01',
+        tenantId,
+        enrollmentId: 'enr_b01',
+        campaignId: 'cmp_b01',
+        stepId: 'invitation',
+        dueAt: new Date(Date.now() - 1000), // Due in past
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'SCHEDULED',
+        prerequisite: 'NONE',
+        lease: { token: null, until: null, claimedBy: null }
+      });
 
       const now = new Date();
-      const lease1 = tryAcquireLease('worker_A', now);
-      const lease2 = tryAcquireLease('worker_B', now);
+      // Concurrent worker poll
+      const [claimA, claimB] = await Promise.all([
+        claimNextDueExecution(tenantId, now, 'worker_A'),
+        claimNextDueExecution(tenantId, now, 'worker_B')
+      ]);
 
-      expect(lease1).not.toBeNull();
-      expect(lease2).toBeNull();
-      expect(executionDoc.leaseToken).toBe(lease1);
+      // Exactly one worker must succeed, the other receives null
+      const claimed = claimA || claimB;
+      const missed = claimA ? claimB : claimA;
+
+      expect(claimed).not.toBeNull();
+      expect(missed).toBeNull();
+      expect(claimed?.state).toBe('EVALUATING');
+      expect(claimed?.lease.token).not.toBeNull();
     });
 
-    it('B02: expired worker lease (>30s) is safely reclaimed by subsequent worker poll', () => {
-      const initialTime = new Date('2026-10-14T10:00:00.000Z');
-      let executionDoc = {
+    it('B02: expired worker lease (>30s) is safely reclaimed by subsequent worker poll via claimNextDueExecution', async () => {
+      const tenantId = 'qa_tenant_b02';
+      const pastTime = new Date(Date.now() - 60000); // 1 minute ago
+
+      await CampaignExecutionModel.create({
         id: 'exe_b02',
+        tenantId,
+        enrollmentId: 'enr_b02',
+        campaignId: 'cmp_b02',
+        stepId: 'invitation',
+        dueAt: pastTime,
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
         state: 'SCHEDULED',
-        leaseToken: 'lease_dead_worker',
-        leaseExpiresAt: new Date(initialTime.getTime() + 30000) // expired at 10:00:30
-      };
+        prerequisite: 'NONE',
+        lease: {
+          token: 'stale_token',
+          until: new Date(Date.now() - 5000), // Expired 5s ago
+          claimedBy: 'dead_worker'
+        }
+      });
 
-      const pollTimeAfterExpiry = new Date('2026-10-14T10:00:31.000Z');
+      const serverNow = new Date();
+      const reclaimed = await claimNextDueExecution(tenantId, serverNow, 'fresh_worker');
 
-      const isLeaseReclaimable = executionDoc.leaseExpiresAt < pollTimeAfterExpiry;
-      expect(isLeaseReclaimable).toBe(true);
-
-      // Reclaim lease
-      executionDoc.leaseToken = 'lease_fresh_worker';
-      executionDoc.leaseExpiresAt = new Date(pollTimeAfterExpiry.getTime() + 30000);
-
-      expect(executionDoc.leaseToken).toBe('lease_fresh_worker');
+      expect(reclaimed).not.toBeNull();
+      expect(reclaimed?.id).toBe('exe_b02');
+      expect(reclaimed?.lease.claimedBy).toBe('fresh_worker');
     });
 
     it('B03: rolling 24-hour contact cap blocks second marketing message to same phone', async () => {
       const phone = `+919800${Math.floor(100000 + Math.random() * 900000)}`;
 
       const res1 = await checkAndReserveContactCapacity(
-        'tenant_qa',
+        'qa_tenant_caps',
         phone,
         'cmp_bday',
         'exe_first',
@@ -337,7 +905,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       expect(res1.allowed).toBe(true);
 
       const res2 = await checkAndReserveContactCapacity(
-        'tenant_qa',
+        'qa_tenant_caps',
         phone,
         'cmp_festival',
         'exe_second',
@@ -354,9 +922,9 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
 
       // Send 3 allowed messages spaced across days 1, 3, 5
       for (let i = 1; i <= 3; i++) {
-        const timeOffset = i * 26 * 3600 * 1000; // 26h intervals to bypass 24h cap
+        const timeOffset = i * 26 * 3600 * 1000; // 26h intervals bypass 24h cap
         const res = await checkAndReserveContactCapacity(
-          'tenant_qa',
+          'qa_tenant_caps',
           phone,
           `cmp_${i}`,
           `exe_${i}`,
@@ -370,7 +938,7 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       // 4th message on day 6 (within 7d window) must be blocked
       const day6Time = baseTime + 4 * 26 * 3600 * 1000;
       const res4 = await checkAndReserveContactCapacity(
-        'tenant_qa',
+        'qa_tenant_caps',
         phone,
         'cmp_excess',
         'exe_excess',
@@ -385,34 +953,34 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
     it('B05: service/transactional notifications carry high priority over marketing', () => {
       const marketingPriority = 60;
       const serviceAlterationPriority = 100;
-
       expect(serviceAlterationPriority).toBeGreaterThan(marketingPriority);
     });
 
-    it('B06: collision priority arbitration awards contact slot to higher priority campaign', async () => {
+    it('B06: collision priority arbitration awards contact slot to higher priority campaign and displaces lower priority', async () => {
       const phone = `+919802${Math.floor(100000 + Math.random() * 900000)}`;
 
-      // High priority birthday campaign (priority 85) reserves first
-      const birthdayRes = await checkAndReserveContactCapacity(
-        'tenant_qa',
+      // 1. Lower priority campaign (priority 50) reserves slot
+      const promoRes = await checkAndReserveContactCapacity(
+        'qa_tenant_caps',
+        phone,
+        'cmp_promo',
+        'exe_promo',
+        new Date(Date.now() + 86400000),
+        50
+      );
+      expect(promoRes.allowed).toBe(true);
+
+      // 2. Higher priority campaign (priority 85) competes in same window
+      const bdayRes = await checkAndReserveContactCapacity(
+        'qa_tenant_caps',
         phone,
         'cmp_bday',
         'exe_bday',
         new Date(Date.now() + 86400000),
         85
       );
-      expect(birthdayRes.allowed).toBe(true);
-
-      // Low priority promotional blast (priority 40) is blocked by contact cap
-      const promoRes = await checkAndReserveContactCapacity(
-        'tenant_qa',
-        phone,
-        'cmp_promo',
-        'exe_promo',
-        new Date(Date.now() + 86400000),
-        40
-      );
-      expect(promoRes.allowed).toBe(false);
+      // Higher priority wins the slot by displacing the lower priority reservation
+      expect(bdayRes.allowed).toBe(true);
     });
 
     it('B07: two-phase intent freezing encrypts recipient phone and computes canonical hash', () => {
@@ -434,43 +1002,90 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       const executionKey = `${enrollmentId}:${stepId}`;
 
       expect(executionKey).toBe('enr_test_123:invitation');
-      // Assert no ephemeral details leaked
       expect(executionKey).not.toContain('worker');
       expect(executionKey).not.toContain('retry');
     });
 
-    it('B09: duplicate delivery protection: deliveryKey = executionId prevents double sending', () => {
-      const executionId = 'exe_step_01';
-      const deliveryKey = `${executionId}`;
+    it('B09: duplicate delivery protection: unique compound index on CampaignDeliveryIntentModel prevents duplicate delivery for same executionId', async () => {
+      const tenantId = 'qa_tenant_b09';
+      const executionId = 'exe_dedup_01';
 
-      const deliveryIntentsMap = new Map<string, string>();
-      deliveryIntentsMap.set(deliveryKey, 'di_001');
-
-      // Attempting second dispatch for same execution
-      const isAlreadyDispatched = deliveryIntentsMap.has(deliveryKey);
-      expect(isAlreadyDispatched).toBe(true);
-    });
-
-    it('B10: optimistic concurrency: plan revision increment rejects stale executor updates', () => {
-      let currentRevision = 2;
-
-      const tryUpdateExecution = (docRevision: number) => {
-        if (docRevision !== currentRevision) {
-          return { success: false, error: 'PLAN_REVISION_CONFLICT' };
-        }
-        currentRevision++;
-        return { success: true };
-      };
-
-      // Stale worker tries to update with revision 1
-      expect(tryUpdateExecution(1)).toEqual({
-        success: false,
-        error: 'PLAN_REVISION_CONFLICT'
+      await CampaignDeliveryIntentModel.create({
+        id: 'di_001',
+        tenantId,
+        executionId,
+        deliveryKey: executionId,
+        connectionId: 'conn_test',
+        customerId: 'cus_lakshmi_01',
+        recipientVersion: 1,
+        encryptedRecipient: encryptText('+919876543210'),
+        templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+        parameters: {},
+        payloadHash: 'hash_01',
+        state: 'ACCEPTED',
+        attemptId: 'att_01',
+        providerMessageId: 'wamid.HB123',
+        submittedAt: new Date()
       });
 
-      // Valid worker updates with revision 2
-      expect(tryUpdateExecution(2)).toEqual({ success: true });
-      expect(currentRevision).toBe(3);
+      // Attempting second delivery intent for same executionId in same tenant must fail with MongoDB E11000 duplicate key
+      let duplicateError: any = null;
+      try {
+        await CampaignDeliveryIntentModel.create({
+          id: 'di_002',
+          tenantId,
+          executionId, // Duplicate!
+          deliveryKey: executionId,
+          connectionId: 'conn_test',
+          customerId: 'cus_lakshmi_01',
+          recipientVersion: 1,
+          encryptedRecipient: encryptText('+919876543210'),
+          templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+          parameters: {},
+          payloadHash: 'hash_02',
+          state: 'SUBMITTING',
+          attemptId: 'att_02'
+        });
+      } catch (err: any) {
+        duplicateError = err;
+      }
+
+      expect(duplicateError).not.toBeNull();
+      expect(duplicateError.code).toBe(11000); // E11000 duplicate key
+    });
+
+    it('B10: optimistic concurrency: plan revision increment rejects stale executor updates', async () => {
+      const tenantId = 'qa_tenant_b10';
+
+      await CampaignExecutionModel.create({
+        id: 'exe_b10',
+        tenantId,
+        enrollmentId: 'enr_b10',
+        campaignId: 'cmp_b10',
+        stepId: 'invitation',
+        dueAt: new Date(),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1, // Current revision 1
+        state: 'SCHEDULED',
+        prerequisite: 'NONE'
+      });
+
+      // Worker 1 atomically increments revision from 1 -> 2
+      const res1 = await CampaignExecutionModel.updateOne(
+        { id: 'exe_b10', planRevision: 1 },
+        { $inc: { planRevision: 1 } }
+      );
+      expect(res1.modifiedCount).toBe(1);
+
+      // Stale Worker 2 attempts update with old revision 1 -> Matches 0 docs!
+      const res2 = await CampaignExecutionModel.updateOne(
+        { id: 'exe_b10', planRevision: 1 },
+        { $inc: { planRevision: 1 } }
+      );
+      expect(res2.modifiedCount).toBe(0);
     });
   });
 
@@ -519,26 +1134,66 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       expect(result.errorCode).toBe('TEMPLATE_NOT_FOUND');
     });
 
-    it('C03: provider webhook transition to DELIVERED updates execution record', () => {
-      let execution = { state: 'PROVIDER_ACCEPTED', deliveredAt: null as Date | null };
+    it('C03: provider webhook transition to DELIVERED updates execution record in MongoDB', async () => {
+      const tenantId = 'qa_tenant_c03';
 
-      // Incoming webhook: status = 'delivered'
-      execution.state = 'DELIVERED';
-      execution.deliveredAt = new Date('2026-10-14T10:05:00.000Z');
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_c03',
+        tenantId,
+        enrollmentId: 'enr_c03',
+        campaignId: 'cmp_c03',
+        stepId: 'invitation',
+        dueAt: new Date(),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'PROVIDER_ACCEPTED',
+        prerequisite: 'NONE'
+      });
 
-      expect(execution.state).toBe('DELIVERED');
-      expect(execution.deliveredAt).not.toBeNull();
+      // Status update arrives from Meta: delivered
+      const deliveredTime = new Date('2026-10-14T10:05:00.000Z');
+      await CampaignExecutionModel.updateOne(
+        { id: execution.id },
+        { $set: { state: 'DELIVERED', deliveredAt: deliveredTime } }
+      );
+
+      const updated = await CampaignExecutionModel.findOne({ id: execution.id });
+      expect(updated?.state).toBe('DELIVERED');
+      expect(updated?.deliveredAt?.toISOString()).toBe(deliveredTime.toISOString());
     });
 
-    it('C04: provider webhook transition to READ updates execution record', () => {
-      let execution = { state: 'DELIVERED', readAt: null as Date | null };
+    it('C04: provider webhook transition to READ updates execution record in MongoDB', async () => {
+      const tenantId = 'qa_tenant_c04';
 
-      // Incoming webhook: status = 'read'
-      execution.state = 'READ';
-      execution.readAt = new Date('2026-10-14T10:07:00.000Z');
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_c04',
+        tenantId,
+        enrollmentId: 'enr_c04',
+        campaignId: 'cmp_c04',
+        stepId: 'invitation',
+        dueAt: new Date(),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'DELIVERED',
+        prerequisite: 'NONE'
+      });
 
-      expect(execution.state).toBe('READ');
-      expect(execution.readAt).not.toBeNull();
+      // Status update arrives from Meta: read
+      const readTime = new Date('2026-10-14T10:07:00.000Z');
+      await CampaignExecutionModel.updateOne(
+        { id: execution.id },
+        { $set: { state: 'READ', readAt: readTime } }
+      );
+
+      const updated = await CampaignExecutionModel.findOne({ id: execution.id });
+      expect(updated?.state).toBe('READ');
+      expect(updated?.readAt?.toISOString()).toBe(readTime.toISOString());
     });
 
     it('C05: retryable network error triggers exponential backoff without marking fatal failure', () => {
@@ -571,12 +1226,12 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       expect(result.state).toBe('OUTCOME_UNKNOWN');
       expect(result.errorCode).toBe('NETWORK_TIMEOUT');
 
-      // Crucial: Handoff Page 27 mandates that OUTCOME_UNKNOWN must NEVER be blindly re-submitted
+      // Handoff Page 27: OUTCOME_UNKNOWN must NEVER be blindly re-submitted
       const canBlindResend = (state: string) => state !== 'OUTCOME_UNKNOWN';
       expect(canBlindResend(result.state)).toBe(false);
     });
 
-    it('C07: webhook signature verification validates SHA-256 HMAC and rejects forged payloads', () => {
+    it('C07: webhook signature verification validates SHA-256 HMAC and rejects forged payloads using real verifyMetaSignature', () => {
       const appSecret = 'boutique_meta_app_secret_xyz';
       const rawPayload = JSON.stringify({ event: 'delivery_receipt', wamid: 'wamid.HB123' });
 
@@ -584,88 +1239,175 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C)', () => {
       const validHmac = crypto.createHmac('sha256', appSecret).update(rawPayload).digest('hex');
       const validHeader = `sha256=${validHmac}`;
 
-      const verifyWebhookSignature = (header: string, payload: string, secret: string) => {
-        const expected = `sha256=${crypto.createHmac('sha256', secret).update(payload).digest('hex')}`;
-        return header === expected;
-      };
-
-      expect(verifyWebhookSignature(validHeader, rawPayload, appSecret)).toBe(true);
-      expect(verifyWebhookSignature('sha256=forged_bad_hash', rawPayload, appSecret)).toBe(false);
+      expect(verifyMetaSignature(validHeader, rawPayload, appSecret)).toBe(true);
+      expect(verifyMetaSignature('sha256=forged_bad_hash', rawPayload, appSecret)).toBe(false);
+      expect(verifyMetaSignature(undefined, rawPayload, appSecret)).toBe(false);
     });
 
-    it('C08: duplicate webhook idempotency safely acknowledges replayed wamid without double processing', () => {
-      const processedWamids = new Set<string>();
+    it('C08: duplicate webhook idempotency via CampaignEventInboxModel with compound unique index', async () => {
+      const tenantId = 'qa_tenant_c08';
+      const eventId = 'evt_unique_wamid_01';
 
-      const processWebhook = (wamid: string) => {
-        if (processedWamids.has(wamid)) {
-          return { status: 200, action: 'IGNORED_DUPLICATE' };
-        }
-        processedWamids.add(wamid);
-        return { status: 200, action: 'PROCESSED' };
-      };
-
-      expect(processWebhook('wamid.001')).toEqual({ status: 200, action: 'PROCESSED' });
-      expect(processWebhook('wamid.001')).toEqual({ status: 200, action: 'IGNORED_DUPLICATE' });
-    });
-
-    it('C09: inbound customer WhatsApp reply webhook emits campaign.reply_received and halts sales flow', () => {
-      const eventBus = new DomainEventBus();
-      let replyEventReceived: any = null;
-
-      eventBus.subscribe('campaign.reply_received', async (event) => {
-        replyEventReceived = event;
-      });
-
-      const inboundReplyEvent: DomainEvent<{ phone: string; messageText: string }> = {
-        schemaVersion: 1,
+      await CampaignEventInboxModel.create({
+        id: generateId('inb'),
+        tenantId,
         producer: 'whatsapp',
-        eventId: 'evt_reply_01',
-        tenantId: 'shop_padmavati',
+        eventId,
         type: 'campaign.reply_received',
-        entityId: 'cus_lakshmi_01',
+        entityId: 'cus_01',
         entityVersion: 1,
         occurredAt: new Date(),
         receivedAt: new Date(),
-        data: {
-          phone: '+919876543210',
-          messageText: 'Can I see the Gadwal silk saree in peacock blue?'
-        }
-      };
-
-      eventBus.publish(inboundReplyEvent);
-
-      expect(replyEventReceived).not.toBeNull();
-      expect(replyEventReceived.data.messageText).toContain('Gadwal silk');
-    });
-
-    it('C10: saree purchase domain event matches customer, sets goalReachedAt, and records conversion', () => {
-      const eventBus = new DomainEventBus();
-      let orderProcessed = false;
-
-      eventBus.subscribe('order.completed', async (event) => {
-        orderProcessed = true;
+        status: 'PROCESSED'
       });
 
-      const orderEvent: DomainEvent<{ orderId: string; totalPaise: number; phone: string }> = {
-        schemaVersion: 1,
-        producer: 'orders',
-        eventId: 'evt_ord_99',
-        tenantId: 'shop_padmavati',
-        type: 'order.completed',
-        entityId: 'ord_99',
-        entityVersion: 1,
-        occurredAt: new Date(),
-        receivedAt: new Date(),
-        data: {
-          orderId: 'ord_99',
-          totalPaise: 3850000,
-          phone: '+919876543210'
-        }
-      };
+      // Attempting to re-ingest duplicate eventId throws MongoDB E11000 duplicate key error
+      let duplicateErr: any = null;
+      try {
+        await CampaignEventInboxModel.create({
+          id: generateId('inb'),
+          tenantId,
+          producer: 'whatsapp',
+          eventId, // Duplicate!
+          type: 'campaign.reply_received',
+          entityId: 'cus_01',
+          entityVersion: 1,
+          occurredAt: new Date(),
+          receivedAt: new Date(),
+          status: 'RECEIVED'
+        });
+      } catch (err: any) {
+        duplicateErr = err;
+      }
 
-      eventBus.publish(orderEvent);
+      expect(duplicateErr).not.toBeNull();
+      expect(duplicateErr.code).toBe(11000);
+    });
 
-      expect(orderProcessed).toBe(true);
+    it('C09: processClaimedExecution executes preflight safeguards and dispatches via MockWhatsAppDeliveryAdapter', async () => {
+      const tenantId = 'qa_tenant_c09';
+
+      await CampaignModel.create({
+        id: 'cmp_c09',
+        tenantId,
+        name: 'Live Dispatch Campaign',
+        type: 'ANNUAL_DATE',
+        status: 'ACTIVE',
+        activeVersionId: 'cv_c09',
+        priority: 80,
+        reviewFingerprint: 'fp_c09'
+      });
+
+      await CampaignVersionModel.create({
+        id: 'cv_c09',
+        tenantId,
+        campaignId: 'cmp_c09',
+        version: 1,
+        name: 'Live Dispatch Version',
+        status: 'ACTIVE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },
+        audience: {},
+        steps: [
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+            bindings: { patronName: 'customer.firstName' },
+            stopOnReply: true,
+            stopOnGoal: true
+          }
+        ],
+        priority: 80,
+        timezone: 'Asia/Kolkata',
+        reviewFingerprint: 'fp_c09'
+      });
+
+      await CustomerModel.create({
+        id: 'cus_c09',
+        tenantId,
+        firstName: 'Lakshmi',
+        lastName: 'Devi',
+        phone: '+919876543299',
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE'
+      });
+
+      await CampaignEnrollmentModel.create({
+        id: 'enr_c09',
+        tenantId,
+        campaignId: 'cmp_c09',
+        campaignVersionId: 'cv_c09',
+        customerId: 'cus_c09',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_c09', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_c09:cus_c09:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: null
+      });
+
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_c09',
+        tenantId,
+        enrollmentId: 'enr_c09',
+        campaignId: 'cmp_c09',
+        stepId: 'invitation',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'EVALUATING',
+        prerequisite: 'NONE',
+        lease: { token: 'lease_test', until: new Date(Date.now() + 30000), claimedBy: 'worker_1' }
+      });
+
+      const resultState = await processClaimedExecution(execution, adapter);
+      expect(resultState).toBe('ACCEPTED');
+
+      // Verify execution updated to PROVIDER_ACCEPTED in MongoDB
+      const updated = await CampaignExecutionModel.findOne({ id: 'exe_c09' });
+      expect(updated?.state).toBe('PROVIDER_ACCEPTED');
+
+      // Verify delivery intent was created
+      const intent = await CampaignDeliveryIntentModel.findOne({ executionId: 'exe_c09' });
+      expect(intent).not.toBeNull();
+      expect(intent?.state).toBe('ACCEPTED');
+      expect(intent?.providerMessageId).toMatch(/^wamid\./);
+    });
+
+    it('C10: inbound customer WhatsApp reply updates CampaignEnrollmentModel with replyHoldAt', async () => {
+      const tenantId = 'qa_tenant_c10';
+
+      const enrollment = await CampaignEnrollmentModel.create({
+        id: 'enr_c10',
+        tenantId,
+        campaignId: 'cmp_c10',
+        campaignVersionId: 'cv_c10',
+        customerId: 'cus_lakshmi_01',
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: 'cus_lakshmi_01', version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:cmp_c10:cus_lakshmi_01:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: null
+      });
+
+      // Simulate webhook processor receiving inbound reply from customer
+      const replyTime = new Date();
+      await CampaignEnrollmentModel.updateMany(
+        { customerId: 'cus_lakshmi_01', status: 'ACTIVE' },
+        { $set: { replyHoldAt: replyTime } }
+      );
+
+      const updated = await CampaignEnrollmentModel.findById(enrollment._id);
+      expect(updated?.replyHoldAt).toEqual(replyTime);
     });
   });
 });

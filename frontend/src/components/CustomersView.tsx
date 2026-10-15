@@ -3,8 +3,10 @@
 import React from 'react';
 import { Users, Calendar, Tag, ShieldCheck, CheckCircle2, XCircle } from 'lucide-react';
 
+import { api } from '../lib/api';
+
 export const CustomersView: React.FC = () => {
-  const patrons = [
+  const [patrons, setPatrons] = React.useState<any[]>([
     {
       id: 'cus_lakshmi_01',
       name: 'Lakshmi Devi',
@@ -45,7 +47,31 @@ export const CustomersView: React.FC = () => {
       weaves: ['Kanjeevaram'],
       tags: ['Opted Out (Protected)']
     }
-  ];
+  ]);
+
+  React.useEffect(() => {
+    async function load() {
+      try {
+        const res = await api.getCustomers();
+        if (res && res.customers && res.customers.length > 0) {
+          const mapped = res.customers.map((c: any) => ({
+            id: c.id,
+            name: `${c.firstName} ${c.lastName}`.trim(),
+            phone: c.phone,
+            birthday: c.birthdayMonth && c.birthdayDay ? `${c.birthdayDay} ${c.birthdayMonth}` : 'None',
+            anniversary: c.anniversaryMonth && c.anniversaryDay ? `${c.anniversaryDay} ${c.anniversaryMonth}` : 'None',
+            optedIn: c.optedInMarketing && !c.channelSuppressed,
+            weaves: c.preferences?.weave || ['Silk'],
+            tags: c.tags || ['Patron']
+          }));
+          setPatrons(mapped);
+        }
+      } catch (err: any) {
+        console.warn('Using seeded patron fallback', err.message);
+      }
+    }
+    load();
+  }, []);
 
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6 animate-in fade-in duration-300">
@@ -88,7 +114,7 @@ export const CustomersView: React.FC = () => {
                 <td className="p-4 text-[#6B5E59]">{p.anniversary}</td>
                 <td className="p-4">
                   <div className="flex flex-wrap gap-1">
-                    {p.weaves.map((w) => (
+                    {p.weaves.map((w: string) => (
                       <span
                         key={w}
                         className="px-2 py-0.5 bg-[#FAF8F5] border border-[#EAE4DC] rounded text-[10px] text-[#5C1D24] font-medium"

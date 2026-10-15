@@ -93,14 +93,40 @@ export async function processClaimedExecution(
     const { customer, version } = outcome;
     const stepDef = version.steps.find((s) => s.stepId === execution.stepId)!;
 
-    // Resolve parameter bindings
-    const parameters: Record<string, string> = {
-      name: customer.firstName,
-      shop: 'Padmavati Handlooms',
-      offer: '15% VIP Celebration Privilege'
-    };
-    const payloadHash = sha256(parameters);
+    // Resolve parameter bindings dynamically (Handoff Page 19)
+    const parameters: Record<string, string> = {};
+    const rawBindings = stepDef.bindings instanceof Map
+      ? Object.fromEntries(stepDef.bindings.entries())
+      : (stepDef.bindings || {});
 
+    for (const [paramKey, rawExpr] of Object.entries(rawBindings)) {
+      const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
+      if (expr === 'customer.firstName') {
+        parameters[paramKey] = customer.firstName || '';
+      } else if (expr === 'customer.lastName') {
+        parameters[paramKey] = customer.lastName || '';
+      } else if (expr === 'customer.fullName') {
+        parameters[paramKey] = `${customer.firstName} ${customer.lastName}`.trim();
+      } else if (expr === 'shop.displayName' || expr === 'shop.name') {
+        parameters[paramKey] = 'Padmavati Handlooms';
+      } else if (expr.startsWith('literal:')) {
+        parameters[paramKey] = expr.slice(8);
+      } else if (expr in customer) {
+        parameters[paramKey] = String((customer as any)[expr] || '');
+      } else {
+        parameters[paramKey] = expr;
+      }
+    }
+
+    // Default standard placeholders if template expects them
+    if (!parameters.name && customer.firstName) {
+      parameters.name = customer.firstName;
+    }
+    if (!parameters.shop) {
+      parameters.shop = 'Padmavati Handlooms';
+    }
+
+    const payloadHash = sha256(parameters);
     const deliveryIntentId = generateId('di');
     const attemptId = `attempt_${ulid().toLowerCase()}`;
 
@@ -127,10 +153,29 @@ export async function processClaimedExecution(
       submittedAt: serverNow
     });
 
-    // Move execution to DISPATCHING
-    execution.state = 'DISPATCHING';
-    execution.deliveryIntentId = deliveryIntentId;
-    await execution.save();
+    // Move execution to DISPATCHING using Atomic CAS
+    const dispatching = await CampaignExecutionModel.findOneAndUpdate(
+      {
+        id: executionId,
+        state: 'EVALUATING',
+        'lease.token': execution.lease.token
+      },
+      {
+        $set: {
+          state: 'DISPATCHING',
+          deliveryIntentId
+        }
+      },
+      { new: true }
+    );
+
+    if (!dispatching) {
+      logger.warn({ executionId }, 'CAS Conflict: Execution was modified or lease expired before dispatching');
+      deliveryIntent.state = 'REJECTED';
+      deliveryIntent.errorCode = 'LEASE_LOST_BEFORE_DISPATCH';
+      await deliveryIntent.save();
+      return 'FAILED';
+    }
 
     // 3. Dispatch to WhatsApp Adapter (Outside of DB transaction)
     const sendResult = await adapter.sendCampaignStep({
@@ -149,15 +194,23 @@ export async function processClaimedExecution(
       recipientPhone: customer.phone
     });
 
-    // 4. Handle Adapter Response & Update States
+    // 4. Handle Adapter Response & Update States via CAS
     if (sendResult.state === 'ACCEPTED') {
       deliveryIntent.state = 'ACCEPTED';
       deliveryIntent.providerMessageId = sendResult.providerMessageId || null;
       await deliveryIntent.save();
 
-      execution.state = 'PROVIDER_ACCEPTED';
-      execution.lease = { token: null, until: null, claimedBy: null };
-      await execution.save();
+      await CampaignExecutionModel.findOneAndUpdate(
+        { id: executionId, state: 'DISPATCHING' },
+        {
+          $set: {
+            state: 'PROVIDER_ACCEPTED',
+            'lease.token': null,
+            'lease.until': null,
+            'lease.claimedBy': null
+          }
+        }
+      );
 
       await updateContactReservationStatus(tenantId, customer.phone, executionId, 'ACCEPTED');
       logger.info({ executionId, providerId: sendResult.providerMessageId }, 'Message accepted by provider');
@@ -204,7 +257,7 @@ export async function processClaimedExecution(
 export async function runDispatchCycle(
   tenantId: string,
   batchSize: number = 5,
-  adapter: IWhatsAppDeliveryAdapter = mockWhatsAppAdapter,
+  adapter: IWhatsAppDeliveryAdapter = getWhatsAppDeliveryAdapter(),
   serverNow: Date = new Date()
 ): Promise<DispatchCycleResult> {
   const result: DispatchCycleResult = {

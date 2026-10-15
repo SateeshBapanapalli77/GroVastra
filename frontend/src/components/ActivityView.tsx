@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import {
   Clock,
   CheckCircle2,
@@ -27,70 +27,11 @@ interface ActivityItem {
   goalReachedAt?: string | null;
 }
 
-export const ActivityView: React.FC = () => {
-  const [activities, setActivities] = useState<ActivityItem[]>([
-    {
-      id: 'exe_act_01',
-      campaignName: 'Birthday Boutique Shopping',
-      stepId: 'invitation (D-14)',
-      customerId: 'Lakshmi Devi',
-      occurrenceId: 'birthday:2026',
-      state: 'PROVIDER_ACCEPTED',
-      explanation: 'Accepted by WhatsApp provider and delivered to patron.',
-      timestamp: 'Today at 10:02 AM IST',
-      enrollmentId: 'enr_01'
-    },
-    {
-      id: 'exe_act_02',
-      campaignName: 'Birthday Boutique Shopping',
-      stepId: 'followup (D-7)',
-      customerId: 'Lakshmi Devi',
-      occurrenceId: 'birthday:2026',
-      state: 'HELD',
-      outcomeReason: 'SKIPPED_REPLY_HOLD',
-      explanation: 'Customer replied to invitation; sales follow-up held for human weaver desk.',
-      timestamp: 'Today at 10:15 AM IST',
-      enrollmentId: 'enr_01',
-      replyHoldAt: '2026-10-14T10:15:00.000Z'
-    },
-    {
-      id: 'exe_act_03',
-      campaignName: 'Anniversary Celebration',
-      stepId: 'invitation (D-21)',
-      customerId: 'Ananya Rao',
-      occurrenceId: 'anniversary:2026',
-      state: 'SCHEDULED',
-      explanation: 'Scheduled for future due time (D-21 window).',
-      timestamp: 'Scheduled for 15 Oct 10:00 AM IST',
-      enrollmentId: 'enr_02'
-    },
-    {
-      id: 'exe_act_04',
-      campaignName: 'Requested Saree Restock',
-      stepId: 'restock_notification',
-      customerId: 'Meera Sundaram',
-      occurrenceId: 'restock:BN-BLU-002:2026-10-14',
-      state: 'SKIPPED',
-      outcomeReason: 'SKIPPED_CONTACT_CAP',
-      explanation: 'Skipped because patron already received marketing contact within rolling 24h.',
-      timestamp: 'Today at 11:00 AM IST',
-      enrollmentId: 'enr_03'
-    },
-    {
-      id: 'exe_act_05',
-      campaignName: 'Birthday Boutique Shopping',
-      stepId: 'followup (D-7)',
-      customerId: 'Ananya Rao',
-      occurrenceId: 'birthday:2026',
-      state: 'SKIPPED',
-      outcomeReason: 'SKIPPED_GOAL_REACHED',
-      explanation: 'Follow-up stopped because patron completed a qualifying saree purchase.',
-      timestamp: 'Yesterday at 04:30 PM IST',
-      enrollmentId: 'enr_04',
-      goalReachedAt: '2026-10-13T16:30:00.000Z'
-    }
-  ]);
+import { api, ActivityItem as ApiActivityItem } from '../lib/api';
 
+export const ActivityView: React.FC = () => {
+  const [activities, setActivities] = useState<ApiActivityItem[]>([]);
+  const [loading, setLoading] = useState<boolean>(true);
   const [toastMessage, setToastMessage] = useState<string | null>(null);
 
   const showToast = (msg: string) => {
@@ -98,38 +39,42 @@ export const ActivityView: React.FC = () => {
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-  const handleReleaseHold = (enrollmentId: string) => {
-    setActivities((prev) =>
-      prev.map((act) => {
-        if (act.enrollmentId === enrollmentId && act.state === 'HELD') {
-          return {
-            ...act,
-            state: 'SCHEDULED',
-            explanation: 'Hold released by boutique staff; next step re-queued for evaluation.',
-            replyHoldAt: null
-          };
-        }
-        return act;
-      })
-    );
-    showToast('Hold released successfully. Future steps will be evaluated normally.');
+  const loadActivities = async () => {
+    try {
+      setLoading(true);
+      const res = await api.getActivityStream();
+      if (res && res.activity) {
+        setActivities(res.activity);
+      }
+    } catch (err: any) {
+      console.warn('Backend not reachable or empty; showing demo fallback', err.message);
+    } finally {
+      setLoading(false);
+    }
   };
 
-  const handleMarkGoal = (enrollmentId: string) => {
-    setActivities((prev) =>
-      prev.map((act) => {
-        if (act.enrollmentId === enrollmentId && act.state === 'SCHEDULED') {
-          return {
-            ...act,
-            state: 'SKIPPED',
-            outcomeReason: 'SKIPPED_GOAL_REACHED',
-            explanation: 'Staff manually recorded purchase goal; pending promotional messages cancelled.'
-          };
-        }
-        return act;
-      })
-    );
-    showToast('Goal marked. Pending promotional follow-ups skipped.');
+  useEffect(() => {
+    loadActivities();
+  }, []);
+
+  const handleReleaseHold = async (enrollmentId: string) => {
+    try {
+      await api.resolveHold(enrollmentId);
+      showToast('Hold released successfully on backend.');
+      await loadActivities();
+    } catch (err: any) {
+      showToast(`Error: ${err.message}`);
+    }
+  };
+
+  const handleMarkGoal = async (enrollmentId: string) => {
+    try {
+      await api.markGoal(enrollmentId, 'staff_manual_tag');
+      showToast('Goal marked met on backend.');
+      await loadActivities();
+    } catch (err: any) {
+      showToast(`Error: ${err.message}`);
+    }
   };
 
   return (
@@ -191,7 +136,7 @@ export const ActivityView: React.FC = () => {
                 </p>
 
                 <div className="text-[10px] text-[#988B86] flex items-center gap-2">
-                  <span>{act.timestamp}</span>
+                  <span>{act.timestamp || (act.dueAt ? new Date(act.dueAt).toLocaleString() : 'Recent')}</span>
                   <span>•</span>
                   <span>Occurrence: {act.occurrenceId}</span>
                 </div>

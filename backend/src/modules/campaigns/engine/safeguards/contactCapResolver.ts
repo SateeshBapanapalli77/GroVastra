@@ -72,32 +72,52 @@ export async function checkAndReserveContactCapacity(
   const cutoff24h = nowDt.minus({ hours: 24 }).toJSDate();
   const cutoff7d = nowDt.minus({ days: 7 }).toJSDate();
 
-  // Active entries in rolling windows (exclude released entries)
-  const validHistory: IContactReservation[] = (gate.history || []).filter((h: IContactReservation) => h.status !== 'RELEASED');
+  // Active entries in rolling windows (exclude released and displaced entries)
+  const validHistory: IContactReservation[] = (gate.history || []).filter(
+    (h: IContactReservation) => h.status !== 'RELEASED' && h.status !== 'DISPLACED'
+  );
 
   const contactsIn24h = validHistory.filter((h: IContactReservation) => h.reservedAt > cutoff24h);
   const contactsIn7d = validHistory.filter((h: IContactReservation) => h.reservedAt > cutoff7d);
 
-  // Cap Rule 1: Max 1 per rolling 24h
+  // Cap Rule 1: Max 1 per rolling 24h with Priority Arbitration (Page 18)
   if (contactsIn24h.length >= 1) {
-    const earliestRelease = new Date(contactsIn24h[0].reservedAt.getTime() + 24 * 60 * 60 * 1000 + 1000);
-    logger.info(
-      { executionId, destinationHash: destinationHash.slice(0, 8), contactsIn24h: contactsIn24h.length },
-      'Contact cap 1/24h exceeded'
+    // Check if the occupying reservation can be displaced by higher priority
+    const displaceable = contactsIn24h.find(
+      (h: IContactReservation) => h.status === 'RESERVED' && priority > (h.priority ?? 50)
     );
 
-    // If earliest slot is before execution expiresAt, we can defer; otherwise skip permanently
-    if (earliestRelease < expiresAt) {
+    if (displaceable) {
+      logger.info(
+        {
+          candidateExecutionId: executionId,
+          candidatePriority: priority,
+          displacedExecutionId: displaceable.executionId,
+          displacedPriority: displaceable.priority
+        },
+        'Collision Arbitration: Higher priority campaign displacing reserved contact slot'
+      );
+
+      displaceable.status = 'DISPLACED';
+    } else {
+      const earliestRelease = new Date(contactsIn24h[0].reservedAt.getTime() + 24 * 60 * 60 * 1000 + 1000);
+      logger.info(
+        { executionId, destinationHash: destinationHash.slice(0, 8), contactsIn24h: contactsIn24h.length, priority },
+        'Contact cap 1/24h exceeded and no lower priority reservation could be displaced'
+      );
+
+      if (earliestRelease < expiresAt) {
+        return {
+          allowed: false,
+          reason: 'DEFERRED_CONTACT_CAP',
+          nextAvailableAt: earliestRelease
+        };
+      }
       return {
         allowed: false,
-        reason: 'DEFERRED_CONTACT_CAP',
-        nextAvailableAt: earliestRelease
+        reason: 'SKIPPED_CONTACT_CAP'
       };
     }
-    return {
-      allowed: false,
-      reason: 'SKIPPED_CONTACT_CAP'
-    };
   }
 
   // Cap Rule 2: Max 3 per rolling 7d
@@ -126,6 +146,7 @@ export async function checkAndReserveContactCapacity(
   const newReservation: IContactReservation = {
     executionId,
     campaignId,
+    priority,
     reservedAt: serverNow,
     expiresAt,
     status: 'RESERVED'
@@ -138,7 +159,7 @@ export async function checkAndReserveContactCapacity(
   }
 
   logger.debug(
-    { executionId, destinationHash: destinationHash.slice(0, 8) },
+    { executionId, destinationHash: destinationHash.slice(0, 8), priority },
     'Successfully reserved contact capacity'
   );
 

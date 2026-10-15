@@ -8,6 +8,7 @@ import { CampaignExecutionModel } from '../models/CampaignExecution.model';
 import { CampaignDryRunModel } from '../models/CampaignDryRun.model';
 import { evaluateCampaignDryRun } from '../engine/dryRun';
 import { planAnnualOccasions } from '../engine/annualDateStrategy';
+import { CustomerModel } from '../../crm/models/Customer.model';
 import { generateId } from '../../../shared/utils/id';
 import { env } from '../../../config/env';
 
@@ -217,6 +218,39 @@ campaignRouter.patch('/campaigns/:id/draft', async (req: Request, res: Response)
 
     if (!draft) {
       return res.status(404).json({ success: false, error: 'Draft version not found' });
+    }
+
+    // Invariant: If draft is currently the active/live version, clone a new immutable draft revision (Page 16)
+    if (campaign.activeVersionId === draft.id) {
+      const nextVersionNumber = (campaign.draftVersion || 1) + 1;
+      const newVersionId = generateId('cv');
+
+      const clonedDraft = await CampaignVersionModel.create({
+        id: newVersionId,
+        tenantId,
+        campaignId: campaign.id,
+        version: nextVersionNumber,
+        name: name || draft.name,
+        industry: draft.industry,
+        purpose: draft.purpose,
+        trigger: trigger ? { ...draft.trigger, ...trigger } : draft.trigger,
+        timezone: timezone || draft.timezone,
+        audience: audience || draft.audience,
+        goal: draft.goal,
+        steps: steps || draft.steps,
+        priority: priority || draft.priority,
+        resumePolicy: draft.resumePolicy,
+        importPolicy: draft.importPolicy,
+        enabledBranches: draft.enabledBranches,
+        publishedBy: 'owner',
+        reviewFingerprint: `draft_${Date.now()}`
+      });
+
+      campaign.draftVersion = nextVersionNumber;
+      if (name) campaign.name = name;
+      await campaign.save();
+
+      return res.json({ success: true, campaign, draftVersion: clonedDraft });
     }
 
     if (name) {
@@ -511,3 +545,26 @@ campaignRouter.get('/campaign-activity', async (req: Request, res: Response) => 
     res.status(500).json({ success: false, error: err.message });
   }
 });
+
+/**
+ * GET /api/v1/customers
+ * Returns all patrons for tenant
+ */
+campaignRouter.get('/customers', async (req: Request, res: Response) => {
+  try {
+    const tenantId = (req as any).tenantId;
+    const customers = await CustomerModel.find({ tenantId }).lean();
+    res.json({ success: true, customers });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/v1/templates
+ * Returns pre-approved Meta WhatsApp templates
+ */
+campaignRouter.get('/templates', async (_req: Request, res: Response) => {
+  res.json({ success: true, templates: APPROVED_TEMPLATES });
+});
+

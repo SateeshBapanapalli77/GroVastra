@@ -19,11 +19,14 @@ app.use(
   })
 );
 
-// Raw body parser for webhooks (HMAC verification)
-app.use('/hooks', express.raw({ type: 'application/json' }));
-
-// Standard JSON parser for application APIs
-app.use(express.json());
+// JSON parser with raw body buffer capture for HMAC webhook verification
+app.use(
+  express.json({
+    verify: (req: any, _res, buf) => {
+      req.rawBody = buf;
+    }
+  })
+);
 
 // Health Check
 app.get('/api/v1/health', (req, res) => {

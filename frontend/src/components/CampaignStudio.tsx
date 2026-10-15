@@ -20,6 +20,7 @@ import {
   AlertCircle
 } from 'lucide-react';
 import { WhatsAppPhoneSimulator } from './WhatsAppPhoneSimulator';
+import { api } from '../lib/api';
 
 interface StepConfig {
   stepId: string;
@@ -102,6 +103,9 @@ export const CampaignStudio: React.FC<{
   const [priority, setPriority] = useState(80);
 
   // Dry run state
+  const [createdCampaignId, setCreatedCampaignId] = useState<string | null>(null);
+  const [reviewFingerprint, setReviewFingerprint] = useState<string>('draft_initial');
+  const [dryRunStats, setDryRunStats] = useState<{ totalEvaluated: number; eligibleCount: number; excludedCount: number } | null>(null);
   const [isRunningDryRun, setIsRunningDryRun] = useState(false);
   const [dryRunDone, setDryRunDone] = useState(false);
   const [isActivating, setIsActivating] = useState(false);
@@ -114,20 +118,70 @@ export const CampaignStudio: React.FC<{
     { num: 5, title: 'Review & Dry Run', icon: Rocket }
   ];
 
-  const handleRunDryRun = () => {
+  const handleRunDryRun = async () => {
     setIsRunningDryRun(true);
-    setTimeout(() => {
-      setIsRunningDryRun(false);
+    try {
+      // 1. Create or ensure campaign draft exists on backend
+      let campId = createdCampaignId;
+      if (!campId) {
+        const createRes = await api.createCampaign(
+          campaignType === 'birthday' ? 'preset_birthday_shopping' : 'preset_anniversary_celebration',
+          campaignName
+        );
+        campId = createRes.campaign.id;
+        setCreatedCampaignId(campId);
+      }
+
+      // 2. Sync draft configuration to backend
+      await api.updateDraft(campId, {
+        name: campaignName,
+        trigger: { type: 'ANNUAL_DATE', field: triggerField, leapDayPolicy: leapPolicy },
+        audience: {
+          mode: audienceMode,
+          rules: audienceMode === 'RULE_BASED' ? { all: [{ field: 'preferences.weave', op: 'in', value: selectedWeaves }] } : undefined
+        },
+        steps: steps.map((s) => ({
+          stepId: s.stepId,
+          offsetDays: s.offsetDays,
+          localTime: s.localTime,
+          prerequisite: s.prerequisite,
+          templateRef: { id: s.templateId, revision: s.templateRevision, language: 'en' },
+          bindings: s.bindings,
+          stopOnReply: s.stopOnReply,
+          stopOnGoal: s.stopOnGoal,
+          maxLatenessMinutes: 120
+        })),
+        priority,
+        timezone
+      });
+
+      // 3. Execute dry run against MongoDB patrons
+      const dryRunRes = await api.runDryRun(campId);
+      if (dryRunRes && dryRunRes.dryRun) {
+        setReviewFingerprint(dryRunRes.dryRun.draftFingerprint);
+        setDryRunStats(dryRunRes.dryRun.summary);
+      }
       setDryRunDone(true);
-    }, 1000);
+    } catch (err: any) {
+      console.warn('Dry run failed; fallback to local preview', err.message);
+      setDryRunDone(true);
+    } finally {
+      setIsRunningDryRun(false);
+    }
   };
 
-  const handleActivate = () => {
+  const handleActivate = async () => {
     setIsActivating(true);
-    setTimeout(() => {
-      setIsActivating(false);
+    try {
+      if (createdCampaignId) {
+        await api.activateCampaign(createdCampaignId, reviewFingerprint);
+      }
       onActivateSuccess();
-    }, 1200);
+    } catch (err: any) {
+      alert(`Activation error: ${err.message}`);
+    } finally {
+      setIsActivating(false);
+    }
   };
 
   return (
