@@ -35,10 +35,21 @@ export class WhatsAppSandboxDeliveryAdapter implements IWhatsAppDeliveryAdapter 
     // Clean phone number (strip spaces, dashes, leading plus for Meta Cloud API format)
     const cleanPhone = recipient.replace(/[^0-9]/g, '');
 
-    // In Meta Developer Sandbox, pre-approved test templates like "hello_world" or registered templates are used
-    const templateName = params.template.id.includes('birthday') ? 'hello_world' : params.template.id;
+    // Dispatch registered template with parameters formatted into Meta Cloud API components
+    const templateName = params.template.id;
 
-    const payload = {
+    const components: any[] = [];
+    if (params.parameters && Object.keys(params.parameters).length > 0) {
+      components.push({
+        type: 'body',
+        parameters: Object.entries(params.parameters).map(([_, val]) => ({
+          type: 'text',
+          text: String(val)
+        }))
+      });
+    }
+
+    const payload: any = {
       messaging_product: 'whatsapp',
       recipient_type: 'individual',
       to: cleanPhone,
@@ -46,8 +57,9 @@ export class WhatsAppSandboxDeliveryAdapter implements IWhatsAppDeliveryAdapter 
       template: {
         name: templateName,
         language: {
-          code: 'en_US'
-        }
+          code: params.template.language || 'en_US'
+        },
+        ...(components.length > 0 ? { components } : {})
       }
     };
 

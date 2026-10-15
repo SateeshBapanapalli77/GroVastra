@@ -118,8 +118,8 @@ describe('Milestone 3: Durable Execution & Safeguards Test Suite', () => {
 
       const params = {
         name: 'Lakshmi',
-        shop: 'Padmavati Handlooms',
-        offer: '15% Birthday Discount'
+        shop: 'GroVastra Boutique',
+        offer: 'Handloom Festive Preview'
       };
       const hash1 = sha256(params);
       const hash2 = sha256(params);

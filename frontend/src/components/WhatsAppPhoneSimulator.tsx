@@ -27,8 +27,8 @@ export const WhatsAppPhoneSimulator: React.FC<WhatsAppSimulatorProps> = ({
   activeStep,
   onSelectStep,
   customerName = 'Sravani garu 🙏',
-  storeName = 'Padmavati Handlooms',
-  offerText = '15% VIP Anniversary discount'
+  storeName = 'GroVastra Boutique',
+  offerText = 'Curated festive preview'
 }) => {
   return (
     <div className="flex flex-col items-center">

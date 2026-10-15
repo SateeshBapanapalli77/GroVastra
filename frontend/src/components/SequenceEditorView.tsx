@@ -247,7 +247,7 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
                       store.brand_trade_name
                     </span>
                     <span className="font-medium text-[#271E1B]">
-                      Padmavati Handlooms
+                      GroVastra Boutique
                     </span>
                   </div>
                   <div className="grid grid-cols-3 p-2.5 items-center">
@@ -258,7 +258,7 @@ export const SequenceEditorView: React.FC<SequenceEditorViewProps> = ({
                       campaign.promo_privilege
                     </span>
                     <span className="font-semibold text-[#8F6910]">
-                      15% VIP Anniversary discount
+                      Curated handloom preview
                     </span>
                   </div>
                 </div>

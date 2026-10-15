@@ -170,11 +170,23 @@ export async function evaluateCampaignDryRun(
       const stepPreviews = version.steps.map((step) => {
         const timing = calculateDueInstant(occurrence.localDate, step.offsetDays, step.localTime, timezone);
         const template = getApprovedTemplate(step.templateRef.id);
-        const vars: Record<string, string> = {
-          name: customer.firstName,
-          shop: 'Padmavati Handlooms',
-          offer: '15% Birthday Discount'
-        };
+        const rawBindings = step.bindings instanceof Map
+          ? Object.fromEntries(step.bindings.entries())
+          : (step.bindings || {});
+
+        const vars: Record<string, string> = {};
+        for (const [k, v] of Object.entries(rawBindings)) {
+          if (v === 'customer.firstName') vars[k] = customer.firstName || '';
+          else if (v === 'customer.lastName') vars[k] = customer.lastName || '';
+          else if (v === 'customer.fullName') vars[k] = `${customer.firstName} ${customer.lastName}`.trim();
+          else if (v === 'shop.displayName' || v === 'shop.name') vars[k] = 'GroVastra Boutique';
+          else if (typeof v === 'string' && v.startsWith('literal:')) vars[k] = v.slice(8);
+          else if (typeof v === 'string' && v in customer) vars[k] = String((customer as any)[v] || '');
+          else vars[k] = String(v || '');
+        }
+        if (!vars.name && customer.firstName) vars.name = customer.firstName;
+        if (!vars.shop) vars.shop = 'GroVastra Boutique';
+
         const rendered = template ? template.render(vars) : 'Template not found';
 
         return {

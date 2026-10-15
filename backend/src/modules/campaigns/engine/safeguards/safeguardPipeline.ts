@@ -8,7 +8,7 @@ import { checkAndReserveContactCapacity, CapCheckResult } from './contactCapReso
 import { logger } from '../../../../config/logger';
 
 export type PipelineOutcome =
-  | { status: 'PROCEED'; customer: ICustomer; version: ICampaignVersion; enrollment: ICampaignEnrollment }
+  | { status: 'PROCEED'; customer: ICustomer; version: ICampaignVersion; enrollment: ICampaignEnrollment; campaign: any }
   | { status: 'SKIP'; reason: string }
   | { status: 'DEFER'; reason: string; nextDueAt: Date };
 
@@ -16,7 +16,7 @@ export type PipelineOutcome =
  * Preflight Safeguard Pipeline (Chain of Responsibility Pattern)
  * Evaluates gates in strict Reason Precedence Order (Handoff Page 33):
  * 1. Channel Suppression / Customer Deletion
- * 2. Campaign / Global Pause
+ * 2. Campaign / Global Pause & Pause Generation
  * 3. Step Expiry / Lateness Cutoff
  * 4. Stop Rules (stopOnGoal purchase, stopOnReply staff hold)
  * 5. Prerequisite Check (PREVIOUS_ACCEPTED)
@@ -34,8 +34,15 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_NOT_FOUND' };
   }
 
-  // Gate 1: Campaign Pause Check
+  // Gate 1: Campaign Pause Check & Pause Generation Validation
   if (campaign.status === 'PAUSED' || campaign.status === 'ARCHIVED') {
+    return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_PAUSED' };
+  }
+
+  if (
+    typeof (execution as any).pauseGeneration === 'number' &&
+    (execution as any).pauseGeneration < campaign.pauseGeneration
+  ) {
     return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_PAUSED' };
   }
 
@@ -92,9 +99,9 @@ export async function executePreflightSafeguards(
       enrollmentId
     }).lean();
 
-    // Check if there is an accepted previous step
+    // Check if there is an accepted previous step (PROVIDER_ACCEPTED, DELIVERED, or READ)
     const priorAccepted = priorExecutions.some(
-      (e) => e.stepId !== stepId && e.state === 'PROVIDER_ACCEPTED'
+      (e) => e.stepId !== stepId && ['PROVIDER_ACCEPTED', 'DELIVERED', 'READ'].includes(e.state)
     );
 
     if (!priorAccepted) {
@@ -149,6 +156,7 @@ export async function executePreflightSafeguards(
     status: 'PROCEED',
     customer,
     version,
-    enrollment
+    enrollment,
+    campaign
   };
 }

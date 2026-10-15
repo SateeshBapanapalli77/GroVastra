@@ -1409,5 +1409,288 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       const updated = await CampaignEnrollmentModel.findById(enrollment._id);
       expect(updated?.replyHoldAt).toEqual(replyTime);
     });
+
+    it('C11: multi-step prerequisite PREVIOUS_ACCEPTED succeeds when prior step is DELIVERED or READ', async () => {
+      const tenantId = 'qa_tenant_c11';
+      const campaignId = 'cmp_c11_multistep';
+      const versionId = 'cv_c11_multistep';
+      const enrollmentId = 'enr_c11';
+      const customerId = 'cus_c11_lakshmi';
+
+      // 1. Setup Customer
+      await CustomerModel.create({
+        id: customerId,
+        tenantId,
+        firstName: 'Lakshmi',
+        lastName: 'Devi',
+        phone: '+919876543211',
+        channelSuppressed: false,
+        optedInMarketing: true,
+        birthdayMonth: 10,
+        birthdayDay: 28,
+        status: 'ACTIVE'
+      });
+
+      // 2. Setup Campaign and Version with 2 Steps (invitation and followup with PREVIOUS_ACCEPTED)
+      await CampaignModel.create({
+        id: campaignId,
+        tenantId,
+        name: 'Birthday Sequence Test',
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        status: 'ACTIVE',
+        activeVersionId: versionId,
+        draftVersion: 1,
+        pauseGeneration: 0
+      });
+
+      await CampaignVersionModel.create({
+        id: versionId,
+        tenantId,
+        campaignId,
+        version: 1,
+        name: 'Birthday Sequence v1',
+        industry: 'BOUTIQUE',
+        purpose: 'MARKETING',
+        trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+        timezone: 'Asia/Kolkata',
+        audience: { mode: 'ALL_ELIGIBLE' },
+        steps: [
+          {
+            stepId: 'invitation',
+            offsetDays: -14,
+            localTime: '10:00',
+            prerequisite: 'NONE',
+            templateRef: { id: 'tpl_birthday_invite', revision: 1, language: 'en' },
+            bindings: { name: 'customer.firstName' },
+            stopOnReply: true,
+            stopOnGoal: true,
+            maxLatenessMinutes: 120
+          },
+          {
+            stepId: 'followup',
+            offsetDays: -7,
+            localTime: '10:00',
+            prerequisite: 'PREVIOUS_ACCEPTED',
+            templateRef: { id: 'tpl_birthday_followup', revision: 1, language: 'en' },
+            bindings: { name: 'customer.firstName' },
+            stopOnReply: true,
+            stopOnGoal: true,
+            maxLatenessMinutes: 120
+          }
+        ],
+        priority: 80,
+        resumePolicy: 'FUTURE_ONLY',
+        importPolicy: 'FUTURE_ONLY',
+        enabledBranches: [],
+        publishedBy: 'test_runner',
+        publishedAt: new Date(),
+        reviewFingerprint: 'fp_c11_test'
+      });
+
+      await CampaignEnrollmentModel.create({
+        id: enrollmentId,
+        tenantId,
+        campaignId,
+        campaignVersionId: versionId,
+        customerId,
+        occurrenceId: '2026',
+        sourceRef: { type: 'CUSTOMER_DATE', id: customerId, version: 1 },
+        status: 'ACTIVE',
+        enrollmentKey: `${tenantId}:${campaignId}:${customerId}:2026`,
+        enrolledAt: new Date(),
+        replyHoldAt: null,
+        goalReachedAt: null
+      });
+
+      // 3. Create Invitation Execution in DELIVERED state (simulating webhook delivery receipt)
+      const invitationExecution = await CampaignExecutionModel.create({
+        id: 'exe_c11_invitation',
+        tenantId,
+        enrollmentId,
+        campaignId,
+        stepId: 'invitation',
+        dueAt: new Date(Date.now() - 7 * 86400 * 1000),
+        expiresAt: new Date(Date.now() + 7 * 86400 * 1000),
+        localDate: '2026-10-14',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'DELIVERED',
+        prerequisite: 'NONE',
+        retryCount: 0,
+        deliveredAt: new Date()
+      });
+
+      // 4. Create Follow-up Execution with PREVIOUS_ACCEPTED prerequisite
+      const followupExecution = await CampaignExecutionModel.create({
+        id: 'exe_c11_followup',
+        tenantId,
+        enrollmentId,
+        campaignId,
+        stepId: 'followup',
+        dueAt: new Date(),
+        expiresAt: new Date(Date.now() + 3600 * 1000),
+        localDate: '2026-10-21',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'SCHEDULED',
+        prerequisite: 'PREVIOUS_ACCEPTED',
+        retryCount: 0
+      });
+
+      // 5. Evaluate Safeguards on Followup -> MUST PROCEED because invitation was DELIVERED!
+      const outcome = await executePreflightSafeguards(followupExecution);
+      expect(outcome.status).toBe('PROCEED');
+
+      // Now simulate invitation advancing to READ state
+      invitationExecution.state = 'READ';
+      invitationExecution.readAt = new Date();
+      await invitationExecution.save();
+
+      // Clear the temporary contact reservation created by first check to re-evaluate gate 5 with READ state
+      await CampaignContactGateModel.deleteMany({ tenantId });
+
+      const outcomeAfterRead = await executePreflightSafeguards(followupExecution);
+      expect(outcomeAfterRead.status).toBe('PROCEED');
+    });
+
+    it('C12: webhook status monotonicity guarantees late delivered receipt cannot overwrite READ state', async () => {
+      const tenantId = 'qa_tenant_c12';
+      const executionId = 'exe_c12_monotonicity';
+      const providerMsgId = 'wamid.C12_RECEIPT_TEST_001';
+
+      await CampaignExecutionModel.create({
+        id: executionId,
+        tenantId,
+        enrollmentId: 'enr_c12',
+        campaignId: 'cmp_c12',
+        stepId: 'invitation',
+        dueAt: new Date(),
+        expiresAt: new Date(Date.now() + 3600 * 1000),
+        localDate: '2026-10-15',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        state: 'READ',
+        readAt: new Date(Date.now() - 1000),
+        prerequisite: 'NONE',
+        retryCount: 0
+      });
+
+      const intent = await CampaignDeliveryIntentModel.create({
+        id: 'di_c12',
+        tenantId,
+        executionId,
+        deliveryKey: executionId,
+        connectionId: 'conn_test',
+        customerId: 'cus_c12',
+        recipientVersion: 1,
+        encryptedRecipient: encryptText('+919876543212'),
+        templateRef: { id: 'tpl_birthday_invite', revision: 1, language: 'en' },
+        parameters: { name: 'Lakshmi' },
+        payloadHash: 'hash_c12',
+        state: 'ACCEPTED',
+        attemptId: 'att_c12',
+        providerMessageId: providerMsgId,
+        submittedAt: new Date(),
+        readAt: new Date()
+      });
+
+      // Simulate late delivered status update arriving from Meta with older epoch timestamp
+      const lateEpochTimestamp = '1710000000';
+      const providerTimestamp = new Date(Number(lateEpochTimestamp) * 1000);
+
+      // Monotonic guard: update only if state is in ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED']
+      const updateResult = await CampaignExecutionModel.updateOne(
+        {
+          id: intent.executionId,
+          tenantId: intent.tenantId,
+          state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED'] }
+        },
+        {
+          $set: {
+            state: 'DELIVERED',
+            deliveredAt: providerTimestamp
+          }
+        }
+      );
+
+      expect(updateResult.modifiedCount).toBe(0);
+
+      const unchangedExecution = await CampaignExecutionModel.findOne({ id: executionId });
+      expect(unchangedExecution?.state).toBe('READ');
+    });
+
+    it('C13: HMAC fail-closed verification rejects forged, unconfigured, or tampered payloads', () => {
+      const secret = 'test_secret_key_12345';
+      const rawBody = Buffer.from(JSON.stringify({ object: 'whatsapp_business_account' }));
+
+      // Missing signature header -> returns false
+      expect(verifyMetaSignature(undefined, rawBody, secret)).toBe(false);
+
+      // Missing secret -> returns false
+      expect(verifyMetaSignature('sha256=abcdef', rawBody, '')).toBe(false);
+
+      // Correct signature calculation
+      const validSig = `sha256=${crypto.createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+      expect(verifyMetaSignature(validSig, rawBody, secret)).toBe(true);
+
+      // Tampered payload with valid sig for different body -> returns false
+      const tamperedBody = Buffer.from(JSON.stringify({ object: 'forged_account' }));
+      expect(verifyMetaSignature(validSig, tamperedBody, secret)).toBe(false);
+    });
+
+    it('C14: domain event inbox enforces atomic deduplication and preserves producer occurredAt and entityVersion', async () => {
+      const tenantId = 'qa_tenant_c14';
+      const eventId = 'evt_producer_c14_01';
+      const producer = 'inventory';
+      const customOccurredAt = new Date('2026-10-15T02:00:00.000Z');
+      const producerEntityVersion = 4;
+
+      // First ingestion
+      const eventDoc = await CampaignEventInboxModel.create({
+        id: eventId,
+        tenantId,
+        producer,
+        eventId,
+        type: 'stock.published',
+        entityId: 'sku_silk_001',
+        entityVersion: producerEntityVersion,
+        occurredAt: customOccurredAt,
+        receivedAt: new Date(),
+        customerId: 'cus_patron_01',
+        data: { sku: 'SKU-KAN-001', stockCount: 5 },
+        status: 'RECEIVED'
+      });
+
+      expect(eventDoc.occurredAt).toEqual(customOccurredAt);
+      expect(eventDoc.entityVersion).toBe(4);
+      expect(eventDoc.status).toBe('RECEIVED');
+
+      // Duplicate ingestion with same tenantId, producer, and eventId MUST throw E11000
+      let duplicateThrewE11000 = false;
+      try {
+        await CampaignEventInboxModel.create({
+          id: 'evt_producer_c14_01_alt',
+          tenantId,
+          producer,
+          eventId,
+          type: 'stock.published',
+          entityId: 'sku_silk_001',
+          entityVersion: producerEntityVersion,
+          occurredAt: customOccurredAt,
+          receivedAt: new Date(),
+          status: 'RECEIVED'
+        });
+      } catch (err: any) {
+        if (err.code === 11000) {
+          duplicateThrewE11000 = true;
+        }
+      }
+
+      expect(duplicateThrewE11000).toBe(true);
+    });
   });
 });

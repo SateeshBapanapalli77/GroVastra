@@ -702,8 +702,8 @@ export const CampaignStudio: React.FC<{
             activeStep={simulatorStep}
             onSelectStep={setSimulatorStep}
             customerName="Lakshmi garu 🙏"
-            storeName="Padmavati Handlooms"
-            offerText="15% VIP Birthday Privilege"
+            storeName="GroVastra Boutique"
+            offerText="Curated festive preview"
           />
         </div>
       </div>

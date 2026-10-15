@@ -305,5 +305,4 @@ npx tsx src/scripts/smokeTestSandbox.ts <your_mobile_number_with_country_code>
 
 Built with precision for **Padmavati Handlooms** and the **GroVastra** Boutique Platform.  
 Designed and implemented following the **Modular Monolithic Architecture Pattern**.
-#   G r o V a s t r a  
- 
+# GroVastra

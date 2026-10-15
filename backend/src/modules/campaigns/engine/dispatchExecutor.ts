@@ -90,8 +90,9 @@ export async function processClaimedExecution(
     }
 
     // 2. All safeguards passed -> PROCEED to Two-Phase Delivery Intent Freezing
-    const { customer, version } = outcome;
+    const { customer, version, campaign } = outcome;
     const stepDef = version.steps.find((s) => s.stepId === execution.stepId)!;
+    const storeDisplayName = (version as any).brandName || campaign?.name || 'GroVastra Boutique';
 
     // Resolve parameter bindings dynamically (Handoff Page 19)
     const parameters: Record<string, string> = {};
@@ -107,8 +108,8 @@ export async function processClaimedExecution(
         parameters[paramKey] = customer.lastName || '';
       } else if (expr === 'customer.fullName') {
         parameters[paramKey] = `${customer.firstName} ${customer.lastName}`.trim();
-      } else if (expr === 'shop.displayName' || expr === 'shop.name') {
-        parameters[paramKey] = 'Padmavati Handlooms';
+      } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
+        parameters[paramKey] = storeDisplayName;
       } else if (expr.startsWith('literal:')) {
         parameters[paramKey] = expr.slice(8);
       } else if (expr in customer) {
@@ -123,7 +124,7 @@ export async function processClaimedExecution(
       parameters.name = customer.firstName;
     }
     if (!parameters.shop) {
-      parameters.shop = 'Padmavati Handlooms';
+      parameters.shop = storeDisplayName;
     }
 
     const payloadHash = sha256(parameters);

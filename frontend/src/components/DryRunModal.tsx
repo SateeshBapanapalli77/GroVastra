@@ -19,12 +19,14 @@ interface DryRunModalProps {
   isOpen: boolean;
   onClose: () => void;
   onActivateSuccess: () => void;
+  result?: any;
 }
 
 export const DryRunModal: React.FC<DryRunModalProps> = ({
   isOpen,
   onClose,
-  onActivateSuccess
+  onActivateSuccess,
+  result
 }) => {
   const [activating, setActivating] = useState(false);
   const [activated, setActivated] = useState(false);
@@ -158,41 +160,38 @@ export const DryRunModal: React.FC<DryRunModalProps> = ({
             </div>
           </div>
 
-          {/* Sample Rendered Messages (First 2 Real Fixtures) */}
+          {/* Sample Rendered Messages (Real Engine Projections) */}
           <div className="space-y-3">
             <div className="font-serif font-bold text-sm text-[#431217]">
-              Sample Patron Payload Projections (First 2)
+              Sample Patron Payload Projections (Server Rendered)
             </div>
             <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
-              <div className="p-3 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC] space-y-1.5">
-                <div className="flex items-center justify-between font-bold">
-                  <span className="text-[#5C1D24]">Lakshmi Devi</span>
-                  <span className="text-[10px] bg-white px-2 py-0.5 rounded border border-[#EAE4DC]">
-                    Birthday: Oct 28
-                  </span>
+              {result?.samplePlans && result.samplePlans.length > 0 ? (
+                result.samplePlans.slice(0, 2).map((plan: any, idx: number) => (
+                  <div key={idx} className="p-3 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC] space-y-1.5">
+                    <div className="flex items-center justify-between font-bold">
+                      <span className="text-[#5C1D24]">{plan.customerName}</span>
+                      <span className="text-[10px] bg-white px-2 py-0.5 rounded border border-[#EAE4DC]">
+                        Occasion: {plan.occasionDate}
+                      </span>
+                    </div>
+                    {plan.steps && plan.steps.map((st: any, sIdx: number) => (
+                      <div key={sIdx} className="space-y-1">
+                        <div className="text-[11px] text-[#6B5E59]">
+                          Step: <strong>{st.stepId}</strong> • Due: {st.localTime}
+                        </div>
+                        <p className="p-2 bg-white rounded-lg border border-[#EAE4DC] text-[10px] text-[#271E1B] italic">
+                          &quot;{st.renderedPreview}&quot;
+                        </p>
+                      </div>
+                    ))}
+                  </div>
+                ))
+              ) : (
+                <div className="p-4 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC] text-xs text-[#6B5E59] italic col-span-2 text-center">
+                  Live dry run audit ready. Real approved template previews will render from store database.
                 </div>
-                <div className="text-[11px] text-[#6B5E59]">
-                  Due at: <strong>14 Oct 10:00 AM IST</strong> (D-14)
-                </div>
-                <p className="p-2 bg-white rounded-lg border border-[#EAE4DC] text-[10px] text-[#271E1B] italic">
-                  &quot;Namaste Lakshmi garu 🙏✨ Padmavati Handlooms wishes you an advance Happy Birthday! Enjoy 15% VIP Anniversary discount...&quot;
-                </p>
-              </div>
-
-              <div className="p-3 bg-[#FAF8F5] rounded-xl border border-[#EAE4DC] space-y-1.5">
-                <div className="flex items-center justify-between font-bold">
-                  <span className="text-[#5C1D24]">Ananya Rao</span>
-                  <span className="text-[10px] bg-white px-2 py-0.5 rounded border border-[#EAE4DC]">
-                    Birthday: Oct 21
-                  </span>
-                </div>
-                <div className="text-[11px] text-[#6B5E59]">
-                  Due at: <strong>14 Oct 10:00 AM IST</strong> (D-7 Follow-up)
-                </div>
-                <p className="p-2 bg-white rounded-lg border border-[#EAE4DC] text-[10px] text-[#271E1B] italic">
-                  &quot;Hi Ananya garu, gentle reminder that your birthday boutique pass is active this week at Padmavati Handlooms...&quot;
-                </p>
-              </div>
+              )}
             </div>
           </div>
         </div>

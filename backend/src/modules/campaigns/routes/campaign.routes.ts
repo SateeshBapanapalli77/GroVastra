@@ -396,6 +396,177 @@ campaignRouter.post('/campaigns/:id/resume', async (req: Request, res: Response)
 });
 
 /**
+ * POST /api/v1/campaigns/:id/validate
+ * Validates campaign configuration, step approved templates, and parameter bindings
+ */
+campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Response) => {
+  try {
+    const tenantId = (req as any).tenantId;
+    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+
+    // Load active or draft version
+    const version = campaign.activeVersionId
+      ? await CampaignVersionModel.findOne({ id: campaign.activeVersionId, tenantId })
+      : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
+
+    if (!version) {
+      return res.status(400).json({ success: false, error: 'No campaign version found to validate' });
+    }
+
+    const validationErrors: string[] = [];
+
+    if (!version.steps || version.steps.length === 0) {
+      validationErrors.push('Campaign must have at least one execution step');
+    }
+
+    for (const step of version.steps || []) {
+      const template = getApprovedTemplate(step.templateRef.id);
+      if (!template) {
+        validationErrors.push(`Step '${step.stepId}' references unapproved template '${step.templateRef.id}'`);
+      }
+      if (!step.localTime || !/^\d{2}:\d{2}$/.test(step.localTime)) {
+        validationErrors.push(`Step '${step.stepId}' has invalid localTime '${step.localTime}' (expected HH:mm)`);
+      }
+    }
+
+    if (validationErrors.length > 0) {
+      return res.status(422).json({
+        success: false,
+        valid: false,
+        errors: validationErrors
+      });
+    }
+
+    campaign.status = 'VALIDATED';
+    await campaign.save();
+
+    res.json({
+      success: true,
+      valid: true,
+      status: 'VALIDATED',
+      campaign,
+      versionId: version.id,
+      validatedSteps: version.steps.length
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/v1/campaigns/:id/publish-revision
+ * Creates a new immutable version revision and updates activeVersionId atomically
+ */
+campaignRouter.post('/campaigns/:id/publish-revision', async (req: Request, res: Response) => {
+  try {
+    const tenantId = (req as any).tenantId;
+    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+
+    const currentVersion = campaign.activeVersionId
+      ? await CampaignVersionModel.findOne({ id: campaign.activeVersionId, tenantId })
+      : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
+
+    if (!currentVersion) {
+      return res.status(400).json({ success: false, error: 'No base version found to revise' });
+    }
+
+    const newVersionNumber = campaign.draftVersion + 1;
+    const newVersionId = generateId('cv');
+
+    const newVersion = await CampaignVersionModel.create({
+      id: newVersionId,
+      tenantId,
+      campaignId: campaign.id,
+      version: newVersionNumber,
+      name: currentVersion.name,
+      industry: currentVersion.industry,
+      purpose: currentVersion.purpose,
+      trigger: req.body.trigger || currentVersion.trigger,
+      timezone: req.body.timezone || currentVersion.timezone,
+      audience: req.body.audience || currentVersion.audience,
+      goal: req.body.goal || currentVersion.goal,
+      steps: req.body.steps || currentVersion.steps,
+      priority: req.body.priority || currentVersion.priority,
+      resumePolicy: currentVersion.resumePolicy || 'FUTURE_ONLY',
+      importPolicy: 'FUTURE_ONLY',
+      enabledBranches: currentVersion.enabledBranches || [],
+      publishedBy: req.body.publishedBy || 'boutique_manager',
+      publishedAt: new Date(),
+      reviewFingerprint: `fp_rev_${newVersionNumber}_${Date.now()}`
+    });
+
+    campaign.draftVersion = newVersionNumber;
+    campaign.activeVersionId = newVersion.id;
+    await campaign.save();
+
+    res.json({
+      success: true,
+      message: `Version ${newVersionNumber} published successfully`,
+      campaign,
+      activeVersion: newVersion
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/v1/campaigns/:id/archive
+ * Archives a campaign and skips any pending executions safely
+ */
+campaignRouter.post('/campaigns/:id/archive', async (req: Request, res: Response) => {
+  try {
+    const tenantId = (req as any).tenantId;
+    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+
+    campaign.status = 'ARCHIVED';
+    campaign.pauseGeneration += 1;
+    await campaign.save();
+
+    // Cancel all scheduled or deferred executions for this campaign
+    const cancelledExecutions = await CampaignExecutionModel.updateMany(
+      {
+        campaignId: campaign.id,
+        tenantId,
+        state: { $in: ['SCHEDULED', 'DEFERRED'] }
+      },
+      {
+        $set: {
+          state: 'SKIPPED',
+          outcomeReason: 'SKIPPED_CAMPAIGN_ARCHIVED'
+        }
+      }
+    );
+
+    // Conclude active enrollments
+    await CampaignEnrollmentModel.updateMany(
+      {
+        campaignId: campaign.id,
+        tenantId,
+        status: 'ACTIVE'
+      },
+      {
+        $set: {
+          status: 'COMPLETED'
+        }
+      }
+    );
+
+    res.json({
+      success: true,
+      message: 'Campaign archived and pending executions cancelled',
+      campaign,
+      cancelledExecutionsCount: cancelledExecutions.modifiedCount
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
  * GET /api/v1/campaigns/:id/enrollments
  * Real paginated enrollments and executions
  */

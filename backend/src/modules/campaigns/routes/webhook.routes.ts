@@ -60,15 +60,19 @@ export function verifyMetaSignature(
  */
 webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => {
   try {
-    // 1. Verify HMAC Signature
-    if (env.WHATSAPP_APP_SECRET) {
-      const signatureHeader = req.headers['x-hub-signature-256'] as string;
-      const rawBody = (req as any).rawBody || Buffer.from(JSON.stringify(req.body));
-      const isValid = verifyMetaSignature(signatureHeader, rawBody, env.WHATSAPP_APP_SECRET);
-      if (!isValid) {
-        logger.warn('WhatsApp webhook signature verification failed (forged payload)');
-        return res.status(401).json({ success: false, error: 'Invalid webhook signature' });
-      }
+    // 1. Verify HMAC Signature (Fail-closed: requires secret and valid signature)
+    const secret = env.WHATSAPP_APP_SECRET;
+    if (!secret) {
+      logger.error('WhatsApp webhook secret is not configured; rejecting request (fail-closed)');
+      return res.status(500).json({ success: false, error: 'Webhook secret is not configured' });
+    }
+
+    const signatureHeader = req.headers['x-hub-signature-256'] as string;
+    const rawBody = (req as any).rawBody || Buffer.from(JSON.stringify(req.body));
+    const isValid = verifyMetaSignature(signatureHeader, rawBody, secret);
+    if (!isValid) {
+      logger.warn('WhatsApp webhook signature verification failed (forged or unsigned payload)');
+      return res.status(401).json({ success: false, error: 'Invalid or missing webhook signature' });
     }
 
     const body = req.body;
@@ -86,25 +90,73 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
             for (const statusObj of value.statuses) {
               const providerMessageId = statusObj.id;
               const status = statusObj.status; // 'delivered' | 'read' | 'failed'
+              const providerTimestamp = statusObj.timestamp
+                ? new Date(Number(statusObj.timestamp) * 1000)
+                : new Date();
 
               const intent = await CampaignDeliveryIntentModel.findOne({ providerMessageId });
               if (intent) {
+                // Per-event deduplication via CampaignEventInboxModel compound unique index
+                const statusEventKey = `${providerMessageId}_${status}_${statusObj.timestamp || ''}`;
+                try {
+                  await CampaignEventInboxModel.create({
+                    id: generateId('evt'),
+                    tenantId: intent.tenantId,
+                    producer: 'whatsapp_status_webhook',
+                    eventId: statusEventKey,
+                    type: `whatsapp.status.${status}`,
+                    entityId: intent.executionId,
+                    entityVersion: 1,
+                    occurredAt: providerTimestamp,
+                    receivedAt: new Date(),
+                    data: { providerMessageId, status, timestamp: statusObj.timestamp },
+                    status: 'PROCESSED',
+                    processedAt: new Date()
+                  });
+                } catch (err: any) {
+                  if (err.code === 11000) {
+                    logger.info({ statusEventKey }, 'Duplicate WhatsApp status webhook receipt ignored');
+                    continue;
+                  }
+                  throw err;
+                }
+
                 if (status === 'delivered') {
-                  intent.deliveredAt = new Date();
+                  intent.deliveredAt = providerTimestamp;
                   await intent.save();
 
+                  // State monotonic progression: delivered cannot overwrite read, failed, or skipped
                   await CampaignExecutionModel.updateOne(
-                    { id: intent.executionId },
-                    { $set: { state: 'DELIVERED', deliveredAt: new Date() } }
+                    {
+                      id: intent.executionId,
+                      tenantId: intent.tenantId,
+                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED'] }
+                    },
+                    {
+                      $set: {
+                        state: 'DELIVERED',
+                        deliveredAt: providerTimestamp
+                      }
+                    }
                   );
                 } else if (status === 'read') {
-                  intent.readAt = new Date();
-                  if (!intent.deliveredAt) intent.deliveredAt = new Date();
+                  intent.readAt = providerTimestamp;
+                  if (!intent.deliveredAt) intent.deliveredAt = providerTimestamp;
                   await intent.save();
 
+                  // Read can transition from PROVIDER_ACCEPTED or DELIVERED
                   await CampaignExecutionModel.updateOne(
-                    { id: intent.executionId },
-                    { $set: { state: 'READ', readAt: new Date() } }
+                    {
+                      id: intent.executionId,
+                      tenantId: intent.tenantId,
+                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'DELIVERED'] }
+                    },
+                    {
+                      $set: {
+                        state: 'READ',
+                        readAt: providerTimestamp
+                      }
+                    }
                   );
                 } else if (status === 'failed') {
                   intent.state = 'REJECTED';
@@ -112,12 +164,21 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                   await intent.save();
 
                   await CampaignExecutionModel.updateOne(
-                    { id: intent.executionId },
-                    { $set: { state: 'FAILED', outcomeReason: intent.errorCode } }
+                    {
+                      id: intent.executionId,
+                      tenantId: intent.tenantId,
+                      state: { $nin: ['READ', 'DELIVERED'] }
+                    },
+                    {
+                      $set: {
+                        state: 'FAILED',
+                        outcomeReason: intent.errorCode
+                      }
+                    }
                   );
                 }
 
-                logger.info({ providerMessageId, status }, 'Updated execution & intent states from Meta status receipt');
+                logger.info({ providerMessageId, status, tenantId: intent.tenantId }, 'Updated execution & intent states from Meta status receipt');
               }
             }
           }
@@ -236,46 +297,74 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
 /**
  * POST /api/v1/internal/campaign-events
- * Internal ingestion endpoint writing to campaignEventInbox and publishing to eventBus
+ * Authenticated internal ingestion endpoint writing durably to campaignEventInbox and publishing to eventBus
  */
 webhookRouter.post('/internal/campaign-events', async (req: Request, res: Response) => {
   try {
-    const { eventId, type, producer, tenantId, entityId, data } = req.body;
+    // 1. Authenticate Internal Service Key (fail closed)
+    const internalKey =
+      (req.headers['x-internal-api-key'] as string) ||
+      (req.headers['authorization'] as string)?.replace(/^Bearer\s+/i, '');
+
+    if (!internalKey || internalKey !== env.INTERNAL_API_KEY) {
+      logger.warn({ internalKey }, 'Unauthorized attempt to access /internal/campaign-events');
+      return res.status(401).json({ success: false, error: 'Unauthorized internal service call' });
+    }
+
+    // 2. Resolve Tenant Identity from Authenticated Context
+    const tenantId = (req.headers['x-tenant-id'] as string) || req.body.tenantId;
+    const { eventId, type, producer, entityId, entityVersion, occurredAt, customerId, data } = req.body;
 
     if (!type || !tenantId) {
       return res.status(400).json({ success: false, error: 'type and tenantId are required' });
     }
 
     const id = eventId || generateId('evt');
+    const producerName = producer || 'internal';
+    const parsedOccurredAt = occurredAt ? new Date(occurredAt) : new Date();
+    const parsedEntityVersion = typeof entityVersion === 'number' ? entityVersion : 1;
 
-    // Deduplication via unique inbox insertion
-    const existing = await CampaignEventInboxModel.findOne({ id });
-    if (existing) {
-      return res.status(200).json({ success: true, message: 'Event already ingested', eventId: id });
+    // 3. Durable & Atomic Ingestion via Compound Unique Index { tenantId, producer, eventId }
+    let inboxEvent;
+    try {
+      inboxEvent = await CampaignEventInboxModel.create({
+        id,
+        tenantId,
+        producer: producerName,
+        eventId: id,
+        type,
+        entityId: entityId || id,
+        entityVersion: parsedEntityVersion,
+        occurredAt: parsedOccurredAt,
+        receivedAt: new Date(),
+        customerId: customerId || undefined,
+        data: data || {},
+        status: 'RECEIVED'
+      });
+    } catch (err: any) {
+      if (err.code === 11000) {
+        // Atomic duplicate catch: Page 25 spec
+        return res.status(200).json({
+          success: true,
+          message: 'Event already ingested (idempotent duplicate)',
+          eventId: id
+        });
+      }
+      throw err;
     }
 
-    const inboxEvent = await CampaignEventInboxModel.create({
-      id,
-      tenantId,
-      eventType: type,
-      source: producer || 'internal',
-      payload: data || {},
-      status: 'PENDING',
-      attempts: 0,
-      receivedAt: new Date()
-    });
-
-    // Publish to in-process bus for immediate consumer dispatch
+    // 4. Durable Event Bus Dispatch (only marks PROCESSED after dispatch)
     await eventBus.publish({
       schemaVersion: 1,
-      producer: producer || 'internal',
+      producer: producerName,
       eventId: id,
       tenantId,
       type,
       entityId: entityId || id,
-      entityVersion: 1,
-      occurredAt: new Date(),
+      entityVersion: parsedEntityVersion,
+      occurredAt: parsedOccurredAt,
       receivedAt: new Date(),
+      customerId: customerId || undefined,
       data: data || {}
     });
 
