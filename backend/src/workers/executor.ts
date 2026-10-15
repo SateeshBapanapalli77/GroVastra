@@ -1,5 +1,9 @@
 import { connectDatabase } from '../config/database';
-import { runDispatchCycle } from '../modules/campaigns/engine/dispatchExecutor';
+import {
+  runDispatchCycle,
+  sweepStaleDispatching,
+  sweepOutcomeUnknownExecutions
+} from '../modules/campaigns/engine/dispatchExecutor';
 import { env } from '../config/env';
 import { logger } from '../config/logger';
 
@@ -11,6 +15,12 @@ export async function startExecutorLoop(once: boolean = false): Promise<void> {
 
   const cycle = async () => {
     try {
+      // Order matters: crash-stuck dispatches become UNKNOWN, then reconcile from evidence, then claim new work.
+      const stale = await sweepStaleDispatching(tenantId);
+      const recon = await sweepOutcomeUnknownExecutions(tenantId);
+      if (stale.movedToUnknown || recon.reconciledAccepted || recon.reconciledDelivered) {
+        logger.warn({ ...stale, ...recon }, 'Sweeper changed execution states');
+      }
       const stats = await runDispatchCycle(tenantId, 10);
       if (stats.claimedCount > 0) {
         logger.info(stats, 'Execution worker cycle finished with dispatches');

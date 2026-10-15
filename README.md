@@ -6,7 +6,7 @@
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?style=flat&logo=typescript)](https://www.typescriptlang.org/)
 [![Express](https://img.shields.io/badge/Express-5.0.1-black?style=flat&logo=express)](https://expressjs.com/)
 [![MongoDB](https://img.shields.io/badge/MongoDB-6.0%2B-green?style=flat&logo=mongodb)](https://www.mongodb.com/)
-[![Vitest](https://img.shields.io/badge/Tests-69%20Passed%20(Real%20DB)-success?style=flat&logo=vitest)](https://vitest.dev/)
+[![Vitest](https://img.shields.io/badge/Tests-78%20Passed%20(Real%20DB)-success?style=flat&logo=vitest)](https://vitest.dev/)
 [![WhatsApp](https://img.shields.io/badge/WhatsApp-Cloud%20API%20Sandbox-25D366?style=flat&logo=whatsapp)](https://developers.facebook.com/)
 [![Architecture](https://img.shields.io/badge/Architecture-Modular%20Monolith-orange?style=flat)](#2-system-architecture)
 
@@ -259,17 +259,18 @@ npm test
 ```
 
 ### Test Suite Breakdown:
-- **`qaMatrix.test.ts` (42 tests)**:
+- **`qaMatrix.test.ts` (45 tests)**:
   - *Matrix A (A01–A14)*: Identity keys, canonical draft fingerprint validation via `evaluateCampaignDryRun`, audience specification filters (`minSpendPaise`, `requiredTags`, `excludedTags`), UTC offset math in `Asia/Kolkata`, Feb 29 leap-day policies, prerequisite gates, `stopOnReply` holds, `stopOnGoal` stops.
   - *Matrix B (B01–B10)*: Atomic step lease acquisition via `claimNextDueExecution`, expired lease safe reclamation, 1/24h and 3/7d rolling contact caps via `checkAndReserveContactCapacity`, priority collision arbitration with slot displacement, compound unique index deduplication, AES-256-GCM intent freezing.
   - *Matrix C (C01–C10)*: Delivery adapter submission, template validation, status progression (`ACCEPTED` $\to$ `DELIVERED` $\to$ `READ`), exponential retry backoffs, ambiguous timeout handling (`OUTCOME_UNKNOWN`), real timing-safe HMAC-SHA256 webhook signature verification (`verifyMetaSignature`), idempotency deduplication via `CampaignEventInboxModel`.
-  - *Regression & Production Hardening Suite (REG-01–REG-08)*: Multi-step delivered/read prerequisite resolution, monotonic webhook progression, timing-safe key comparison, event idempotency and recovery, pause generation synchronization without stranding, late receipt sweeper with outage grace, and positional Meta Cloud API parameter ordering.
+  - *Regression & Production Hardening Suite (REG-01–REG-08)*: Multi-step delivered/read prerequisite resolution, monotonic webhook progression, timing-safe key comparison, event idempotency and recovery, pause generation synchronization without stranding, evidence-only reconciliation (REG-07a–c) preventing requeue/double-sends, crash-stalled dispatch sweeper (REG-07d), and positional Meta Cloud API parameter ordering.
+- **`security.test.ts` (6 tests)**: Fail-closed auth validation, cross-tenant header tampering block, claim verification, and confirmation that `POST /auth/token` is permanently eliminated.
 - **`foundation.test.ts` (12 tests)**: Prefixed ULIDs, AES-256-GCM encryption, Luxon date math.
 - **`planner.test.ts` (3 tests)**: Annual occasion discovery & step offset calculations.
 - **`execution.test.ts` (6 tests)**: Contact cap reservations and delivery adapters.
 - **`lifecycle.test.ts` (6 tests)**: Saree restock, boutique alteration, and win-back strategies.
 
-**Result**: **69 passed (100%) against live MongoDB.**
+**Result**: **78 passed (100%) against live MongoDB.**
 
 ---
 

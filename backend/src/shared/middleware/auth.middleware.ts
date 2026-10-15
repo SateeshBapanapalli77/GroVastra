@@ -73,6 +73,10 @@ export function verifyJwt(token: string, secret: string = env.JWT_SECRET): AuthP
     throw new Error('Token expired');
   }
 
+  const validRoles: UserRole[] = ['BOUTIQUE_OWNER', 'STORE_MANAGER', 'STAFF', 'SYSTEM'];
+  if (!payload.tenantId || typeof payload.tenantId !== 'string' || !validRoles.includes(payload.role)) {
+    throw new Error('Invalid token claims');
+  }
   return payload;
 }
 
@@ -87,21 +91,21 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     token = authHeader.slice(7).trim();
   }
 
-  // In test and local development, allow fallback to signed default owner token if no token is provided
+  // Fail closed. The only bypass is an explicit local-dev opt-in, never active in production or test.
   if (!token) {
-    if (env.NODE_ENV !== 'production') {
-      const devTenantId = (req.headers['x-tenant-id'] as string) || env.DEFAULT_TENANT_ID;
-      token = signJwt({
-        userId: 'dev_boutique_owner_01',
-        tenantId: devTenantId,
-        role: 'BOUTIQUE_OWNER'
-      });
-    } else {
+    const devBypass = env.NODE_ENV === 'development' && env.ALLOW_INSECURE_DEV_AUTH === 'true';
+    if (!devBypass) {
       return res.status(401).json({
         success: false,
         error: 'Authentication required. Missing Bearer token in Authorization header.'
       });
     }
+    logger.warn('INSECURE DEV AUTH BYPASS in use. Never enable this outside a local machine.');
+    token = signJwt({
+      userId: 'dev_boutique_owner_01',
+      tenantId: (req.headers['x-tenant-id'] as string) || env.DEFAULT_TENANT_ID,
+      role: 'BOUTIQUE_OWNER'
+    });
   }
 
   try {

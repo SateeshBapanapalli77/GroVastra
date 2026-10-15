@@ -21,12 +21,17 @@ webhookRouter.get('/webhooks/whatsapp', (req: Request, res: Response) => {
   const token = req.query['hub.verify_token'];
   const challenge = req.query['hub.challenge'];
 
-  if (mode === 'subscribe' && token === env.WHATSAPP_WEBHOOK_VERIFY_TOKEN) {
+  const expectedToken = env.WHATSAPP_WEBHOOK_VERIFY_TOKEN;
+  const given = Buffer.from(String(token ?? ''));
+  const expected = Buffer.from(expectedToken);
+  const tokenOk = given.length === expected.length && crypto.timingSafeEqual(given, expected);
+
+  if (mode === 'subscribe' && tokenOk) {
     logger.info('WhatsApp webhook challenge verified successfully');
     return res.status(200).send(challenge);
   }
 
-  logger.warn({ token, expected: env.WHATSAPP_WEBHOOK_VERIFY_TOKEN }, 'WhatsApp webhook challenge verification failed');
+  logger.warn('WhatsApp webhook challenge verification failed');
   return res.sendStatus(403);
 });
 

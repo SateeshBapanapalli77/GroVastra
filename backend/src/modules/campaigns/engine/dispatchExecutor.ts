@@ -8,6 +8,7 @@ import { getWhatsAppDeliveryAdapter } from '../adapters/adapterFactory';
 import { encryptText, decryptText, sha256 } from '../../../shared/utils/crypto';
 import { generateId } from '../../../shared/utils/id';
 import { logger } from '../../../config/logger';
+import { env } from '../../../config/env';
 import { ulid } from 'ulid';
 
 export interface DispatchCycleResult {
@@ -177,7 +178,7 @@ export async function processClaimedExecution(
       tenantId,
       executionId,
       deliveryKey: executionId,
-      connectionId: 'conn_padmavati',
+      connectionId: env.WHATSAPP_CONNECTION_ID,
       customerId: customer.id,
       recipientVersion: 1,
       encryptedRecipient: encryptText(customer.phone),
@@ -224,7 +225,7 @@ export async function processClaimedExecution(
     const sendResult = await adapter.sendCampaignStep({
       executionId,
       deliveryKey: executionId,
-      connectionId: 'conn_padmavati',
+      connectionId: env.WHATSAPP_CONNECTION_ID,
       customerId: customer.id,
       recipientVersion: 1,
       template: {
@@ -360,162 +361,136 @@ export async function runDispatchCycle(
 export interface SweepResult {
   reconciledAccepted: number;
   reconciledDelivered: number;
-  retriedCount: number;
-  expiredCount: number;
+  stillUnknown: number;
+}
+
+export interface StaleDispatchSweepResult {
+  movedToUnknown: number;
+}
+
+async function recipientPhoneOf(intent: ICampaignDeliveryIntent | null): Promise<string | null> {
+  if (!intent?.encryptedRecipient) return null;
+  try {
+    return decryptText(intent.encryptedRecipient);
+  } catch (err) {
+    logger.warn({ err, executionId: intent.executionId }, 'Could not decrypt recipient for reservation update');
+    return null;
+  }
 }
 
 /**
- * Sweeper for OUTCOME_UNKNOWN executions:
- * 1. Checks if late delivery receipts or webhook statuses correlated the execution.
- * 2. If unconfirmed within outageGraceMs, retries with exponential backoff (up to 2 retries).
- * 3. Once retries are exhausted, transitions to FAILED and safely releases contact cap reservation.
+ * Moves stale DISPATCHING attempts to OUTCOME_UNKNOWN (Handoff p.27).
+ * A crashed worker is indistinguishable from a lost response, so the outcome is UNKNOWN, never requeued.
+ * The contact reservation stays held; only proven non-acceptance may release it.
  */
-export async function sweepOutcomeUnknownExecutions(
+export async function sweepStaleDispatching(
   tenantId: string,
   serverNow: Date = new Date(),
-  outageGraceMs: number = 30 * 60 * 1000 // 30 minutes grace period
-): Promise<SweepResult> {
-  const result: SweepResult = {
-    reconciledAccepted: 0,
-    reconciledDelivered: 0,
-    retriedCount: 0,
-    expiredCount: 0
-  };
+  requestDeadlineMs: number = 2 * 60 * 1000
+): Promise<StaleDispatchSweepResult> {
+  const result: StaleDispatchSweepResult = { movedToUnknown: 0 };
+  const cutoff = new Date(serverNow.getTime() - requestDeadlineMs);
 
-  const unknownExecutions = await CampaignExecutionModel.find({
+  const stale = await CampaignExecutionModel.find({
     tenantId,
-    state: 'OUTCOME_UNKNOWN'
+    state: 'DISPATCHING',
+    updatedAt: { $lte: cutoff }
   }).exec();
 
-  for (const exec of unknownExecutions) {
-    // 1. Check if delivery intent has providerMessageId or status inbox correlated it
+  for (const exec of stale) {
+    const moved = await CampaignExecutionModel.findOneAndUpdate(
+      { id: exec.id, tenantId, state: 'DISPATCHING', planRevision: exec.planRevision },
+      {
+        $set: {
+          state: 'OUTCOME_UNKNOWN',
+          outcomeReason: 'DISPATCH_INTERRUPTED',
+          'lease.token': null, 'lease.until': null, 'lease.claimedBy': null
+        },
+        $inc: { planRevision: 1 }
+      },
+      { new: true }
+    );
+    if (!moved) continue; // original worker finished meanwhile; leave it alone
+
     const intent = exec.deliveryIntentId
       ? await CampaignDeliveryIntentModel.findOne({ id: exec.deliveryIntentId, tenantId }).exec()
       : null;
-
-    if (intent) {
-      if (intent.deliveredAt || intent.readAt) {
-        await CampaignExecutionModel.findOneAndUpdate(
-          { id: exec.id, planRevision: exec.planRevision },
-          {
-            $set: {
-              state: intent.readAt ? 'READ' : 'DELIVERED',
-              deliveredAt: intent.deliveredAt,
-              readAt: intent.readAt,
-              outcomeReason: undefined
-            },
-            $inc: { planRevision: 1 }
-          }
-        );
-        result.reconciledDelivered++;
-        continue;
-      }
-
-      if (intent.state === 'ACCEPTED') {
-        await CampaignExecutionModel.findOneAndUpdate(
-          { id: exec.id, planRevision: exec.planRevision },
-          {
-            $set: {
-              state: 'PROVIDER_ACCEPTED',
-              outcomeReason: undefined
-            },
-            $inc: { planRevision: 1 }
-          }
-        );
-        result.reconciledAccepted++;
-        continue;
-      }
-
-      // Check CampaignEventInbox for any status receipts for this execution
-      const statusEvent = await CampaignEventInboxModel.findOne({
-        tenantId,
-        entityId: exec.id,
-        type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read'] }
-      }).sort({ occurredAt: -1 }).exec();
-
-      if (statusEvent) {
-        const isRead = statusEvent.type === 'whatsapp.status.read';
-        await CampaignExecutionModel.findOneAndUpdate(
-          { id: exec.id, planRevision: exec.planRevision },
-          {
-            $set: {
-              state: isRead ? 'READ' : 'DELIVERED',
-              deliveredAt: statusEvent.occurredAt,
-              readAt: isRead ? statusEvent.occurredAt : undefined,
-              outcomeReason: undefined
-            },
-            $inc: { planRevision: 1 }
-          }
-        );
-        result.reconciledDelivered++;
-        continue;
-      }
+    if (intent && intent.state === 'SUBMITTING') {
+      intent.state = 'OUTCOME_UNKNOWN';
+      await intent.save();
     }
+    const phone = await recipientPhoneOf(intent);
+    if (phone) await updateContactReservationStatus(tenantId, phone, exec.id, 'UNKNOWN');
+    result.movedToUnknown++;
+  }
+  return result;
+}
 
-    // 2. Check if still within outage grace period
-    const updatedAtTime = exec.updatedAt ? exec.updatedAt.getTime() : exec.createdAt.getTime();
-    const elapsedMs = serverNow.getTime() - updatedAtTime;
+/**
+ * Reconciles OUTCOME_UNKNOWN executions from provider EVIDENCE only.
+ * NEVER requeues, retries, fails, or releases the contact reservation (tests C06/C07/C13).
+ */
+export async function sweepOutcomeUnknownExecutions(
+  tenantId: string,
+  _serverNow: Date = new Date()
+): Promise<SweepResult> {
+  const result: SweepResult = { reconciledAccepted: 0, reconciledDelivered: 0, stillUnknown: 0 };
+  const unknownExecutions = await CampaignExecutionModel.find({ tenantId, state: 'OUTCOME_UNKNOWN' }).exec();
 
-    if (elapsedMs < outageGraceMs) {
-      // In grace window, do not fail yet
-      continue;
-    }
+  for (const exec of unknownExecutions) {
+    const intent = exec.deliveryIntentId
+      ? await CampaignDeliveryIntentModel.findOne({ id: exec.deliveryIntentId, tenantId }).exec()
+      : null;
+    if (!intent) { result.stillUnknown++; continue; }
 
-    // 3. Grace period expired without webhook confirmation -> Retry or Fail
-    const maxRetries = 2;
-    if (exec.retryCount < maxRetries) {
-      const backoffMs = Math.pow(2, exec.retryCount) * 15 * 60 * 1000;
-      const nextDueAt = new Date(serverNow.getTime() + backoffMs);
+    const phone = await recipientPhoneOf(intent);
+    const byIntentReceipt = Boolean(intent.deliveredAt || intent.readAt);
 
-      await CampaignExecutionModel.findOneAndUpdate(
-        { id: exec.id, planRevision: exec.planRevision },
+    const statusEvent = byIntentReceipt
+      ? null
+      : await CampaignEventInboxModel.findOne({
+          tenantId,
+          entityId: exec.id,
+          type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read'] }
+        }).sort({ occurredAt: -1 }).exec();
+
+    if (byIntentReceipt || statusEvent) {
+      const isRead = byIntentReceipt ? Boolean(intent.readAt) : statusEvent!.type === 'whatsapp.status.read';
+      const deliveredAt = byIntentReceipt ? intent.deliveredAt ?? intent.readAt : statusEvent!.occurredAt;
+      const moved = await CampaignExecutionModel.findOneAndUpdate(
+        { id: exec.id, tenantId, state: 'OUTCOME_UNKNOWN', planRevision: exec.planRevision },
         {
           $set: {
-            state: 'DEFERRED',
-            dueAt: nextDueAt,
-            retryAt: serverNow,
-            outcomeReason: `OUTAGE_RETRY_SCHEDULED_${exec.retryCount + 1}`,
-            'lease.token': null,
-            'lease.until': null,
-            'lease.claimedBy': null
-          },
-          $inc: {
-            planRevision: 1,
-            retryCount: 1
-          }
-        }
-      );
-      result.retriedCount++;
-    } else {
-      // Retries exhausted
-      await CampaignExecutionModel.findOneAndUpdate(
-        { id: exec.id, planRevision: exec.planRevision },
-        {
-          $set: {
-            state: 'FAILED',
-            outcomeReason: 'OUTAGE_GRACE_EXPIRED_UNCONFIRMED',
-            'lease.token': null,
-            'lease.until': null,
-            'lease.claimedBy': null
+            state: isRead ? 'READ' : 'DELIVERED',
+            deliveredAt,
+            readAt: isRead ? (byIntentReceipt ? intent.readAt : statusEvent!.occurredAt) : null,
+            outcomeReason: null
           },
           $inc: { planRevision: 1 }
         }
       );
-
-      // Release contact reservation safely
-      if (intent && intent.encryptedRecipient) {
-        try {
-          const decryptedPhone = decryptText(intent.encryptedRecipient);
-          await updateContactReservationStatus(tenantId, decryptedPhone, exec.id, 'RELEASED');
-        } catch (decryptErr) {
-          logger.warn({ err: decryptErr, executionId: exec.id }, 'Could not decrypt recipient for reservation release');
-        }
+      if (moved) {
+        if (phone) await updateContactReservationStatus(tenantId, phone, exec.id, 'ACCEPTED');
+        result.reconciledDelivered++;
       }
-
-      result.expiredCount++;
+      continue;
     }
-  }
 
+    if (intent.state === 'ACCEPTED' && intent.providerMessageId) {
+      const moved = await CampaignExecutionModel.findOneAndUpdate(
+        { id: exec.id, tenantId, state: 'OUTCOME_UNKNOWN', planRevision: exec.planRevision },
+        { $set: { state: 'PROVIDER_ACCEPTED', outcomeReason: null }, $inc: { planRevision: 1 } }
+      );
+      if (moved) {
+        if (phone) await updateContactReservationStatus(tenantId, phone, exec.id, 'ACCEPTED');
+        result.reconciledAccepted++;
+      }
+      continue;
+    }
+
+    // No evidence: stays OUTCOME_UNKNOWN, reservation stays held, nothing is resubmitted.
+    result.stillUnknown++;
+  }
   return result;
 }
 

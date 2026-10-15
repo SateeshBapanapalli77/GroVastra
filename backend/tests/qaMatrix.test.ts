@@ -12,6 +12,7 @@ import { executePreflightSafeguards } from '../src/modules/campaigns/engine/safe
 import {
   claimNextDueExecution,
   processClaimedExecution,
+  sweepStaleDispatching,
   sweepOutcomeUnknownExecutions
 } from '../src/modules/campaigns/engine/dispatchExecutor';
 import { evaluateCampaignDryRun } from '../src/modules/campaigns/engine/dryRun';
@@ -1767,61 +1768,65 @@ describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine',
       expect(updatedExecution?.pauseGeneration).toBe(2);
     });
 
-    it('REG-07: sweepOutcomeUnknownExecutions reconciles late receipts and respects outage grace period', async () => {
-      const tenantId = 'qa_tenant_reg07';
-      const executionId = 'exe_reg07_unknown';
-      const deliveryIntentId = 'di_reg07_unknown';
-
-      // Setup execution in OUTCOME_UNKNOWN updated 40 minutes ago (past 30-min outage grace)
-      const pastTime = new Date(Date.now() - 40 * 60 * 1000);
-      const execution = await CampaignExecutionModel.create({
-        id: executionId,
-        tenantId,
-        enrollmentId: 'enr_reg07',
-        campaignId: 'cmp_reg07',
-        stepId: 'invitation',
-        dueAt: pastTime,
-        expiresAt: new Date(Date.now() + 3600000),
-        localDate: '2026-10-15',
-        localTime: '10:00',
-        timezone: 'Asia/Kolkata',
-        planRevision: 1,
-        pauseGeneration: 0,
-        state: 'OUTCOME_UNKNOWN',
-        prerequisite: 'NONE',
-        deliveryIntentId,
-        retryCount: 0,
-        createdAt: pastTime,
-        updatedAt: pastTime
+    const seedUnknown = async (tenantId: string, suffix: string, intentOverrides: Record<string, any> = {}) => {
+      const executionId = `exe_${suffix}`;
+      const deliveryIntentId = `di_${suffix}`;
+      const past = new Date(Date.now() - 6 * 60 * 60 * 1000);
+      await CampaignExecutionModel.create({
+        id: executionId, tenantId, enrollmentId: `enr_${suffix}`, campaignId: `cmp_${suffix}`, stepId: 'invitation',
+        dueAt: past, expiresAt: new Date(Date.now() + 3600000), localDate: '2026-10-15', localTime: '10:00',
+        timezone: 'Asia/Kolkata', planRevision: 1, pauseGeneration: 0, state: 'OUTCOME_UNKNOWN', prerequisite: 'NONE',
+        deliveryIntentId, retryCount: 0
       });
-
       await CampaignDeliveryIntentModel.create({
-        id: deliveryIntentId,
-        tenantId,
-        executionId,
-        deliveryKey: executionId,
-        connectionId: 'conn_test',
-        customerId: 'cus_reg07',
-        recipientVersion: 1,
-        encryptedRecipient: encryptText('+919876543217'),
-        templateRef: { id: 'tpl_birthday_invite', revision: 1, language: 'en' },
-        parameters: { name: 'Sunita' },
-        payloadHash: 'hash_reg07',
-        state: 'OUTCOME_UNKNOWN',
-        attemptId: 'att_reg07',
-        submittedAt: pastTime
+        id: deliveryIntentId, tenantId, executionId, deliveryKey: executionId, connectionId: 'conn_test',
+        customerId: `cus_${suffix}`, recipientVersion: 1, encryptedRecipient: encryptText('+919876543217'),
+        templateRef: { id: 'tpl_birthday_invite', revision: 1, language: 'en' }, parameters: { name: 'Sunita' },
+        payloadHash: `hash_${suffix}`, state: 'OUTCOME_UNKNOWN', attemptId: `att_${suffix}`, submittedAt: past,
+        ...intentOverrides
       });
+      return executionId;
+    };
 
-      // Run sweeper with serverNow = current time (elapsed > 30 min)
-      const sweepResult = await sweepOutcomeUnknownExecutions(tenantId, new Date(), 30 * 60 * 1000);
+    it('REG-07a (C06/C07): OUTCOME_UNKNOWN with no evidence is never requeued, retried or failed', async () => {
+      const tenantId = 'qa_tenant_reg07a';
+      const executionId = await seedUnknown(tenantId, 'reg07a');
+      const sweep = await sweepOutcomeUnknownExecutions(tenantId, new Date());
+      expect(sweep.stillUnknown).toBe(1);
+      const exec = await CampaignExecutionModel.findOne({ id: executionId });
+      expect(exec?.state).toBe('OUTCOME_UNKNOWN');
+      expect(exec?.retryCount).toBe(0);
+      expect(exec?.planRevision).toBe(1);
+      expect(await claimNextDueExecution(tenantId, new Date())).toBeNull();
+    });
 
-      // Should schedule 1st retry with exponential backoff (15 min)
-      expect(sweepResult.retriedCount).toBe(1);
+    it('REG-07b: accepted intent with provider ID reconciles to PROVIDER_ACCEPTED', async () => {
+      const tenantId = 'qa_tenant_reg07b';
+      const executionId = await seedUnknown(tenantId, 'reg07b', { state: 'ACCEPTED', providerMessageId: 'wamid.reg07b' });
+      const sweep = await sweepOutcomeUnknownExecutions(tenantId, new Date());
+      expect(sweep.reconciledAccepted).toBe(1);
+      expect((await CampaignExecutionModel.findOne({ id: executionId }))?.state).toBe('PROVIDER_ACCEPTED');
+    });
 
-      const retried = await CampaignExecutionModel.findOne({ id: executionId });
-      expect(retried?.state).toBe('DEFERRED');
-      expect(retried?.retryCount).toBe(1);
-      expect(retried?.outcomeReason).toBe('OUTAGE_RETRY_SCHEDULED_1');
+    it('REG-07c: late delivered receipt reconciles to DELIVERED', async () => {
+      const tenantId = 'qa_tenant_reg07c';
+      const executionId = await seedUnknown(tenantId, 'reg07c', { deliveredAt: new Date() });
+      const sweep = await sweepOutcomeUnknownExecutions(tenantId, new Date());
+      expect(sweep.reconciledDelivered).toBe(1);
+      expect((await CampaignExecutionModel.findOne({ id: executionId }))?.state).toBe('DELIVERED');
+    });
+
+    it('REG-07d (C07): stale DISPATCHING becomes OUTCOME_UNKNOWN, never SCHEDULED', async () => {
+      const tenantId = 'qa_tenant_reg07d';
+      const executionId = await seedUnknown(tenantId, 'reg07d', { state: 'SUBMITTING' });
+      await CampaignExecutionModel.updateOne({ id: executionId }, { $set: { state: 'DISPATCHING' } });
+      const later = new Date(Date.now() + 10 * 60 * 1000);
+      const sweep = await sweepStaleDispatching(tenantId, later, 2 * 60 * 1000);
+      expect(sweep.movedToUnknown).toBe(1);
+      const exec = await CampaignExecutionModel.findOne({ id: executionId });
+      expect(exec?.state).toBe('OUTCOME_UNKNOWN');
+      expect(exec?.outcomeReason).toBe('DISPATCH_INTERRUPTED');
+      expect(await claimNextDueExecution(tenantId, later)).toBeNull();
     });
 
     it('REG-08: template variableKeys enforce strict positional parameter mapping for Meta Cloud API', () => {

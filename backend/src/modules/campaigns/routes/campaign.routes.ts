@@ -12,27 +12,12 @@ import { CustomerModel } from '../../crm/models/Customer.model';
 import { generateId } from '../../../shared/utils/id';
 import { env } from '../../../config/env';
 
-import { requireAuth, requireRole, signJwt } from '../../../shared/middleware/auth.middleware';
+import { requireAuth, requireRole } from '../../../shared/middleware/auth.middleware';
 
 export const campaignRouter = Router();
 
 // Middleware: Authenticate credentials and enforce tenant isolation
 campaignRouter.use(requireAuth);
-
-/**
- * POST /api/v1/auth/token
- * Generate development/test bearer token with tenant claims
- */
-campaignRouter.post('/auth/token', (req: Request, res: Response) => {
-  const tenantId = req.body.tenantId || req.tenantId || env.DEFAULT_TENANT_ID;
-  const role = req.body.role || 'BOUTIQUE_OWNER';
-  const token = signJwt({
-    userId: req.body.userId || 'usr_boutique_owner',
-    tenantId,
-    role
-  });
-  res.json({ success: true, token, tenantId, role });
-});
 
 /**
  * GET /api/v1/campaign-presets

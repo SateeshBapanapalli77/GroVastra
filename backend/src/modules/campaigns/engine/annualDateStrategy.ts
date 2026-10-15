@@ -104,26 +104,37 @@ export async function planAnnualOccasions(
 
     let isNewEnrollment = false;
     if (!enrollment) {
-      enrollment = await CampaignEnrollmentModel.create({
-        id: generateId('enr'),
-        tenantId,
-        campaignId,
-        campaignVersionId: version.id,
-        customerId: customer.id,
-        occurrenceId,
-        sourceRef: {
-          type: 'CUSTOMER_DATE',
-          id: customer.id,
-          version: 1
-        },
-        occasionLocalDate: occurrence.localDate,
-        planRevision: 1,
-        status: 'ACTIVE',
-        replyHoldAt: null,
-        goalReachedAt: null
-      });
-      isNewEnrollment = true;
-      plannedEnrollments++;
+      try {
+        enrollment = await CampaignEnrollmentModel.create({
+          id: generateId('enr'),
+          tenantId,
+          campaignId,
+          campaignVersionId: version.id,
+          customerId: customer.id,
+          occurrenceId,
+          sourceRef: {
+            type: 'CUSTOMER_DATE',
+            id: customer.id,
+            version: 1
+          },
+          occasionLocalDate: occurrence.localDate,
+          planRevision: 1,
+          status: 'ACTIVE',
+          replyHoldAt: null,
+          goalReachedAt: null
+        });
+        isNewEnrollment = true;
+        plannedEnrollments++;
+      } catch (err: any) {
+        if (err?.code !== 11000) throw err; // another planner won the race: reuse its enrollment
+        enrollment = await CampaignEnrollmentModel.findOne({
+          tenantId,
+          campaignId,
+          customerId: customer.id,
+          occurrenceId
+        });
+        if (!enrollment) throw err;
+      }
     }
 
     // Version Pinning: Existing active enrollments stay pinned to their original campaignVersionId
@@ -153,27 +164,30 @@ export async function planAnnualOccasions(
         // Calculate expiresAt: dueAt + maxLatenessMinutes
         const expiresAt = new Date(timing.dueAtUtc.getTime() + step.maxLatenessMinutes * 60 * 1000);
 
-        await CampaignExecutionModel.create({
-          id: generateId('exe'),
-          tenantId,
-          enrollmentId: enrollment.id,
-          campaignId,
-          stepId: step.stepId,
-          dueAt: timing.dueAtUtc,
-          expiresAt,
-          localDate: timing.localDate,
-          localTime: timing.localTime,
-          timezone,
-          planRevision: 1,
-          pauseGeneration: campaign?.pauseGeneration ?? 0,
-          state: 'SCHEDULED',
-          prerequisite: step.prerequisite,
-          deliveryIntentId: null,
-          lease: { token: null, until: null, claimedBy: null }
-        });
-
-        plannedExecutions++;
-        stepsPlannedForCustomer++;
+        try {
+          await CampaignExecutionModel.create({
+            id: generateId('exe'),
+            tenantId,
+            enrollmentId: enrollment.id,
+            campaignId,
+            stepId: step.stepId,
+            dueAt: timing.dueAtUtc,
+            expiresAt,
+            localDate: timing.localDate,
+            localTime: timing.localTime,
+            timezone,
+            planRevision: 1,
+            pauseGeneration: campaign?.pauseGeneration ?? 0,
+            state: 'SCHEDULED',
+            prerequisite: step.prerequisite,
+            deliveryIntentId: null,
+            lease: { token: null, until: null, claimedBy: null }
+          });
+          plannedExecutions++;
+          stepsPlannedForCustomer++;
+        } catch (err: any) {
+          if (err?.code !== 11000) throw err; // stable step already planned by a concurrent planner
+        }
       }
     }
 
