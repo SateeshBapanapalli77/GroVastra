@@ -1,6 +1,7 @@
 import { Router, Request, Response } from 'express';
+import mongoose from 'mongoose';
 import { BOUTIQUE_CAMPAIGN_PRESETS, getCampaignPreset } from '../presets/boutiquePresets';
-import { APPROVED_TEMPLATES, getApprovedTemplate } from '../adapters/templateCatalogue';
+import { APPROVED_TEMPLATES, getApprovedTemplate, resolveApprovedTemplate } from '../adapters/templateCatalogue';
 import { CampaignModel } from '../models/Campaign.model';
 import { CampaignVersionModel } from '../models/CampaignVersion.model';
 import { CampaignEnrollmentModel } from '../models/CampaignEnrollment.model';
@@ -122,89 +123,143 @@ campaignRouter.patch(
         blackouts
       } = req.body;
 
-      let settings = await TenantSettingsModel.findOne({ tenantId });
-      if (!settings) {
-        settings = await TenantSettingsModel.create({
-          id: generateId('set'),
-          tenantId,
-          version: 1,
-          timezone: 'Asia/Kolkata',
-          allowedHours: { start: '10:00', end: '19:00' },
-          caps: { marketing24h: 1, marketing7d: 3 },
-          globalPause: false,
-          outageGraceMinutes: 120,
-          leapDayPolicy: 'FEB_28',
-          holidays: [],
-          blackouts: [],
-          notice: REQUIRED_SETTINGS_NOTICE
-        });
-      }
-
-      // Optimistic concurrency control (Spec C16)
-      if (typeof expectedVersion === 'number' && settings.version !== expectedVersion) {
-        return res.status(409).json({
+      // Mandatory optimistic concurrency control (Review 2, Spec C16)
+      if (typeof expectedVersion !== 'number') {
+        return res.status(400).json({
           success: false,
-          error: `Settings version conflict: expected version ${expectedVersion}, but settings are at version ${settings.version}.`
+          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
         });
       }
 
-      if (timezone) settings.timezone = timezone;
-      if (allowedHours) settings.allowedHours = allowedHours;
-      if (caps) settings.caps = caps;
-      if (typeof outageGraceMinutes === 'number') settings.outageGraceMinutes = outageGraceMinutes;
-      if (leapDayPolicy) settings.leapDayPolicy = leapDayPolicy;
-      if (Array.isArray(holidays)) settings.holidays = holidays;
-      if (Array.isArray(blackouts)) settings.blackouts = blackouts;
+      // Atomic conditional update on settings and control gate (Review 2 A)
+      const session = await mongoose.startSession();
+      try {
+        let updatedSettings: any = null;
+        await session.withTransaction(async () => {
+          let settings = await TenantSettingsModel.findOne({ tenantId }).session(session);
+          if (!settings) {
+            const created = await TenantSettingsModel.create(
+              [
+                {
+                  id: generateId('set'),
+                  tenantId,
+                  version: 1,
+                  timezone: 'Asia/Kolkata',
+                  allowedHours: { start: '10:00', end: '19:00' },
+                  caps: { marketing24h: 1, marketing7d: 3 },
+                  globalPause: false,
+                  outageGraceMinutes: 120,
+                  leapDayPolicy: 'FEB_28',
+                  holidays: [],
+                  blackouts: [],
+                  notice: REQUIRED_SETTINGS_NOTICE
+                }
+              ],
+              { session }
+            );
+            settings = created[0];
+          }
 
-      if (typeof globalPause === 'boolean' && globalPause !== settings.globalPause) {
-        settings.globalPause = globalPause;
-        // Sync with TenantControlGateModel (P1.c)
-        let tenantGate = await TenantControlGateModel.findOne({ tenantId });
-        if (!tenantGate) {
-          await TenantControlGateModel.create({
-            id: generateId('tg'),
-            tenantId,
-            globalPause,
-            gateVersion: 1
+          if (settings.version !== expectedVersion) {
+            throw new Error('VERSION_CONFLICT');
+          }
+
+          const updateFields: any = {
+            $inc: { version: 1 },
+            $set: { notice: REQUIRED_SETTINGS_NOTICE }
+          };
+          if (timezone) updateFields.$set.timezone = timezone;
+          if (allowedHours) updateFields.$set.allowedHours = allowedHours;
+          if (caps) updateFields.$set.caps = caps;
+          if (typeof outageGraceMinutes === 'number') updateFields.$set.outageGraceMinutes = outageGraceMinutes;
+          if (leapDayPolicy) updateFields.$set.leapDayPolicy = leapDayPolicy;
+          if (Array.isArray(holidays)) updateFields.$set.holidays = holidays;
+          if (Array.isArray(blackouts)) updateFields.$set.blackouts = blackouts;
+          if (typeof globalPause === 'boolean') updateFields.$set.globalPause = globalPause;
+
+          updatedSettings = await TenantSettingsModel.findOneAndUpdate(
+            { tenantId, version: expectedVersion },
+            updateFields,
+            { session, new: true }
+          );
+
+          if (!updatedSettings) {
+            throw new Error('VERSION_CONFLICT');
+          }
+
+          // Atomically sync global pause with TenantControlGateModel (Consistent Lock Order: 1, Spec p.25)
+          if (typeof globalPause === 'boolean') {
+            await TenantControlGateModel.findOneAndUpdate(
+              { tenantId },
+              {
+                $set: { globalPause },
+                $inc: { gateVersion: 1 }
+              },
+              { session, upsert: true, new: true }
+            );
+
+            if (globalPause) {
+              // Invalidate in-flight evaluation leases across tenant
+              await CampaignExecutionModel.updateMany(
+                { tenantId, state: 'EVALUATING' },
+                {
+                  $set: {
+                    state: 'DEFERRED',
+                    'lease.token': null,
+                    'lease.until': null,
+                    'lease.claimedBy': null,
+                    outcomeReason: 'DEFERRED_GLOBAL_PAUSED'
+                  }
+                },
+                { session }
+              );
+            }
+          }
+
+          // Audit Log inside transaction
+          await AuditLogModel.create(
+            [
+              {
+                id: generateId('aud'),
+                tenantId,
+                userId: (req as any).user?.userId || 'owner',
+                action: 'UPDATE_SETTINGS',
+                targetType: 'TENANT_SETTINGS',
+                targetId: updatedSettings.id,
+                details: { version: updatedSettings.version, globalPause: updatedSettings.globalPause }
+              }
+            ],
+            { session }
+          );
+        });
+
+        res.json({
+          success: true,
+          settings: {
+            id: updatedSettings.id,
+            version: updatedSettings.version,
+            timezone: updatedSettings.timezone,
+            allowedHours: updatedSettings.allowedHours,
+            caps: updatedSettings.caps,
+            globalPause: updatedSettings.globalPause,
+            outageGraceMinutes: updatedSettings.outageGraceMinutes,
+            leapDayPolicy: updatedSettings.leapDayPolicy,
+            holidays: updatedSettings.holidays,
+            blackouts: updatedSettings.blackouts,
+            notice: REQUIRED_SETTINGS_NOTICE
+          }
+        });
+      } catch (txErr: any) {
+        if (txErr.message === 'VERSION_CONFLICT') {
+          return res.status(409).json({
+            success: false,
+            error: `Settings version conflict: expected version ${expectedVersion} does not match current version.`
           });
-        } else {
-          tenantGate.globalPause = globalPause;
-          tenantGate.gateVersion += 1;
-          await tenantGate.save();
         }
+        throw txErr;
+      } finally {
+        await session.endSession();
       }
-
-      settings.version += 1;
-      settings.notice = REQUIRED_SETTINGS_NOTICE; // Strict invariant: cannot alter required notice
-      await settings.save();
-
-      // Audit Log
-      await AuditLogModel.create({
-        id: generateId('aud'),
-        tenantId,
-        userId: (req as any).user?.userId || 'owner',
-        action: 'UPDATE_SETTINGS',
-        targetType: 'TENANT_SETTINGS',
-        targetId: settings.id,
-        details: { version: settings.version, globalPause: settings.globalPause }
-      });
-
-      res.json({
-        success: true,
-        settings: {
-          id: settings.id,
-          version: settings.version,
-          timezone: settings.timezone,
-          allowedHours: settings.allowedHours,
-          caps: settings.caps,
-          globalPause: settings.globalPause,
-          outageGraceMinutes: settings.outageGraceMinutes,
-          leapDayPolicy: settings.leapDayPolicy,
-          holidays: settings.holidays,
-          blackouts: settings.blackouts,
-          notice: REQUIRED_SETTINGS_NOTICE
-        }
-      });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
     }
@@ -362,82 +417,134 @@ campaignRouter.patch(
       const tenantId = (req as any).tenantId;
       const { expectedVersion, name, trigger, audience, steps, priority, timezone } = req.body;
 
-      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-      if (!campaign) {
-        return res.status(404).json({ success: false, error: 'Campaign not found' });
+      // Mandatory optimistic concurrency control (Review 2, Spec C16)
+      if (typeof expectedVersion !== 'number') {
+        return res.status(400).json({
+          success: false,
+          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
+        });
       }
 
-      // Optimistic concurrency control (Spec C16, Finding 6)
-      if (expectedVersion !== undefined) {
-        if (typeof expectedVersion !== 'number') {
-          return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
-        }
-        if (campaign.draftVersion !== expectedVersion) {
-          return res.status(409).json({
-            success: false,
-            error: `Draft version conflict: expected version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-          });
-        }
-      }
+      const session = await mongoose.startSession();
+      try {
+        let finalCampaign: any = null;
+        let finalDraft: any = null;
 
-      const draft = await CampaignVersionModel.findOne({
-        campaignId: campaign.id,
-        tenantId,
-        version: campaign.draftVersion
-      });
+        await session.withTransaction(async () => {
+          const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId }).session(session);
+          if (!campaign) {
+            throw new Error('NOT_FOUND');
+          }
 
-      if (!draft) {
-        return res.status(404).json({ success: false, error: 'Draft version not found' });
-      }
+          if (campaign.draftVersion !== expectedVersion) {
+            throw new Error('VERSION_CONFLICT');
+          }
 
-      // Invariant: If draft is currently the active/live version, clone a new immutable draft revision (Spec p.16)
-      if (campaign.activeVersionId === draft.id) {
-        const nextVersionNumber = (campaign.draftVersion || 1) + 1;
-        const newVersionId = generateId('cv');
+          const draft = await CampaignVersionModel.findOne({
+            campaignId: campaign.id,
+            tenantId,
+            version: expectedVersion
+          }).session(session);
 
-        const clonedDraft = await CampaignVersionModel.create({
-          id: newVersionId,
-          tenantId,
-          campaignId: campaign.id,
-          version: nextVersionNumber,
-          name: name || draft.name,
-          industry: draft.industry,
-          purpose: draft.purpose,
-          trigger: trigger ? { ...draft.trigger, ...trigger } : draft.trigger,
-          timezone: timezone || draft.timezone,
-          audience: audience || draft.audience,
-          goal: draft.goal,
-          steps: steps || draft.steps,
-          priority: priority || draft.priority,
-          resumePolicy: draft.resumePolicy,
-          importPolicy: draft.importPolicy,
-          enabledBranches: draft.enabledBranches,
-          publishedBy: (req as any).user?.userId || 'owner',
-          reviewFingerprint: `draft_${Date.now()}`
+          if (!draft) {
+            throw new Error('DRAFT_NOT_FOUND');
+          }
+
+          // Invariant: If draft is currently the active/live version, clone a new immutable draft revision (Spec p.16)
+          if (campaign.activeVersionId === draft.id) {
+            const nextVersionNumber = expectedVersion + 1;
+            const newVersionId = generateId('cv');
+
+            const clonedDraft = await CampaignVersionModel.create(
+              [
+                {
+                  id: newVersionId,
+                  tenantId,
+                  campaignId: campaign.id,
+                  version: nextVersionNumber,
+                  name: name || draft.name,
+                  industry: draft.industry,
+                  purpose: draft.purpose,
+                  trigger: trigger ? { ...draft.trigger, ...trigger } : draft.trigger,
+                  timezone: timezone || draft.timezone,
+                  audience: audience || draft.audience,
+                  goal: draft.goal,
+                  steps: steps || draft.steps,
+                  priority: priority || draft.priority,
+                  resumePolicy: draft.resumePolicy,
+                  importPolicy: draft.importPolicy,
+                  enabledBranches: draft.enabledBranches,
+                  publishedBy: (req as any).user?.userId || 'owner',
+                  reviewFingerprint: `draft_${Date.now()}`
+                }
+              ],
+              { session }
+            );
+
+            const updatedCampaign = await CampaignModel.findOneAndUpdate(
+              { id: campaign.id, tenantId, draftVersion: expectedVersion },
+              {
+                $set: {
+                  draftVersion: nextVersionNumber,
+                  ...(name ? { name } : {})
+                }
+              },
+              { session, new: true }
+            );
+
+            if (!updatedCampaign) {
+              throw new Error('VERSION_CONFLICT');
+            }
+
+            finalCampaign = updatedCampaign;
+            finalDraft = clonedDraft[0];
+          } else {
+            // Updating an unpublished draft revision
+            if (name) {
+              draft.name = name;
+            }
+            if (trigger) draft.trigger = { ...draft.trigger, ...trigger };
+            if (audience) draft.audience = audience;
+            if (steps) draft.steps = steps;
+            if (priority) draft.priority = priority;
+            if (timezone) draft.timezone = timezone;
+
+            draft.reviewFingerprint = `draft_${Date.now()}`;
+            await draft.save({ session });
+
+            const updatedCampaign = await CampaignModel.findOneAndUpdate(
+              { id: campaign.id, tenantId, draftVersion: expectedVersion },
+              {
+                $set: {
+                  ...(name ? { name } : {})
+                }
+              },
+              { session, new: true }
+            );
+
+            if (!updatedCampaign) {
+              throw new Error('VERSION_CONFLICT');
+            }
+
+            finalCampaign = updatedCampaign;
+            finalDraft = draft;
+          }
         });
 
-        campaign.draftVersion = nextVersionNumber;
-        if (name) campaign.name = name;
-        await campaign.save();
-
-        return res.json({ success: true, campaign, draftVersion: clonedDraft });
+        res.json({ success: true, campaign: finalCampaign, draftVersion: finalDraft });
+      } catch (txErr: any) {
+        if (txErr.message === 'NOT_FOUND') return res.status(404).json({ success: false, error: 'Campaign not found' });
+        if (txErr.message === 'DRAFT_NOT_FOUND') return res.status(404).json({ success: false, error: 'Draft version not found' });
+        if (txErr.message === 'VERSION_CONFLICT') {
+          return res.status(409).json({
+            success: false,
+            error: `Draft version conflict: expected version ${expectedVersion} does not match current draft version.`
+          });
+        }
+        throw txErr;
+      } finally {
+        await session.endSession();
       }
-
-      if (name) {
-        campaign.name = name;
-        draft.name = name;
-        await campaign.save();
-      }
-      if (trigger) draft.trigger = { ...draft.trigger, ...trigger };
-      if (audience) draft.audience = audience;
-      if (steps) draft.steps = steps;
-      if (priority) draft.priority = priority;
-      if (timezone) draft.timezone = timezone;
-
-      draft.reviewFingerprint = `draft_${Date.now()}`;
-      await draft.save();
-
-      res.json({ success: true, campaign, draftVersion: draft });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });
     }
@@ -498,23 +605,25 @@ campaignRouter.post(
         return res.status(404).json({ success: false, error: 'Campaign not found' });
       }
 
-      // Concurrency check (C16, Finding 6)
-      if (expectedVersion !== undefined) {
-        if (typeof expectedVersion !== 'number') {
-          return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
-        }
-        if (campaign.draftVersion !== expectedVersion) {
-          return res.status(409).json({
-            success: false,
-            error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-          });
-        }
+      // Mandatory optimistic concurrency control (Review 2, Spec C16)
+      if (typeof expectedVersion !== 'number') {
+        return res.status(400).json({
+          success: false,
+          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
+        });
+      }
+
+      if (campaign.draftVersion !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+        });
       }
 
       const draft = await CampaignVersionModel.findOne({
         campaignId: campaign.id,
         tenantId,
-        version: campaign.draftVersion
+        version: expectedVersion
       });
 
       if (!draft) {
@@ -552,7 +661,6 @@ campaignRouter.post(
       }
 
       // Activation Readiness Checks (Spec A05, Finding 5): Exact approved template ID, revision, and locale
-      const { resolveApprovedTemplate } = await import('../adapters/templateCatalogue');
       for (const step of draft.steps || []) {
         const template = await resolveApprovedTemplate(
           step.templateRef?.id,
@@ -589,20 +697,15 @@ campaignRouter.post(
       }
 
       // Atomic MongoDB transaction for version publishing, campaign activation, and audit (Spec p.21, Finding 3)
-      const session = await CampaignModel.startSession();
+      const session = await mongoose.startSession();
       try {
         await session.withTransaction(async () => {
-          const casFilter: any = {
-            id: campaign.id,
-            tenantId,
-            draftVersion: campaign.draftVersion
-          };
-          if (typeof expectedVersion === 'number') {
-            casFilter.draftVersion = expectedVersion;
-          }
-
           const updatedCampaign = await CampaignModel.findOneAndUpdate(
-            casFilter,
+            {
+              id: campaign.id,
+              tenantId,
+              draftVersion: expectedVersion
+            },
             {
               $set: {
                 status: 'ACTIVE',
@@ -617,9 +720,24 @@ campaignRouter.post(
             throw new Error('VERSION_CONFLICT');
           }
 
-          draft.publishedAt = new Date();
-          draft.publishedBy = (req as any).user?.userId || 'owner';
-          await draft.save({ session });
+          const updatedDraft = await CampaignVersionModel.findOneAndUpdate(
+            {
+              id: draft.id,
+              tenantId,
+              version: expectedVersion
+            },
+            {
+              $set: {
+                publishedAt: new Date(),
+                publishedBy: (req as any).user?.userId || 'owner'
+              }
+            },
+            { session, new: true }
+          );
+
+          if (!updatedDraft) {
+            throw new Error('VERSION_CONFLICT');
+          }
 
           await AuditLogModel.create(
             [
@@ -674,6 +792,7 @@ campaignRouter.post(
 
 /**
  * POST /api/v1/campaigns/:id/pause | resume
+ * Serialized via CampaignControlGate transaction matching dispatch submission protocol (Review 2 B)
  */
 campaignRouter.post('/campaigns/:id/pause', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
   try {
@@ -681,27 +800,67 @@ campaignRouter.post('/campaigns/:id/pause', requireRole(['BOUTIQUE_OWNER', 'STOR
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-    campaign.status = 'PAUSED';
-    campaign.pauseGeneration += 1;
-    await campaign.save();
+    const session = await mongoose.startSession();
+    let updatedCampaign: any = null;
+    try {
+      await session.withTransaction(async () => {
+        const nextPauseGen = campaign.pauseGeneration + 1;
 
-    // Monotonically increment gateVersion and record pause in CampaignControlGateModel (Spec p.25, B11, B12)
-    await CampaignControlGateModel.findOneAndUpdate(
-      { tenantId, campaignId: campaign.id },
-      {
-        $set: { paused: true, pauseGeneration: campaign.pauseGeneration },
-        $inc: { gateVersion: 1 }
-      },
-      { upsert: true, new: true }
-    );
+        // 1. Lock & Conditionally Update CampaignControlGate (Consistent Lock Order: 2, Spec p.25)
+        await CampaignControlGateModel.findOneAndUpdate(
+          { tenantId, campaignId: campaign.id },
+          {
+            $set: { paused: true, pauseGeneration: nextPauseGen },
+            $inc: { gateVersion: 1 }
+          },
+          { session, upsert: true, new: true }
+        );
 
-    // Invalidate in-flight evaluation leases
-    await CampaignExecutionModel.updateMany(
-      { campaignId: campaign.id, tenantId, state: 'EVALUATING' },
-      { $set: { state: 'DEFERRED', 'lease.token': null, 'lease.until': null, outcomeReason: 'DEFERRED_CAMPAIGN_PAUSED' } }
-    );
+        // 2. Update campaign state inside same transaction
+        updatedCampaign = await CampaignModel.findOneAndUpdate(
+          { id: campaign.id, tenantId },
+          {
+            $set: { status: 'PAUSED', pauseGeneration: nextPauseGen }
+          },
+          { session, new: true }
+        );
 
-    res.json({ success: true, campaign });
+        // 3. Invalidate in-flight evaluation leases inside same transaction
+        await CampaignExecutionModel.updateMany(
+          { campaignId: campaign.id, tenantId, state: 'EVALUATING' },
+          {
+            $set: {
+              state: 'DEFERRED',
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null,
+              outcomeReason: 'DEFERRED_CAMPAIGN_PAUSED'
+            }
+          },
+          { session }
+        );
+
+        // 4. Audit log entry inside same transaction
+        await AuditLogModel.create(
+          [
+            {
+              id: generateId('aud'),
+              tenantId,
+              userId: (req as any).user?.userId || 'owner',
+              action: 'PAUSE_CAMPAIGN',
+              targetType: 'CAMPAIGN',
+              targetId: campaign.id,
+              details: { pauseGeneration: nextPauseGen }
+            }
+          ],
+          { session }
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    res.json({ success: true, campaign: updatedCampaign });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -713,59 +872,91 @@ campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STO
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-    campaign.status = 'ACTIVE';
-    campaign.pauseGeneration += 1;
-    await campaign.save();
+    const session = await mongoose.startSession();
+    let updatedCampaign: any = null;
+    try {
+      await session.withTransaction(async () => {
+        const nextPauseGen = campaign.pauseGeneration + 1;
 
-    // Monotonically increment gateVersion and record unpause in CampaignControlGateModel (Spec p.25, B11, B12)
-    await CampaignControlGateModel.findOneAndUpdate(
-      { tenantId, campaignId: campaign.id },
-      {
-        $set: { paused: false, pauseGeneration: campaign.pauseGeneration },
-        $inc: { gateVersion: 1 }
-      },
-      { upsert: true, new: true }
-    );
+        // 1. Lock & Conditionally Update CampaignControlGate (Consistent Lock Order: 2, Spec p.25)
+        await CampaignControlGateModel.findOneAndUpdate(
+          { tenantId, campaignId: campaign.id },
+          {
+            $set: { paused: false, pauseGeneration: nextPauseGen },
+            $inc: { gateVersion: 1 }
+          },
+          { session, upsert: true, new: true }
+        );
 
-    const serverNow = new Date();
+        // 2. Update campaign status inside same transaction
+        updatedCampaign = await CampaignModel.findOneAndUpdate(
+          { id: campaign.id, tenantId },
+          {
+            $set: { status: 'ACTIVE', pauseGeneration: nextPauseGen }
+          },
+          { session, new: true }
+        );
 
-    // 1. Skip missed steps that became overdue while paused (Spec p.9, p.17 FUTURE_ONLY)
-    await CampaignExecutionModel.updateMany(
-      {
-        campaignId: campaign.id,
-        tenantId,
-        state: { $in: ['SCHEDULED', 'DEFERRED'] },
-        dueAt: { $lt: serverNow }
-      },
-      {
-        $set: {
-          state: 'SKIPPED',
-          outcomeReason: 'SKIPPED_STEP_EXPIRED',
-          'lease.token': null,
-          'lease.until': null,
-          'lease.claimedBy': null
-        }
-      }
-    );
+        // 3. Skip missed steps that became overdue while paused (FUTURE_ONLY, Spec p.9, p.17)
+        const serverNow = new Date();
+        await CampaignExecutionModel.updateMany(
+          {
+            campaignId: campaign.id,
+            tenantId,
+            state: { $in: ['SCHEDULED', 'DEFERRED'] },
+            dueAt: { $lt: serverNow }
+          },
+          {
+            $set: {
+              state: 'SKIPPED',
+              outcomeReason: 'SKIPPED_STEP_EXPIRED',
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          },
+          { session }
+        );
 
-    // 2. Re-stamp all future pending and retry executions with the new pauseGeneration (Finding 6)
-    await CampaignExecutionModel.updateMany(
-      {
-        campaignId: campaign.id,
-        tenantId,
-        state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] }
-      },
-      {
-        $set: {
-          pauseGeneration: campaign.pauseGeneration,
-          'lease.token': null,
-          'lease.until': null,
-          'lease.claimedBy': null
-        }
-      }
-    );
+        // 4. Re-stamp all future pending and retry executions with the new pauseGeneration
+        await CampaignExecutionModel.updateMany(
+          {
+            campaignId: campaign.id,
+            tenantId,
+            state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] }
+          },
+          {
+            $set: {
+              pauseGeneration: nextPauseGen,
+              'lease.token': null,
+              'lease.until': null,
+              'lease.claimedBy': null
+            }
+          },
+          { session }
+        );
 
-    res.json({ success: true, campaign });
+        // 5. Audit log inside same transaction
+        await AuditLogModel.create(
+          [
+            {
+              id: generateId('aud'),
+              tenantId,
+              userId: (req as any).user?.userId || 'owner',
+              action: 'RESUME_CAMPAIGN',
+              targetType: 'CAMPAIGN',
+              targetId: campaign.id,
+              details: { pauseGeneration: nextPauseGen }
+            }
+          ],
+          { session }
+        );
+      });
+    } finally {
+      await session.endSession();
+    }
+
+    res.json({ success: true, campaign: updatedCampaign });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -806,7 +997,12 @@ export async function validateCampaignVersionDefinition(version: any, tenantId: 
     });
   } else {
     for (const step of version.steps) {
-      const template = getApprovedTemplate(step.templateRef?.id);
+      const template = await resolveApprovedTemplate(
+        step.templateRef?.id,
+        tenantId,
+        step.templateRef?.revision,
+        step.templateRef?.language
+      );
       if (!template) {
         errors.push({
           fieldPath: `steps.${step.stepId}.templateRef.id`,
@@ -936,17 +1132,18 @@ campaignRouter.post(
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
       if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-      // 1. Optimistic Concurrency Control (expectedVersion check, C16, Finding 6)
-      if (expectedVersion !== undefined) {
-        if (typeof expectedVersion !== 'number') {
-          return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
-        }
-        if (campaign.draftVersion !== expectedVersion) {
-          return res.status(409).json({
-            success: false,
-            error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-          });
-        }
+      // 1. Mandatory optimistic concurrency control (Review 2, Spec C16)
+      if (typeof expectedVersion !== 'number') {
+        return res.status(400).json({
+          success: false,
+          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
+        });
+      }
+      if (campaign.draftVersion !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+        });
       }
 
       // 2. Mandatory dry-run reviewFingerprint
@@ -981,7 +1178,6 @@ campaignRouter.post(
       const candidateSteps = req.body.steps || currentVersion.steps;
 
       // 3. Template Validation (Finding 5)
-      const { resolveApprovedTemplate } = await import('../adapters/templateCatalogue');
       for (const step of candidateSteps) {
         const tpl = await resolveApprovedTemplate(
           step.templateRef?.id,
@@ -1004,11 +1200,11 @@ campaignRouter.post(
       let newVersion: any = null;
       let finalCampaign: any = null;
 
-      const session = await CampaignModel.startSession();
+      const session = await mongoose.startSession();
       try {
         await session.withTransaction(async () => {
           const updatedCampaign = await CampaignModel.findOneAndUpdate(
-            { id: campaign.id, tenantId, draftVersion: campaign.draftVersion },
+            { id: campaign.id, tenantId, draftVersion: expectedVersion },
             {
               $inc: { draftVersion: 1 },
               $set: {

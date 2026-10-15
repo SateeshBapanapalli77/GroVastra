@@ -211,7 +211,7 @@ export const CampaignStudio: React.FC<{
     setIsActivating(true);
     try {
       if (createdCampaignId) {
-        await api.activateCampaign(createdCampaignId, reviewFingerprint);
+        await api.activateCampaign(createdCampaignId, reviewFingerprint, draftVersion);
       }
       onActivateSuccess();
     } catch (err: any) {

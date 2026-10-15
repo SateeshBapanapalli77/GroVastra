@@ -247,7 +247,7 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
       // User modifies draft after dry run -> reviewFingerprint updates
       const patchRes = await apiPatch(
         `/api/v1/campaigns/${cmp.id}/draft`,
-        { priority: 90 },
+        { priority: 90, expectedVersion: 1 },
         { Authorization: `Bearer ${ownerToken}` }
       );
       expect(patchRes.status).toBe(200);
@@ -255,7 +255,7 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
       // Attempting to activate with stale reviewFingerprint must be rejected
       const res = await apiPost(
         `/api/v1/campaigns/${cmp.id}/activate`,
-        { reviewFingerprint: 'fp_valid_original' },
+        { reviewFingerprint: 'fp_valid_original', expectedVersion: 1 },
         { Authorization: `Bearer ${ownerToken}` }
       );
 
@@ -345,7 +345,7 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
       // Activation must fail closed with 422
       const actRes = await apiPost(
         `/api/v1/campaigns/${cmp.id}/activate`,
-        { reviewFingerprint: 'fp_test_broken' },
+        { reviewFingerprint: 'fp_test_broken', expectedVersion: 1 },
         { Authorization: `Bearer ${ownerToken}` }
       );
 

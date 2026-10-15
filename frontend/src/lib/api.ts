@@ -181,10 +181,10 @@ export const api = {
     });
   },
 
-  activateCampaign: async (id: string, reviewFingerprint: string): Promise<{ success: boolean; campaign: any }> => {
+  activateCampaign: async (id: string, reviewFingerprint: string, expectedVersion: number = 1): Promise<{ success: boolean; campaign: any }> => {
     return request(`/campaigns/${id}/activate`, {
       method: 'POST',
-      body: JSON.stringify({ reviewFingerprint })
+      body: JSON.stringify({ reviewFingerprint, expectedVersion })
     });
   },
 

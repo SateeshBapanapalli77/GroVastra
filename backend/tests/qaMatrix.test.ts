@@ -305,7 +305,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       // 3. Attempting to activate with stale reviewFingerprint MUST be rejected (Spec p.21, A03)
       const res = await apiPost(
         `/api/v1/campaigns/${camp.id}/activate`,
-        { reviewFingerprint: staleFingerprint },
+        { reviewFingerprint: staleFingerprint, expectedVersion: 1 },
         { Authorization: `Bearer ${ownerToken}` }
       );
 
@@ -2771,7 +2771,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
           'Content-Type': 'application/json',
           Authorization: `Bearer ${ownerToken}`
         },
-        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint })
+        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint, expectedVersion: 1 })
       });
       const bodyNoKey = await resNoKey.json();
       expect(resNoKey.status).toBe(400);
@@ -2786,7 +2786,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
           Authorization: `Bearer ${ownerToken}`,
           'Idempotency-Key': stableKey
         },
-        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint })
+        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint, expectedVersion: 1 })
       });
       const body1 = await res1.json();
       expect(res1.status).toBe(200);
@@ -2805,7 +2805,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
           Authorization: `Bearer ${ownerToken}`,
           'Idempotency-Key': stableKey
         },
-        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint })
+        body: JSON.stringify({ reviewFingerprint: dryRunRes.draftFingerprint, expectedVersion: 1 })
       });
       const body2 = await res2.json();
       expect(res2.status).toBe(200);

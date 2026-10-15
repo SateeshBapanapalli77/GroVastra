@@ -13,6 +13,10 @@ import { CampaignExecutionModel } from '../src/modules/campaigns/models/Campaign
 import { CampaignDeliveryIntentModel } from '../src/modules/campaigns/models/CampaignDeliveryIntent.model';
 import { CampaignDryRunModel } from '../src/modules/campaigns/models/CampaignDryRun.model';
 import { TenantConnectionModel } from '../src/modules/campaigns/models/TenantConnection.model';
+import { TenantSettingsModel } from '../src/modules/campaigns/models/TenantSettings.model';
+import { TenantControlGateModel } from '../src/modules/campaigns/models/TenantControlGate.model';
+import { CampaignControlGateModel } from '../src/modules/campaigns/models/CampaignControlGate.model';
+import { CustomerModel } from '../src/modules/crm/models/Customer.model';
 import { AuditLogModel } from '../src/modules/campaigns/models/AuditLog.model';
 import { processClaimedExecution } from '../src/modules/campaigns/engine/dispatchExecutor';
 import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/mockWhatsAppAdapter';
@@ -95,6 +99,10 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       CampaignDeliveryIntentModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
       CampaignDryRunModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
       TenantConnectionModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
+      TenantSettingsModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
+      TenantControlGateModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
+      CampaignControlGateModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
+      CustomerModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
       AuditLogModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } })
     ]);
   });
@@ -539,5 +547,263 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
 
     const afterDelivExe = await CampaignExecutionModel.findOne({ id: exe.id });
     expect(afterDelivExe?.state).toBe('READ'); // Still READ, not regressed to DELIVERED!
+  });
+
+  it('Review 2 Issue A — P1: Global settings mutations strictly require expectedVersion (400 on missing) and atomically update settings & control gate (409 on stale)', async () => {
+    // Seed initial settings version 1
+    await TenantSettingsModel.create({
+      id: generateId('set'),
+      tenantId: tenantA,
+      version: 1,
+      timezone: 'Asia/Kolkata',
+      allowedHours: { start: '10:00', end: '19:00' },
+      caps: { marketing24h: 1, marketing7d: 3 },
+      globalPause: false,
+      outageGraceMinutes: 120,
+      leapDayPolicy: 'FEB_28',
+      holidays: [],
+      blackouts: [],
+      notice: 'Required Notice'
+    });
+
+    // 1. Missing expectedVersion returns 400
+    const resMissing = await apiPatch(
+      '/api/v1/campaign-settings',
+      { timezone: 'Asia/Dubai' },
+      ownerTokenA,
+      { 'Idempotency-Key': 'idemp_set_missing' }
+    );
+    expect(resMissing.status).toBe(400);
+    expect(resMissing.body.error).toContain('EXPECTED_VERSION_REQUIRED');
+
+    // 2. Conflicting/stale expectedVersion returns 409
+    const resStale = await apiPatch(
+      '/api/v1/campaign-settings',
+      { expectedVersion: 99, timezone: 'Asia/Dubai' },
+      ownerTokenA,
+      { 'Idempotency-Key': 'idemp_set_stale' }
+    );
+    expect(resStale.status).toBe(409);
+    expect(resStale.body.error).toContain('conflict');
+
+    // 3. Valid expectedVersion 1 with globalPause: true atomically updates both settings and control gate
+    const resValid = await apiPatch(
+      '/api/v1/campaign-settings',
+      { expectedVersion: 1, globalPause: true },
+      ownerTokenA,
+      { 'Idempotency-Key': 'idemp_set_valid' }
+    );
+    expect(resValid.status).toBe(200);
+    expect(resValid.body.settings.version).toBe(2);
+    expect(resValid.body.settings.globalPause).toBe(true);
+
+    const savedGate = await TenantControlGateModel.findOne({ tenantId: tenantA });
+    expect(savedGate).not.toBeNull();
+    expect(savedGate?.globalPause).toBe(true);
+    expect(savedGate?.gateVersion).toBeGreaterThan(0);
+  });
+
+  it('Review 2 Action 1 — P1: Mutations strictly reject missing or non-number expectedVersion with 400 Bad Request', async () => {
+    const camp = await CampaignModel.create({
+      id: 'cmp_mandatory_exp_ver',
+      tenantId: tenantA,
+      name: 'Mandatory Concurrency Test',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      status: 'DRAFT',
+      draftVersion: 1,
+      pauseGeneration: 0
+    });
+
+    await CampaignVersionModel.create({
+      id: 'cv_mandatory_v1',
+      tenantId: tenantA,
+      campaignId: camp.id,
+      version: 1,
+      name: camp.name,
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [],
+      reviewFingerprint: 'fp_mandatory'
+    });
+
+    // 1. PATCH /draft without expectedVersion returns 400
+    const resDraftNoVer = await apiPatch(
+      `/api/v1/campaigns/${camp.id}/draft`,
+      { priority: 60 },
+      ownerTokenA,
+      { 'Idempotency-Key': 'idemp_no_ver_draft' }
+    );
+    expect(resDraftNoVer.status).toBe(400);
+    expect(resDraftNoVer.body.error).toContain('EXPECTED_VERSION_REQUIRED');
+
+    // 2. POST /activate without expectedVersion returns 400
+    const resActNoVer = await apiPost(
+      `/api/v1/campaigns/${camp.id}/activate`,
+      { reviewFingerprint: 'fp_mandatory' },
+      ownerTokenA,
+      { 'Idempotency-Key': 'idemp_no_ver_act' }
+    );
+    expect(resActNoVer.status).toBe(400);
+    expect(resActNoVer.body.error).toContain('EXPECTED_VERSION_REQUIRED');
+
+    // 3. POST /publish-revision without expectedVersion returns 400
+    const resPubNoVer = await apiPost(
+      `/api/v1/campaigns/${camp.id}/publish-revision`,
+      { reviewFingerprint: 'fp_mandatory' },
+      ownerTokenA,
+      { 'Idempotency-Key': 'idemp_no_ver_pub' }
+    );
+    expect(resPubNoVer.status).toBe(400);
+    expect(resPubNoVer.body.error).toContain('EXPECTED_VERSION_REQUIRED');
+  });
+
+  it('Review 2 Issue B — P1: Campaign pause serializes atomically with dispatch submission through CampaignControlGate transaction', async () => {
+    // Setup connection and active campaign
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantA,
+      connectionId: 'conn_pause_race_test',
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE'
+    });
+
+    const camp = await CampaignModel.create({
+      id: 'cmp_pause_race',
+      tenantId: tenantA,
+      name: 'Pause Race Campaign',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      status: 'ACTIVE',
+      draftVersion: 1,
+      activeVersionId: 'cv_pause_race_v1',
+      pauseGeneration: 0
+    });
+
+    const version = await CampaignVersionModel.create({
+      id: 'cv_pause_race_v1',
+      tenantId: tenantA,
+      campaignId: camp.id,
+      version: 1,
+      name: camp.name,
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [
+        {
+          stepId: 'step_invite',
+          offsetDays: 0,
+          localTime: '10:00',
+          prerequisite: 'NONE',
+          templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+          bindings: { name: 'customer.firstName' },
+          stopOnReply: true,
+          stopOnGoal: true,
+          maxLatenessMinutes: 120
+        }
+      ],
+      publishedAt: new Date(),
+      publishedBy: 'owner',
+      reviewFingerprint: 'fp_pause_race'
+    });
+
+    // Control gate initialized
+    await CampaignControlGateModel.create({
+      id: generateId('cg'),
+      tenantId: tenantA,
+      campaignId: camp.id,
+      paused: false,
+      pauseGeneration: 0,
+      gateVersion: 1
+    });
+
+    // Pause the campaign via API
+    const pauseRes = await apiPost(
+      `/api/v1/campaigns/${camp.id}/pause`,
+      {},
+      ownerTokenA
+    );
+    expect(pauseRes.status).toBe(200);
+
+    // Verify CampaignControlGate was updated in transaction
+    const gate = await CampaignControlGateModel.findOne({ tenantId: tenantA, campaignId: camp.id });
+    expect(gate?.paused).toBe(true);
+    expect(gate?.pauseGeneration).toBe(1);
+    expect(gate?.gateVersion).toBe(2);
+
+    const updatedCamp = await CampaignModel.findOne({ id: camp.id, tenantId: tenantA });
+    expect(updatedCamp?.status).toBe('PAUSED');
+    expect(updatedCamp?.pauseGeneration).toBe(1);
+
+    // Create execution that attempted dispatch with stale pauseGeneration 0
+    const now = new Date();
+    const staleExe = await CampaignExecutionModel.create({
+      id: 'exe_stale_dispatch_during_pause',
+      tenantId: tenantA,
+      enrollmentId: 'enr_pause_race',
+      campaignId: camp.id,
+      stepId: 'step_invite',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-15',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      pauseGeneration: 0, // Stale!
+      state: 'EVALUATING',
+      lease: {
+        token: 'token_pause_worker',
+        until: new Date(now.getTime() + 30000),
+        claimedBy: 'worker_pause'
+      }
+    });
+
+    await CustomerModel.create({
+      id: 'cus_pause_race',
+      tenantId: tenantA,
+      firstName: 'Divya',
+      lastName: 'Reddy',
+      phone: '+919876543299',
+      version: 1,
+      status: 'ACTIVE',
+      optedInMarketing: true,
+      channelSuppressed: false,
+      birthdayMonth: 10,
+      birthdayDay: 15
+    });
+
+    await CampaignEnrollmentModel.create({
+      id: 'enr_pause_race',
+      tenantId: tenantA,
+      campaignId: camp.id,
+      campaignVersionId: version.id,
+      customerId: 'cus_pause_race',
+      occurrenceId: 'birthday:2026',
+      sourceRef: {
+        type: 'CUSTOMER_DATE',
+        id: 'cus_pause_race',
+        version: 1
+      },
+      planRevision: 1,
+      status: 'ACTIVE',
+      replyHoldAt: null
+    });
+
+    // When worker attempts dispatch submission, it MUST be rejected by CampaignControlGate transaction
+    const mockAdapter = new MockWhatsAppDeliveryAdapter();
+    await processClaimedExecution(staleExe, mockAdapter, now);
+
+    // Verify execution was skipped/aborted and ZERO messages were submitted to delivery adapter
+    const finalExe = await CampaignExecutionModel.findOne({ id: staleExe.id });
+    expect(finalExe?.state).toBe('SKIPPED');
+    expect(finalExe?.outcomeReason).toContain('PAUSED');
+    expect(mockAdapter.getSubmissionCount()).toBe(0);
   });
 });

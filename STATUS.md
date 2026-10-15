@@ -153,8 +153,23 @@ Following the Higher Authority / Senior Technical Manager review of commit `8b95
 
 ### Test Suite Execution Summary (15 October 2026)
 - **Backend Test Suites:** 14 passed (14/14)
-- **Individual Tests:** 166 passed (166/166, 0 failures, 0 skips)
+- **Individual Tests:** 169 passed (169/169, 0 failures, 0 skips)
 - **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
 - **Frontend Production Build:** Next.js 16.4.0 `next build` clean (0 errors)
+
+---
+
+## 10. Higher Authority Review 2 Resolution (15 October 2026)
+
+Following Review 2 feedback from the Senior Technical Manager / Higher Authority on main, the remaining concurrency and serialization items have been strictly addressed and verified:
+
+| # | Review 2 Action | Implementation Details | Verification Evidence |
+| :--- | :--- | :--- | :--- |
+| **Action 1** | **Mandatory `expectedVersion` Across All Mutations** | Made `expectedVersion` mandatory on `PATCH /campaign-settings`, `PATCH /campaigns/:id/draft`, `POST /campaigns/:id/activate`, and `POST /campaigns/:id/publish-revision`. Missing or non-number returns `400 Bad Request` (`EXPECTED_VERSION_REQUIRED`). Version mismatch returns `409 Conflict`. | `backend/tests/reviewHardening.test.ts` ("Review 2: Mandatory expectedVersion on settings and campaign endpoints") |
+| **Action 2** | **Atomic Campaign Publication & Pointer CAS** | Campaign publication and revision switching execute within a MongoDB replica set session transaction (`session.withTransaction`). Uses atomic CAS `findOneAndUpdate({ id, tenantId, draftVersion: expectedVersion })` updating `status`, `activeVersionId`, and `draftVersion`, writing `CampaignVersionModel` and `AuditLogModel` within the same transaction commit. Fails closed with 409 if any concurrent mutation altered `draftVersion`. | `backend/tests/reviewHardening.test.ts` ("Review 2: Atomic campaign publication CAS and audit logging") |
+| **Action 3** | **Pause/Resume & Dispatch Submission Serialization** | Both `POST /campaigns/:id/pause` and `POST /campaigns/:id/resume` now acquire and increment `CampaignControlGateModel` within a MongoDB session transaction (`$inc: { gateVersion: 1 }`). Preflight guards and dispatch submission locks serialize through the exact same control gate version check, preventing stale workers from submitting dispatches while pause operations commit. | `backend/tests/reviewHardening.test.ts` ("Review 2: Pause-versus-dispatch serialization via CampaignControlGate") |
+| **Action 4** | **Authoritative Template Revision & Locale Check** | `validateCampaignVersionDefinition` resolves templates against `resolveApprovedTemplate(id, tenantId, revision, language)` backed by `TemplateCatalogModel`. Unapproved revisions, mismatched locales, or paused templates fail validation closed with descriptive error messages. | Verified via `reviewHardening.test.ts` and `qaMatrix.test.ts` |
+| **Action 5** | **Full Regression & CI Verification** | Complete 14-suite test harness executed against live MongoDB replica set (`MongoMemoryReplSet`). 169 tests pass with 0 skips and 0 failures. Typecheck clean on backend and frontend Next.js production build passes. | 169/169 tests pass in 23.79s (`npm test`) |
+
 
 
