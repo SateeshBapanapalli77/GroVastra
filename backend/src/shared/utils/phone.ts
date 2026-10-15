@@ -58,3 +58,17 @@ export function isValidE164(phone: string): boolean {
   // E.164 regex: + followed by non-zero country code digit, then 6 to 14 digits (7-15 digits total)
   return /^\+[1-9]\d{6,14}$/.test(phone);
 }
+
+/**
+ * Masks a phone number for UI display and routine history projections.
+ * Never displays the full phone number in unprivileged logs or routine history.
+ */
+export function maskPhone(phone?: string | null): string {
+  if (!phone || typeof phone !== 'string') return '';
+  const clean = phone.trim();
+  if (clean.length <= 5) return '***';
+  const prefix = clean.slice(0, clean.startsWith('+') ? 5 : 3);
+  const suffix = clean.slice(-3);
+  const maskedMiddle = '*'.repeat(Math.max(3, clean.length - prefix.length - suffix.length));
+  return `${prefix}${maskedMiddle}${suffix}`;
+}

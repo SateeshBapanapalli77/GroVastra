@@ -77,6 +77,12 @@ export const ActivityView: React.FC = () => {
     }
   };
 
+  const acceptedCount = activities.filter((a) => a.state === 'PROVIDER_ACCEPTED').length;
+  const deliveredCount = activities.filter((a) => (a as any).state === 'DELIVERED').length;
+  const readCount = activities.filter((a) => (a as any).state === 'READ').length;
+  const heldCount = activities.filter((a) => a.state === 'HELD' || Boolean(a.replyHoldAt)).length;
+  const skippedCount = activities.filter((a) => a.state === 'SKIPPED').length;
+
   return (
     <div className="p-8 max-w-7xl mx-auto space-y-6 animate-in fade-in duration-300">
       {/* Toast */}
@@ -98,6 +104,35 @@ export const ActivityView: React.FC = () => {
         <p className="text-xs text-[#6B5E59] mt-0.5">
           Plain-English audit log explaining why every customer was selected, held, deferred, or skipped (Handoff Page 28)
         </p>
+      </div>
+
+      {/* Metrics Row: Separate Accepted, Delivered, Read counts per Spec p.5 */}
+      <div className="grid grid-cols-2 sm:grid-cols-5 gap-3 text-center text-xs">
+        <div className="p-3 bg-white rounded-xl border border-[#EAE4DC] shadow-2xs">
+          <div className="text-[10px] uppercase font-bold text-[#988B86]">Accepted</div>
+          <div className="font-serif text-xl font-bold text-[#1B7A43]">{acceptedCount}</div>
+          <div className="text-[10px] text-[#6B5E59]">Meta accepted</div>
+        </div>
+        <div className="p-3 bg-white rounded-xl border border-[#EAE4DC] shadow-2xs">
+          <div className="text-[10px] uppercase font-bold text-[#988B86]">Delivered</div>
+          <div className="font-serif text-xl font-bold text-emerald-600">{deliveredCount}</div>
+          <div className="text-[10px] text-[#6B5E59]">Device delivered</div>
+        </div>
+        <div className="p-3 bg-white rounded-xl border border-[#EAE4DC] shadow-2xs">
+          <div className="text-[10px] uppercase font-bold text-[#988B86]">Read</div>
+          <div className="font-serif text-xl font-bold text-[#431217]">{readCount}</div>
+          <div className="text-[10px] text-[#6B5E59]">Patron opened</div>
+        </div>
+        <div className="p-3 bg-white rounded-xl border border-[#EAE4DC] shadow-2xs">
+          <div className="text-[10px] uppercase font-bold text-[#988B86]">Staff Holds</div>
+          <div className="font-serif text-xl font-bold text-[#8F6910]">{heldCount}</div>
+          <div className="text-[10px] text-[#6B5E59]">Inbound replies</div>
+        </div>
+        <div className="p-3 bg-white rounded-xl border border-[#EAE4DC] shadow-2xs">
+          <div className="text-[10px] uppercase font-bold text-[#988B86]">Skipped</div>
+          <div className="font-serif text-xl font-bold text-[#6B5E59]">{skippedCount}</div>
+          <div className="text-[10px] text-[#6B5E59]">Policy / Caps</div>
+        </div>
       </div>
 
       {/* Activity Table */}

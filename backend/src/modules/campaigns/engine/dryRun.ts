@@ -2,6 +2,7 @@ import { CustomerModel } from '../../crm/models/Customer.model';
 import { CampaignDryRunModel, ICampaignDryRun } from '../models/CampaignDryRun.model';
 import { ICampaignVersion } from '../models/CampaignVersion.model';
 import { getApprovedTemplate } from '../adapters/templateCatalogue';
+import { evaluateAudienceWithExplanation } from './audienceEngine';
 import {
   resolveNextAnnualOccurrence,
   calculateDueInstant,
@@ -118,46 +119,9 @@ export async function evaluateCampaignDryRun(
       continue;
     }
 
-    // 5. Audience rule predicates
-    let matchesAudience = true;
-    const aud = version.audience as any;
-
-    if (aud) {
-      if (Array.isArray(aud.requiredTags) && aud.requiredTags.length > 0) {
-        const hasAllTags = aud.requiredTags.every((t: string) => (customer.tags || []).includes(t));
-        if (!hasAllTags) matchesAudience = false;
-      }
-
-      if (Array.isArray(aud.excludedTags) && aud.excludedTags.length > 0) {
-        const hasExcluded = aud.excludedTags.some((t: string) => (customer.tags || []).includes(t));
-        if (hasExcluded) matchesAudience = false;
-      }
-
-      if (typeof aud.minSpendPaise === 'number') {
-        const spend = customer.preferences?.budgetMaxPaise || (customer as any).totalSpendPaise || 0;
-        if (spend < aud.minSpendPaise) matchesAudience = false;
-      }
-
-      if (aud.mode === 'RULE_BASED' && aud.rules) {
-        const allRules = aud.rules.all || [];
-        for (const rule of allRules) {
-          if (rule.field === 'preferences.weave' && (rule.op === 'in' || rule.op === 'contains')) {
-            const hasWeave = (customer.preferences?.weave || []).some((w) =>
-              (rule.value as string[]).includes(w)
-            );
-            if (!hasWeave) matchesAudience = false;
-          }
-          if (rule.field === 'tags' && (rule.op === 'contains' || rule.op === 'in')) {
-            const hasTag = (customer.tags || []).some((t) =>
-              Array.isArray(rule.value) ? rule.value.includes(t) : t === rule.value
-            );
-            if (!hasTag) matchesAudience = false;
-          }
-        }
-      }
-    }
-
-    if (!matchesAudience) {
+    // 5. Evaluate full audience rules
+    const audEval = evaluateAudienceWithExplanation(customer as any, version.audience as any);
+    if (!audEval.matched) {
       reasonBreakdown.AUDIENCE_RULE_MISMATCH = (reasonBreakdown.AUDIENCE_RULE_MISMATCH || 0) + 1;
       continue;
     }
@@ -167,6 +131,7 @@ export async function evaluateCampaignDryRun(
 
     // Build sample plan preview
     if (samplePlans.length < 5) {
+      const storeDisplayName = (version as any).brandName || 'Boutique';
       const stepPreviews = version.steps.map((step) => {
         const timing = calculateDueInstant(occurrence.localDate, step.offsetDays, step.localTime, timezone);
         const template = getApprovedTemplate(step.templateRef.id);
@@ -179,13 +144,13 @@ export async function evaluateCampaignDryRun(
           if (v === 'customer.firstName') vars[k] = customer.firstName || '';
           else if (v === 'customer.lastName') vars[k] = customer.lastName || '';
           else if (v === 'customer.fullName') vars[k] = `${customer.firstName} ${customer.lastName}`.trim();
-          else if (v === 'shop.displayName' || v === 'shop.name') vars[k] = 'GroVastra Boutique';
+          else if (v === 'shop.displayName' || v === 'shop.name') vars[k] = storeDisplayName;
           else if (typeof v === 'string' && v.startsWith('literal:')) vars[k] = v.slice(8);
           else if (typeof v === 'string' && v in customer) vars[k] = String((customer as any)[v] || '');
           else vars[k] = String(v || '');
         }
         if (!vars.name && customer.firstName) vars.name = customer.firstName;
-        if (!vars.shop) vars.shop = 'GroVastra Boutique';
+        if (!vars.shop) vars.shop = storeDisplayName;
 
         const rendered = template ? template.render(vars) : 'Template not found';
 

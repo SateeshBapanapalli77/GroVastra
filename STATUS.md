@@ -72,20 +72,20 @@ This document is the real-time tracking register for the GroVastra Auto Campaign
 
 | Requirement | Exists | Wired and running | Proven by test (test ID) |
 | :--- | :--- | :--- | :--- |
-| **P2.a**: Audience rules engine (`all`/`any`/`none`, explicit `ALL_ELIGIBLE`, match explanations) | Partial | Partial | A04 |
-| **P2.b**: Discovery window (today - largest offset) to (today + largest lead + 30d) (B19) | Partial | Partial | Pending B19 |
-| **P2.b**: FUTURE_ONLY activation/resume with 2-hour technical outage grace (B05, B06, B13) | Partial | Partial | Pending B06, B13 |
-| **P2.c**: Leap-day policies (`FEB_28`, `MAR_01`, `LEAP_ONLY`) (A08) | Yes | Yes | A08 |
-| **P2.c**: Timezone and local-time calculation avoiding UTC midnight drift | Yes | Yes | A05 |
-| **P2.d**: Anniversary & wedding per-eventId occurrences and postponement replan (A09, A10) | Partial | Partial | Pending A09, A10 |
-| **P2.e**: Date corrections: within-year replan vs across-year `correctionGroupId` lineage (B04) | Partial | Partial | Pending B04 |
-| **P2.f**: Immutable published versions; draft PATCH never mutates published (B14) | Partial | Partial | Pending B14 |
-| **P2.g**: Activation requires matching dry-run reviewFingerprint (A03, C01) | Yes | Yes | A03, C01 |
-| **P2.h**: Validation endpoint with fieldPath and resolutionOwner (A05) | Partial | Partial | Pending A05 |
-| **P2.i**: Meta positional parameters driven strictly by template variable keys (C05) | Yes | Yes | REG-08 |
-| **P2.j**: Idempotency keys on mutations; 409 on version conflict (C15, C16) | Partial | Partial | Pending C15, C16 |
-| **P2.k**: Next.js Studio (Editor, Dry Run, Simulator, Activity, Settings) | Yes | Yes | UI build clean |
-| **P2.l**: Staff actions (resolve-hold, mark-goal) with audited reason precedence | Partial | Partial | A11, A12 |
+| **P2.a**: Audience rules engine (`all`/`any`/`none`, explicit `ALL_ELIGIBLE`, match explanations) | Yes | Yes | `p2Milestone.test.ts` (A04) |
+| **P2.b**: Discovery window (today - largest offset) to (today + largest lead + 30d) (B19) | Yes | Yes | `p2Milestone.test.ts` (B19) |
+| **P2.b**: FUTURE_ONLY activation/resume with 2-hour technical outage grace (B05, B06, B13) | Yes | Yes | `p2Milestone.test.ts` (B06, B13) |
+| **P2.c**: Leap-day policies (`FEB_28`, `MAR_01`, `LEAP_ONLY`) (A08) | Yes | Yes | `p2Milestone.test.ts` (A08) |
+| **P2.c**: Timezone and local-time calculation avoiding UTC midnight drift | Yes | Yes | `p2Milestone.test.ts` (A05, A07, B07) |
+| **P2.d**: Anniversary & wedding per-eventId occurrences and postponement replan (A09, A10) | Yes | Yes | `p2Milestone.test.ts` (A09, A10) |
+| **P2.e**: Date corrections: within-year replan vs across-year `correctionGroupId` lineage (B04) | Yes | Yes | `p2Milestone.test.ts` (B04) |
+| **P2.f**: Immutable published versions; draft PATCH never mutates published (B14) | Yes | Yes | `p2Milestone.test.ts` (B14) |
+| **P2.g**: Activation requires matching dry-run reviewFingerprint (A03, C01) | Yes | Yes | `p2Milestone.test.ts` (A03, C01) |
+| **P2.h**: Validation endpoint with fieldPath and resolutionOwner (A05) | Yes | Yes | `p2Milestone.test.ts` (A05) |
+| **P2.i**: Meta positional parameters driven strictly by template variable keys (C05) | Yes | Yes | `p2Milestone.test.ts` (C05) |
+| **P2.j**: Idempotency keys on mutations; 409 on version conflict (C15, C16) | Yes | Yes | `p2Milestone.test.ts` (C15, C16) |
+| **P2.k**: Next.js Studio (Editor, Dry Run, Simulator, Activity, Settings with required notice & separate accepted/delivered/read counts) | Yes | Yes | Frontend build clean (Next.js 16) |
+| **P2.l**: Staff actions (resolve-hold, mark-goal) with audited reason precedence | Yes | Yes | `p2Milestone.test.ts` (A11, A12, AuditLogModel) |
 
 ---
 

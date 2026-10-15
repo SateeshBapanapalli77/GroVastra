@@ -20,6 +20,16 @@ export interface ICustomer extends Document {
     preferredLanguage: string;
   };
   tags: string[]; // e.g. ['vip', 'occasionwear', 'bridal']
+  totalSpendPaise?: number;
+  savedOccasions?: Array<{
+    eventId: string;
+    type: 'ANNIVERSARY' | 'WEDDING';
+    date: string; // 'YYYY-MM-DD'
+    active: boolean;
+    leadTimeDays?: number;
+    recipientLabel?: string;
+    budgetPaise?: number;
+  }>;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -44,7 +54,22 @@ const CustomerSchema = new Schema<ICustomer>(
       budgetMaxPaise: { type: Number },
       preferredLanguage: { type: String, default: 'en' }
     },
-    tags: { type: [String], default: [] }
+    tags: { type: [String], default: [] },
+    totalSpendPaise: { type: Number, default: 0 },
+    savedOccasions: {
+      type: [
+        {
+          eventId: { type: String, required: true },
+          type: { type: String, required: true, enum: ['ANNIVERSARY', 'WEDDING'] },
+          date: { type: String, required: true },
+          active: { type: Boolean, required: true, default: true },
+          leadTimeDays: { type: Number },
+          recipientLabel: { type: String },
+          budgetPaise: { type: Number }
+        }
+      ],
+      default: []
+    }
   },
   {
     timestamps: true,

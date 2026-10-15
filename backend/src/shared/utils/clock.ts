@@ -59,15 +59,17 @@ export function resolveNextAnnualOccurrence(
   day: number,   // 1-31
   timezone: string = 'Asia/Kolkata',
   leapDayPolicy: LeapDayPolicy = 'FEB_28',
-  clock: IClock = defaultClock
+  clock: IClock = defaultClock,
+  lookbackDays: number = 0
 ): { localDate: string; occurrenceYear: number; occurrenceId: string } {
   const currentNow = clock.now().setZone(timezone);
   const currentYear = currentNow.year;
+  const cutoff = currentNow.startOf('day').minus({ days: lookbackDays });
 
   // Function to build a date for a specific year considering leap-day
   const buildDateForYear = (year: number): DateTime | null => {
     const isLeapYear = DateTime.local(year).isInLeapYear;
-    
+
     if (month === 2 && day === 29 && !isLeapYear) {
       if (leapDayPolicy === 'FEB_28') {
         return DateTime.fromObject({ year, month: 2, day: 28 }, { zone: timezone });
@@ -87,11 +89,11 @@ export function resolveNextAnnualOccurrence(
   let targetDt = buildDateForYear(currentYear);
   let resolvedYear = currentYear;
 
-  // If this year is already past (or skipped by LEAP_ONLY), check next year
-  if (!targetDt || targetDt.startOf('day') < currentNow.startOf('day')) {
+  // If this year is earlier than cutoff (now minus lookbackDays), check next year
+  if (!targetDt || targetDt.startOf('day') < cutoff) {
     resolvedYear = currentYear + 1;
     targetDt = buildDateForYear(resolvedYear);
-    
+
     // In rare cases where LEAP_ONLY skips next year too, find next leap year
     while (!targetDt) {
       resolvedYear++;
@@ -109,6 +111,7 @@ export function resolveNextAnnualOccurrence(
 /**
  * Calculates dueAt UTC instant by taking occasion localDate,
  * adding signed offsetDays, setting localTime (HH:mm), and converting via IANA timezone to UTC.
+ * Resolves DST gaps (missing hours advance to next valid local time, B07).
  */
 export function calculateDueInstant(
   occasionLocalDate: string, // 'YYYY-MM-DD'
@@ -121,12 +124,77 @@ export function calculateDueInstant(
   const minute = parseInt(minStr || '00', 10);
 
   const baseDt = DateTime.fromISO(occasionLocalDate, { zone: timezone });
-  const offsetDt = baseDt.plus({ days: offsetDays }).set({ hour, minute, second: 0, millisecond: 0 });
+  let offsetDt = baseDt.plus({ days: offsetDays }).set({ hour, minute, second: 0, millisecond: 0 });
+
+  // DST handling (Spec p.31 test B07): if hour falls in spring-forward gap, Luxon/advance to valid hour
+  if (!offsetDt.isValid) {
+    offsetDt = baseDt.plus({ days: offsetDays }).set({ hour: hour + 1, minute, second: 0, millisecond: 0 });
+  }
 
   return {
     dueAtUtc: offsetDt.toUTC().toJSDate(),
     localDate: offsetDt.toISODate()!,
     localTime,
     timezone
+  };
+}
+
+/**
+ * Adjusts send time for allowed hours (e.g. 10:00-19:00) and blackout dates (Handoff p.7, test B08).
+ * Never pushes a send past expiresAt; skips with reason if deadline exceeded.
+ */
+export function adjustForAllowedHoursAndBlackouts(
+  initialDueAt: Date,
+  expiresAt: Date,
+  timezone: string = 'Asia/Kolkata',
+  allowedHours: { start: string; end: string } = { start: '10:00', end: '19:00' },
+  blackoutDates: string[] = []
+): { valid: boolean; adjustedDueAt: Date; reason?: string } {
+  let dt = DateTime.fromJSDate(initialDueAt, { zone: timezone });
+  const [startH, startM] = allowedHours.start.split(':').map(Number);
+  const [endH, endM] = allowedHours.end.split(':').map(Number);
+
+  // Check if current date is a blackout
+  let attempts = 0;
+  while (attempts < 30) {
+    const isBlackout = blackoutDates.includes(dt.toISODate()!);
+    const timeNum = dt.hour * 60 + dt.minute;
+    const startNum = startH * 60 + startM;
+    const endNum = endH * 60 + endM;
+
+    if (isBlackout) {
+      // Advance to next morning at start hour
+      dt = dt.plus({ days: 1 }).set({ hour: startH, minute: startM, second: 0, millisecond: 0 });
+      attempts++;
+      continue;
+    }
+
+    if (timeNum < startNum) {
+      dt = dt.set({ hour: startH, minute: startM, second: 0, millisecond: 0 });
+      break;
+    }
+
+    if (timeNum >= endNum) {
+      // Move to next morning
+      dt = dt.plus({ days: 1 }).set({ hour: startH, minute: startM, second: 0, millisecond: 0 });
+      attempts++;
+      continue;
+    }
+
+    break;
+  }
+
+  const adjustedDueAt = dt.toUTC().toJSDate();
+  if (adjustedDueAt >= expiresAt) {
+    return {
+      valid: false,
+      adjustedDueAt,
+      reason: 'SKIPPED_BLACKOUT_EXPIRED'
+    };
+  }
+
+  return {
+    valid: true,
+    adjustedDueAt
   };
 }

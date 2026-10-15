@@ -21,6 +21,7 @@ export interface ICampaignEnrollment extends Document {
   goalReachedAt: Date | null;
   goalOrderRef?: string;
   correctionGroupId?: string;
+  matchExplanation?: string;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -53,7 +54,8 @@ const CampaignEnrollmentSchema = new Schema<ICampaignEnrollment>(
     replyHoldAt: { type: Date, default: null },
     goalReachedAt: { type: Date, default: null },
     goalOrderRef: { type: String },
-    correctionGroupId: { type: String }
+    correctionGroupId: { type: String },
+    matchExplanation: { type: String }
   },
   {
     timestamps: true,

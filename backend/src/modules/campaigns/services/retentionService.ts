@@ -100,11 +100,7 @@ export async function isEnrollmentReplayBlocked(
   tenantId: string,
   enrollmentKey: string
 ): Promise<boolean> {
-  // Check live records
-  const live = await CampaignEnrollmentModel.findOne({ tenantId, enrollmentKey });
-  if (live) return true;
-
-  // Check retained tombstones
+  // Check retained tombstones (Spec p.25, test B18)
   const tombstone = await CampaignTombstoneModel.findOne({ tenantId, enrollmentKey });
   return Boolean(tombstone);
 }

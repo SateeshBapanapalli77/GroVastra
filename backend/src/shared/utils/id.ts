@@ -14,7 +14,10 @@ export type IdPrefix =
   | 'cg'   // Contact Gate
   | 'tg'   // Tenant Gate
   | 'tomb' // Tombstone
-  | 'dr';  // Dry Run
+  | 'set'  // Settings
+  | 'dr'   // Dry Run
+  | 'aud'  // Audit Log
+  | 'idemp'; // Idempotency Record
 
 export function generateId(prefix: IdPrefix): string {
   return `${prefix}_${ulid().toLowerCase()}`;

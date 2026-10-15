@@ -12,3 +12,6 @@ export * from './TenantConnection.model';
 export * from './TenantControlGate.model';
 export * from './CampaignControlGate.model';
 export * from './CampaignTombstone.model';
+export * from './TenantSettings.model';
+export * from './AuditLog.model';
+export * from './Idempotency.model';

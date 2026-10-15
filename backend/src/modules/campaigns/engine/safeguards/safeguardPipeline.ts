@@ -119,37 +119,47 @@ export async function executePreflightSafeguards(
     return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
   }
 
-  // 7. Resolve Parameter Bindings
-  const storeDisplayName = (version as any).brandName || campaign?.name || 'GroVastra Boutique';
+  // 7. Resolve Parameter Bindings (Spec p.19, C05)
+  const storeDisplayName = (version as any).brandName || campaign?.name || '';
   const parameters: Record<string, string> = {};
   const rawBindings = stepDef.bindings instanceof Map
     ? Object.fromEntries(stepDef.bindings.entries())
     : (stepDef.bindings || {});
 
-  for (const [paramKey, rawExpr] of Object.entries(rawBindings)) {
-    const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
-    if (expr === 'customer.firstName') {
-      parameters[paramKey] = customer.firstName || '';
-    } else if (expr === 'customer.lastName') {
-      parameters[paramKey] = customer.lastName || '';
-    } else if (expr === 'customer.fullName') {
-      parameters[paramKey] = `${customer.firstName} ${customer.lastName}`.trim();
-    } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
-      parameters[paramKey] = storeDisplayName;
-    } else if (expr.startsWith('literal:')) {
-      parameters[paramKey] = expr.slice(8);
-    } else if (expr in customer) {
-      parameters[paramKey] = String((customer as any)[expr] || '');
-    } else {
-      parameters[paramKey] = expr;
-    }
-  }
+  for (const varKey of template.variableKeys) {
+    const rawExpr = rawBindings[varKey];
+    let resolvedValue = '';
 
-  if (!parameters.name && customer.firstName) {
-    parameters.name = customer.firstName;
-  }
-  if (!parameters.shop) {
-    parameters.shop = storeDisplayName;
+    if (rawExpr) {
+      const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
+      if (expr === 'customer.firstName') {
+        resolvedValue = customer.firstName || '';
+      } else if (expr === 'customer.lastName') {
+        resolvedValue = customer.lastName || '';
+      } else if (expr === 'customer.fullName') {
+        resolvedValue = `${customer.firstName} ${customer.lastName}`.trim();
+      } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName') {
+        resolvedValue = storeDisplayName;
+      } else if (expr.startsWith('literal:')) {
+        resolvedValue = expr.slice(8);
+      } else if (expr in customer) {
+        resolvedValue = String((customer as any)[expr] || '');
+      } else {
+        resolvedValue = expr;
+      }
+    } else {
+      if (varKey === 'name') {
+        resolvedValue = customer.firstName || '';
+      } else if (varKey === 'shop') {
+        resolvedValue = storeDisplayName;
+      }
+    }
+
+    if (!resolvedValue || resolvedValue.trim() === '') {
+      return { status: 'BLOCKED', reason: 'BLOCKED_MISSING_VARIABLE_BINDING' };
+    }
+
+    parameters[varKey] = resolvedValue;
   }
 
   const payloadHash = sha256(parameters);
@@ -227,3 +237,5 @@ export async function executePreflightSafeguards(
     payloadHash
   };
 }
+
+export const runSafeguardPipeline = executePreflightSafeguards;

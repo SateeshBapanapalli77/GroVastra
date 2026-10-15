@@ -6,13 +6,18 @@ import { CampaignVersionModel } from '../models/CampaignVersion.model';
 import { CampaignEnrollmentModel } from '../models/CampaignEnrollment.model';
 import { CampaignExecutionModel } from '../models/CampaignExecution.model';
 import { CampaignDryRunModel } from '../models/CampaignDryRun.model';
+import { TenantSettingsModel, REQUIRED_SETTINGS_NOTICE } from '../models/TenantSettings.model';
+import { TenantControlGateModel } from '../models/TenantControlGate.model';
+import { TenantConnectionModel } from '../models/TenantConnection.model';
+import { AuditLogModel } from '../models/AuditLog.model';
 import { evaluateCampaignDryRun } from '../engine/dryRun';
 import { planAnnualOccasions } from '../engine/annualDateStrategy';
+import { validateAudienceConfig } from '../engine/audienceEngine';
 import { CustomerModel } from '../../crm/models/Customer.model';
 import { generateId } from '../../../shared/utils/id';
-import { env } from '../../../config/env';
-
+import { maskPhone } from '../../../shared/utils/phone';
 import { requireAuth, requireRole } from '../../../shared/middleware/auth.middleware';
+import { requireIdempotency } from '../../../shared/middleware/idempotency.middleware';
 
 export const campaignRouter = Router();
 
@@ -41,25 +46,164 @@ campaignRouter.get('/approved-template-catalogue', (req: Request, res: Response)
 
 /**
  * GET /api/v1/campaign-settings
+ * Backed by real tenant settings document with exact required notice text (Spec p.8, P2.j)
  */
-campaignRouter.get('/campaign-settings', (req: Request, res: Response) => {
-  res.json({
-    success: true,
-    settings: {
-      timezone: 'Asia/Kolkata',
-      allowedHours: { start: '10:00', end: '19:00' },
-      caps: {
-        marketing24h: 1,
-        marketing7d: 3
-      },
-      globalPause: false,
-      outageGraceMinutes: 120,
-      leapDayPolicy: 'FEB_28',
-      notice:
-        'This module runs auto campaigns using an existing WhatsApp connection and approved templates. WhatsApp setup and template approval are managed by the integration developer.'
+campaignRouter.get('/campaign-settings', async (req: Request, res: Response) => {
+  try {
+    const tenantId = req.tenantId!;
+    let settings = await TenantSettingsModel.findOne({ tenantId });
+    if (!settings) {
+      settings = await TenantSettingsModel.create({
+        id: generateId('set'),
+        tenantId,
+        version: 1,
+        timezone: 'Asia/Kolkata',
+        allowedHours: { start: '10:00', end: '19:00' },
+        caps: {
+          marketing24h: 1,
+          marketing7d: 3
+        },
+        globalPause: false,
+        outageGraceMinutes: 120,
+        leapDayPolicy: 'FEB_28',
+        holidays: [],
+        blackouts: [],
+        notice: REQUIRED_SETTINGS_NOTICE
+      });
     }
-  });
+
+    res.json({
+      success: true,
+      settings: {
+        id: settings.id,
+        version: settings.version,
+        timezone: settings.timezone,
+        allowedHours: settings.allowedHours,
+        caps: settings.caps,
+        globalPause: settings.globalPause,
+        outageGraceMinutes: settings.outageGraceMinutes,
+        leapDayPolicy: settings.leapDayPolicy,
+        holidays: settings.holidays,
+        blackouts: settings.blackouts,
+        notice: REQUIRED_SETTINGS_NOTICE
+      }
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
 });
+
+/**
+ * PATCH /api/v1/campaign-settings
+ * Real tenant settings update with optimistic concurrency control and notice lock (P2.j, C16)
+ */
+campaignRouter.patch(
+  '/campaign-settings',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = req.tenantId!;
+      const {
+        expectedVersion,
+        timezone,
+        allowedHours,
+        caps,
+        globalPause,
+        outageGraceMinutes,
+        leapDayPolicy,
+        holidays,
+        blackouts
+      } = req.body;
+
+      let settings = await TenantSettingsModel.findOne({ tenantId });
+      if (!settings) {
+        settings = await TenantSettingsModel.create({
+          id: generateId('set'),
+          tenantId,
+          version: 1,
+          timezone: 'Asia/Kolkata',
+          allowedHours: { start: '10:00', end: '19:00' },
+          caps: { marketing24h: 1, marketing7d: 3 },
+          globalPause: false,
+          outageGraceMinutes: 120,
+          leapDayPolicy: 'FEB_28',
+          holidays: [],
+          blackouts: [],
+          notice: REQUIRED_SETTINGS_NOTICE
+        });
+      }
+
+      // Optimistic concurrency control (Spec C16)
+      if (typeof expectedVersion === 'number' && settings.version !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Settings version conflict: expected version ${expectedVersion}, but settings are at version ${settings.version}.`
+        });
+      }
+
+      if (timezone) settings.timezone = timezone;
+      if (allowedHours) settings.allowedHours = allowedHours;
+      if (caps) settings.caps = caps;
+      if (typeof outageGraceMinutes === 'number') settings.outageGraceMinutes = outageGraceMinutes;
+      if (leapDayPolicy) settings.leapDayPolicy = leapDayPolicy;
+      if (Array.isArray(holidays)) settings.holidays = holidays;
+      if (Array.isArray(blackouts)) settings.blackouts = blackouts;
+
+      if (typeof globalPause === 'boolean' && globalPause !== settings.globalPause) {
+        settings.globalPause = globalPause;
+        // Sync with TenantControlGateModel (P1.c)
+        let tenantGate = await TenantControlGateModel.findOne({ tenantId });
+        if (!tenantGate) {
+          await TenantControlGateModel.create({
+            id: generateId('tg'),
+            tenantId,
+            globalPause,
+            gateVersion: 1
+          });
+        } else {
+          tenantGate.globalPause = globalPause;
+          tenantGate.gateVersion += 1;
+          await tenantGate.save();
+        }
+      }
+
+      settings.version += 1;
+      settings.notice = REQUIRED_SETTINGS_NOTICE; // Strict invariant: cannot alter required notice
+      await settings.save();
+
+      // Audit Log
+      await AuditLogModel.create({
+        id: generateId('aud'),
+        tenantId,
+        userId: (req as any).user?.userId || 'owner',
+        action: 'UPDATE_SETTINGS',
+        targetType: 'TENANT_SETTINGS',
+        targetId: settings.id,
+        details: { version: settings.version, globalPause: settings.globalPause }
+      });
+
+      res.json({
+        success: true,
+        settings: {
+          id: settings.id,
+          version: settings.version,
+          timezone: settings.timezone,
+          allowedHours: settings.allowedHours,
+          caps: settings.caps,
+          globalPause: settings.globalPause,
+          outageGraceMinutes: settings.outageGraceMinutes,
+          leapDayPolicy: settings.leapDayPolicy,
+          holidays: settings.holidays,
+          blackouts: settings.blackouts,
+          notice: REQUIRED_SETTINGS_NOTICE
+        }
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  }
+);
 
 /**
  * GET /api/v1/campaigns
@@ -69,7 +213,6 @@ campaignRouter.get('/campaigns', async (req: Request, res: Response) => {
     const tenantId = (req as any).tenantId;
     const campaigns = await CampaignModel.find({ tenantId }).sort({ updatedAt: -1 }).lean();
 
-    // Attach activeVersion and enrolled counts
     const populated = await Promise.all(
       campaigns.map(async (c) => {
         let activeVersion = null;
@@ -99,71 +242,76 @@ campaignRouter.get('/campaigns', async (req: Request, res: Response) => {
  * POST /api/v1/campaigns
  * Create a new campaign from a preset
  */
-campaignRouter.post('/campaigns', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const { presetId, name } = req.body;
+campaignRouter.post(
+  '/campaigns',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = (req as any).tenantId;
+      const { presetId, name } = req.body;
 
-    const preset = presetId ? getCampaignPreset(presetId) : null;
-    const campaignId = generateId('cmp');
-    const versionId = generateId('cv');
+      const preset = presetId ? getCampaignPreset(presetId) : null;
+      const campaignId = generateId('cmp');
+      const versionId = generateId('cv');
 
-    const newCampaign = await CampaignModel.create({
-      id: campaignId,
-      tenantId,
-      name: name || (preset ? preset.name : 'Birthday Boutique Shopping'),
-      industry: 'BOUTIQUE',
-      purpose: preset?.purpose || 'MARKETING',
-      status: 'DRAFT',
-      activeVersionId: null,
-      draftVersion: 1,
-      pauseGeneration: 0
-    });
+      const newCampaign = await CampaignModel.create({
+        id: campaignId,
+        tenantId,
+        name: name || (preset ? preset.name : 'Birthday Boutique Shopping'),
+        industry: 'BOUTIQUE',
+        purpose: preset?.purpose || 'MARKETING',
+        status: 'DRAFT',
+        activeVersionId: null,
+        draftVersion: 1,
+        pauseGeneration: 0
+      });
 
-    const steps = preset
-      ? preset.defaultSteps.map((s) => ({
-          stepId: s.stepId,
-          offsetDays: s.offsetDays,
-          localTime: s.localTime,
-          prerequisite: s.prerequisite,
-          templateRef: { id: s.templateId, revision: s.templateRevision, language: 'en' },
-          bindings: s.bindings,
-          stopOnReply: s.stopOnReply,
-          stopOnGoal: s.stopOnGoal,
-          maxLatenessMinutes: s.maxLatenessMinutes
-        }))
-      : [];
+      const steps = preset
+        ? preset.defaultSteps.map((s) => ({
+            stepId: s.stepId,
+            offsetDays: s.offsetDays,
+            localTime: s.localTime,
+            prerequisite: s.prerequisite,
+            templateRef: { id: s.templateId, revision: s.templateRevision, language: 'en' },
+            bindings: s.bindings,
+            stopOnReply: s.stopOnReply,
+            stopOnGoal: s.stopOnGoal,
+            maxLatenessMinutes: s.maxLatenessMinutes
+          }))
+        : [];
 
-    const draftVersion = await CampaignVersionModel.create({
-      id: versionId,
-      tenantId,
-      campaignId,
-      version: 1,
-      name: newCampaign.name,
-      industry: 'BOUTIQUE',
-      purpose: newCampaign.purpose,
-      trigger: preset?.trigger || { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
-      timezone: 'Asia/Kolkata',
-      audience: { mode: 'ALL_ELIGIBLE' },
-      goal: { type: 'OCCASION_TAGGED_OR_STAFF_COMPLETED', windowDays: 14 },
-      steps,
-      priority: preset?.defaultPriority || 80,
-      resumePolicy: 'FUTURE_ONLY',
-      importPolicy: 'FUTURE_ONLY',
-      enabledBranches: ['default'],
-      publishedBy: 'owner',
-      reviewFingerprint: 'draft_initial'
-    });
+      const draftVersion = await CampaignVersionModel.create({
+        id: versionId,
+        tenantId,
+        campaignId,
+        version: 1,
+        name: newCampaign.name,
+        industry: 'BOUTIQUE',
+        purpose: newCampaign.purpose,
+        trigger: preset?.trigger || { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+        timezone: 'Asia/Kolkata',
+        audience: { mode: 'ALL_ELIGIBLE' },
+        goal: { type: 'OCCASION_TAGGED_OR_STAFF_COMPLETED', windowDays: 14 },
+        steps,
+        priority: preset?.defaultPriority || 80,
+        resumePolicy: 'FUTURE_ONLY',
+        importPolicy: 'FUTURE_ONLY',
+        enabledBranches: ['default'],
+        publishedBy: (req as any).user?.userId || 'owner',
+        reviewFingerprint: 'draft_initial'
+      });
 
-    res.status(201).json({
-      success: true,
-      campaign: newCampaign,
-      draftVersion
-    });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+      res.status(201).json({
+        success: true,
+        campaign: newCampaign,
+        draftVersion
+      });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   }
-});
+);
 
 /**
  * GET /api/v1/campaigns/:id
@@ -197,135 +345,104 @@ campaignRouter.get('/campaigns/:id', async (req: Request, res: Response) => {
 /**
  * PATCH /api/v1/campaigns/:id/draft
  * Update draft configuration (Trigger, Audience, Steps, Rules)
+ * Never mutates a published version (Spec p.9, P2.f, C16)
  */
 campaignRouter.patch(
   '/campaigns/:id/draft',
   requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
   async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const { name, trigger, audience, steps, priority, timezone } = req.body;
+    try {
+      const tenantId = (req as any).tenantId;
+      const { expectedVersion, name, trigger, audience, steps, priority, timezone } = req.body;
 
-    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campaign not found' });
-    }
+      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+      if (!campaign) {
+        return res.status(404).json({ success: false, error: 'Campaign not found' });
+      }
 
-    const draft = await CampaignVersionModel.findOne({
-      campaignId: campaign.id,
-      tenantId,
-      version: campaign.draftVersion
-    });
+      // Optimistic concurrency control (Spec C16)
+      if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Draft version conflict: expected version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+        });
+      }
 
-    if (!draft) {
-      return res.status(404).json({ success: false, error: 'Draft version not found' });
-    }
-
-    // Invariant: If draft is currently the active/live version, clone a new immutable draft revision (Page 16)
-    if (campaign.activeVersionId === draft.id) {
-      const nextVersionNumber = (campaign.draftVersion || 1) + 1;
-      const newVersionId = generateId('cv');
-
-      const clonedDraft = await CampaignVersionModel.create({
-        id: newVersionId,
-        tenantId,
+      const draft = await CampaignVersionModel.findOne({
         campaignId: campaign.id,
-        version: nextVersionNumber,
-        name: name || draft.name,
-        industry: draft.industry,
-        purpose: draft.purpose,
-        trigger: trigger ? { ...draft.trigger, ...trigger } : draft.trigger,
-        timezone: timezone || draft.timezone,
-        audience: audience || draft.audience,
-        goal: draft.goal,
-        steps: steps || draft.steps,
-        priority: priority || draft.priority,
-        resumePolicy: draft.resumePolicy,
-        importPolicy: draft.importPolicy,
-        enabledBranches: draft.enabledBranches,
-        publishedBy: 'owner',
-        reviewFingerprint: `draft_${Date.now()}`
+        tenantId,
+        version: campaign.draftVersion
       });
 
-      campaign.draftVersion = nextVersionNumber;
-      if (name) campaign.name = name;
-      await campaign.save();
+      if (!draft) {
+        return res.status(404).json({ success: false, error: 'Draft version not found' });
+      }
 
-      return res.json({ success: true, campaign, draftVersion: clonedDraft });
+      // Invariant: If draft is currently the active/live version, clone a new immutable draft revision (Spec p.16)
+      if (campaign.activeVersionId === draft.id) {
+        const nextVersionNumber = (campaign.draftVersion || 1) + 1;
+        const newVersionId = generateId('cv');
+
+        const clonedDraft = await CampaignVersionModel.create({
+          id: newVersionId,
+          tenantId,
+          campaignId: campaign.id,
+          version: nextVersionNumber,
+          name: name || draft.name,
+          industry: draft.industry,
+          purpose: draft.purpose,
+          trigger: trigger ? { ...draft.trigger, ...trigger } : draft.trigger,
+          timezone: timezone || draft.timezone,
+          audience: audience || draft.audience,
+          goal: draft.goal,
+          steps: steps || draft.steps,
+          priority: priority || draft.priority,
+          resumePolicy: draft.resumePolicy,
+          importPolicy: draft.importPolicy,
+          enabledBranches: draft.enabledBranches,
+          publishedBy: (req as any).user?.userId || 'owner',
+          reviewFingerprint: `draft_${Date.now()}`
+        });
+
+        campaign.draftVersion = nextVersionNumber;
+        if (name) campaign.name = name;
+        await campaign.save();
+
+        return res.json({ success: true, campaign, draftVersion: clonedDraft });
+      }
+
+      if (name) {
+        campaign.name = name;
+        draft.name = name;
+        await campaign.save();
+      }
+      if (trigger) draft.trigger = { ...draft.trigger, ...trigger };
+      if (audience) draft.audience = audience;
+      if (steps) draft.steps = steps;
+      if (priority) draft.priority = priority;
+      if (timezone) draft.timezone = timezone;
+
+      draft.reviewFingerprint = `draft_${Date.now()}`;
+      await draft.save();
+
+      res.json({ success: true, campaign, draftVersion: draft });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
     }
-
-    if (name) {
-      campaign.name = name;
-      draft.name = name;
-      await campaign.save();
-    }
-    if (trigger) draft.trigger = { ...draft.trigger, ...trigger };
-    if (audience) draft.audience = audience;
-    if (steps) draft.steps = steps;
-    if (priority) draft.priority = priority;
-    if (timezone) draft.timezone = timezone;
-
-    draft.reviewFingerprint = `draft_${Date.now()}`;
-    await draft.save();
-
-    res.json({ success: true, campaign, draftVersion: draft });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
   }
-});
+);
 
 /**
  * POST /api/v1/campaigns/:id/dry-runs
  * Run pre-flight dry-run evaluation on the draft version
  */
-campaignRouter.post('/campaigns/:id/dry-runs', async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campaign not found' });
-    }
-
-    const draft = await CampaignVersionModel.findOne({
-      campaignId: campaign.id,
-      tenantId,
-      version: campaign.draftVersion
-    });
-
-    if (!draft) {
-      return res.status(404).json({ success: false, error: 'Draft version not found' });
-    }
-
-    const result = await evaluateCampaignDryRun(draft);
-    draft.reviewFingerprint = result.draftFingerprint;
-    await draft.save();
-
-    res.json({ success: true, dryRun: result });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
-  }
-});
-
-/**
- * POST /api/v1/campaigns/:id/activate
- * Publish immutable version and execute calendar planner (requires reviewFingerprint from real dry run)
- */
 campaignRouter.post(
-  '/campaigns/:id/activate',
-  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  '/campaigns/:id/dry-runs',
+  requireIdempotency,
   async (req: Request, res: Response) => {
     try {
-      const tenantId = req.tenantId!;
-      const { reviewFingerprint } = req.body;
-
-      // Mandatory review fingerprint check (Handoff Page 21)
-      if (!reviewFingerprint) {
-        return res.status(400).json({
-          success: false,
-          error: 'Mandatory reviewFingerprint is required to activate a campaign. Run dry run first.'
-        });
-      }
-
+      const tenantId = (req as any).tenantId;
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
       if (!campaign) {
         return res.status(404).json({ success: false, error: 'Campaign not found' });
@@ -341,7 +458,62 @@ campaignRouter.post(
         return res.status(404).json({ success: false, error: 'Draft version not found' });
       }
 
-      // Verify fingerprint matches draft review
+      const result = await evaluateCampaignDryRun(draft);
+      draft.reviewFingerprint = result.draftFingerprint;
+      await draft.save();
+
+      res.json({ success: true, dryRun: result });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
+  }
+);
+
+/**
+ * POST /api/v1/campaigns/:id/activate
+ * Publish immutable version and execute calendar planner (requires reviewFingerprint from real dry run, A03, A05, C01)
+ */
+campaignRouter.post(
+  '/campaigns/:id/activate',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = req.tenantId!;
+      const { reviewFingerprint, expectedVersion } = req.body;
+
+      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+      if (!campaign) {
+        return res.status(404).json({ success: false, error: 'Campaign not found' });
+      }
+
+      // Concurrency check (C16)
+      if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+        });
+      }
+
+      const draft = await CampaignVersionModel.findOne({
+        campaignId: campaign.id,
+        tenantId,
+        version: campaign.draftVersion
+      });
+
+      if (!draft) {
+        return res.status(404).json({ success: false, error: 'Draft version not found' });
+      }
+
+      // Mandatory review fingerprint check (Spec p.21, A03)
+      if (!reviewFingerprint) {
+        return res.status(400).json({
+          success: false,
+          error: 'Mandatory reviewFingerprint is required to activate a campaign. Run dry run first.'
+        });
+      }
+
+      // Verify fingerprint matches draft review (A03: Draft changed after dry run -> reject old review fingerprint)
       if (draft.reviewFingerprint !== reviewFingerprint) {
         return res.status(400).json({
           success: false,
@@ -349,7 +521,7 @@ campaignRouter.post(
         });
       }
 
-      // Verify that a real persisted dry run audit exists
+      // Verify that a real persisted dry run audit exists (C01)
       const dryRunReport = await CampaignDryRunModel.findOne({
         tenantId,
         campaignId: campaign.id,
@@ -363,11 +535,49 @@ campaignRouter.post(
         });
       }
 
-      // Freeze active version
+      // Activation Readiness Checks (Spec A05): Block activation if template, binding or connection missing
+      for (const step of draft.steps || []) {
+        const template = getApprovedTemplate(step.templateRef?.id);
+        if (!template || template.status === 'PAUSED') {
+          return res.status(422).json({
+            success: false,
+            error: `Activation blocked: Step '${step.stepId}' references unusable template '${step.templateRef?.id}'.`,
+            fieldPath: `steps.${step.stepId}.templateRef.id`,
+            resolutionOwner: 'INTEGRATION_DEVELOPER'
+          });
+        }
+      }
+
+      const connection = await TenantConnectionModel.findOne({ tenantId, active: true });
+      if (!connection) {
+        return res.status(422).json({
+          success: false,
+          error: 'Activation blocked: No active WhatsApp connection provisioned for this boutique.',
+          fieldPath: 'connectionId',
+          resolutionOwner: 'INTEGRATION_DEVELOPER'
+        });
+      }
+
+      // Freeze immutable active version (Spec p.21)
+      draft.publishedAt = new Date();
+      draft.publishedBy = (req as any).user?.userId || 'owner';
+      await draft.save();
+
       campaign.status = 'ACTIVE';
       campaign.activeVersionId = draft.id;
       campaign.activatedAt = new Date();
       await campaign.save();
+
+      // Audit Log
+      await AuditLogModel.create({
+        id: generateId('aud'),
+        tenantId,
+        userId: (req as any).user?.userId || 'owner',
+        action: 'ACTIVATE_CAMPAIGN',
+        targetType: 'CAMPAIGN',
+        targetId: campaign.id,
+        details: { versionId: draft.id, version: draft.version, reviewFingerprint }
+      });
 
       // Trigger calendar planning for annual date occasions
       let planningResult = null;
@@ -422,7 +632,7 @@ campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STO
     campaign.pauseGeneration += 1;
     await campaign.save();
 
-    // Re-stamp all pending executions with the new pauseGeneration so they are re-enabled and not stranded!
+    // Re-stamp all pending executions with the new pauseGeneration so they are re-enabled
     await CampaignExecutionModel.updateMany(
       { campaignId: campaign.id, tenantId, state: { $in: ['SCHEDULED', 'DEFERRED'] } },
       { $set: { pauseGeneration: campaign.pauseGeneration, 'lease.token': null, 'lease.until': null } }
@@ -436,7 +646,7 @@ campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STO
 
 /**
  * POST /api/v1/campaigns/:id/validate
- * Validates campaign configuration, step approved templates, and parameter bindings
+ * Validates campaign configuration, step approved templates, parameter bindings, and channel readiness (A05)
  */
 campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Response) => {
   try {
@@ -444,7 +654,6 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-    // Load active or draft version
     const version = campaign.activeVersionId
       ? await CampaignVersionModel.findOne({ id: campaign.activeVersionId, tenantId })
       : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
@@ -453,40 +662,111 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
       return res.status(400).json({ success: false, error: 'No campaign version found to validate' });
     }
 
-    const validationErrors: string[] = [];
+    const errors: Array<{ fieldPath: string; message: string; resolutionOwner: 'BOUTIQUE_OWNER' | 'INTEGRATION_DEVELOPER' }> = [];
+    const warnings: Array<{ fieldPath: string; message: string; resolutionOwner: string }> = [];
 
-    if (!version.steps || version.steps.length === 0) {
-      validationErrors.push('Campaign must have at least one execution step');
+    // 1. Audience validation
+    const audVal = validateAudienceConfig(version.audience);
+    if (!audVal.valid && audVal.errors.length > 0) {
+      for (const err of audVal.errors) {
+        errors.push({
+          fieldPath: 'audience',
+          message: err,
+          resolutionOwner: 'BOUTIQUE_OWNER'
+        });
+      }
     }
 
-    for (const step of version.steps || []) {
-      const template = getApprovedTemplate(step.templateRef.id);
-      if (!template) {
-        validationErrors.push(`Step '${step.stepId}' references unapproved template '${step.templateRef.id}'`);
-      }
-      if (!step.localTime || !/^\d{2}:\d{2}$/.test(step.localTime)) {
-        validationErrors.push(`Step '${step.stepId}' has invalid localTime '${step.localTime}' (expected HH:mm)`);
-      }
-    }
-
-    if (validationErrors.length > 0) {
-      return res.status(422).json({
-        success: false,
-        valid: false,
-        errors: validationErrors
+    // 2. Channel Connection Readiness check (Spec A05)
+    const connection = await TenantConnectionModel.findOne({ tenantId, active: true });
+    if (!connection) {
+      errors.push({
+        fieldPath: 'connectionId',
+        message: 'No active WhatsApp channel connection found for this boutique.',
+        resolutionOwner: 'INTEGRATION_DEVELOPER'
       });
     }
 
-    campaign.status = 'VALIDATED';
-    await campaign.save();
+    // 3. Step validation
+    if (!version.steps || version.steps.length === 0) {
+      errors.push({
+        fieldPath: 'steps',
+        message: 'Campaign must have at least one execution step configured.',
+        resolutionOwner: 'BOUTIQUE_OWNER'
+      });
+    } else {
+      for (const step of version.steps) {
+        const template = getApprovedTemplate(step.templateRef?.id);
+        if (!template) {
+          errors.push({
+            fieldPath: `steps.${step.stepId}.templateRef.id`,
+            message: `Template '${step.templateRef?.id}' is missing or not in the approved catalogue.`,
+            resolutionOwner: 'INTEGRATION_DEVELOPER'
+          });
+        } else if (template.status === 'PAUSED') {
+          errors.push({
+            fieldPath: `steps.${step.stepId}.templateRef.id`,
+            message: `Template '${step.templateRef?.id}' is paused by the WhatsApp provider.`,
+            resolutionOwner: 'INTEGRATION_DEVELOPER'
+          });
+        } else {
+          // Check variable bindings for required keys
+          const rawBindings = step.bindings instanceof Map
+            ? Object.fromEntries(step.bindings.entries())
+            : (step.bindings || {});
+
+          for (const varKey of template.variableKeys) {
+            const bound = rawBindings[varKey];
+            if (!bound && varKey !== 'name' && varKey !== 'shop') {
+              errors.push({
+                fieldPath: `steps.${step.stepId}.bindings.${varKey}`,
+                message: `Template variable '${varKey}' is not mapped to a customer or store attribute.`,
+                resolutionOwner: 'BOUTIQUE_OWNER'
+              });
+            }
+          }
+        }
+
+        // Timing validation
+        if (!step.localTime || !/^\d{2}:\d{2}$/.test(step.localTime)) {
+          errors.push({
+            fieldPath: `steps.${step.stepId}.localTime`,
+            message: `Invalid localTime '${step.localTime}'. Must be in HH:mm format.`,
+            resolutionOwner: 'BOUTIQUE_OWNER'
+          });
+        }
+      }
+    }
+
+    // Check eligible customers today (Spec A04)
+    const eligibleCount = await CustomerModel.countDocuments({
+      tenantId,
+      status: 'ACTIVE',
+      channelSuppressed: false,
+      optedInMarketing: true
+    });
+    if (eligibleCount === 0) {
+      warnings.push({
+        fieldPath: 'audience.customers',
+        message: 'No eligible customers currently in CRM. Future customers will qualify when added.',
+        resolutionOwner: 'BOUTIQUE_OWNER'
+      });
+    }
+
+    const isValid = errors.length === 0;
+    if (isValid) {
+      campaign.status = 'VALIDATED';
+      await campaign.save();
+    }
 
     res.json({
       success: true,
-      valid: true,
-      status: 'VALIDATED',
+      valid: isValid,
+      errors,
+      warnings,
       campaign,
       versionId: version.id,
-      validatedSteps: version.steps.length
+      validatedSteps: version.steps?.length || 0
     });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
@@ -495,15 +775,12 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
 
 /**
  * POST /api/v1/campaigns/:id/publish-revision
- * Creates a new immutable version revision and updates activeVersionId atomically
- */
-/**
- * POST /api/v1/campaigns/:id/publish-revision
  * Enforces full review lifecycle (optimistic concurrency, template check, dry-run fingerprint)
  */
 campaignRouter.post(
   '/campaigns/:id/publish-revision',
   requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
   async (req: Request, res: Response) => {
     try {
       const tenantId = req.tenantId!;
@@ -512,7 +789,7 @@ campaignRouter.post(
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
       if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-      // 1. Optimistic Concurrency Control (expectedVersion check)
+      // 1. Optimistic Concurrency Control (expectedVersion check, C16)
       if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
         return res.status(409).json({
           success: false,
@@ -576,33 +853,45 @@ campaignRouter.post(
         });
       }
 
-      const newVersionNumber = updatedCampaign.draftVersion;
+      const baseVersion = currentVersion.toObject ? currentVersion.toObject() : currentVersion;
       const newVersionId = generateId('cv');
+      const newVersionNumber = (currentVersion.version || 1) + 1;
 
       const newVersion = await CampaignVersionModel.create({
         id: newVersionId,
         tenantId,
         campaignId: campaign.id,
         version: newVersionNumber,
-        name: currentVersion.name,
-        industry: currentVersion.industry,
-        purpose: currentVersion.purpose,
-        trigger: req.body.trigger || currentVersion.trigger,
-        timezone: req.body.timezone || currentVersion.timezone,
-        audience: req.body.audience || currentVersion.audience,
-        goal: req.body.goal || currentVersion.goal,
+        name: baseVersion.name,
+        industry: baseVersion.industry,
+        purpose: baseVersion.purpose,
+        trigger: req.body.trigger || baseVersion.trigger,
+        timezone: req.body.timezone || baseVersion.timezone,
+        audience: req.body.audience || baseVersion.audience,
+        goal: req.body.goal || baseVersion.goal,
         steps: candidateSteps,
-        priority: req.body.priority || currentVersion.priority,
-        resumePolicy: currentVersion.resumePolicy || 'FUTURE_ONLY',
+        priority: req.body.priority || baseVersion.priority,
+        resumePolicy: baseVersion.resumePolicy || 'FUTURE_ONLY',
         importPolicy: 'FUTURE_ONLY',
-        enabledBranches: currentVersion.enabledBranches || [],
-        publishedBy: req.user?.userId || 'boutique_manager',
+        enabledBranches: baseVersion.enabledBranches || [],
+        publishedBy: (req as any).user?.userId || 'boutique_manager',
         publishedAt: new Date(),
         reviewFingerprint
       });
 
       updatedCampaign.activeVersionId = newVersion.id;
       await updatedCampaign.save();
+
+      // Audit Log
+      await AuditLogModel.create({
+        id: generateId('aud'),
+        tenantId,
+        userId: (req as any).user?.userId || 'owner',
+        action: 'PUBLISH_REVISION',
+        targetType: 'CAMPAIGN',
+        targetId: campaign.id,
+        details: { versionId: newVersion.id, version: newVersion.version, reviewFingerprint }
+      });
 
       res.json({
         success: true,
@@ -664,6 +953,17 @@ campaignRouter.post(
         }
       );
 
+      // Audit Log
+      await AuditLogModel.create({
+        id: generateId('aud'),
+        tenantId,
+        userId: (req as any).user?.userId || 'owner',
+        action: 'ARCHIVE_CAMPAIGN',
+        targetType: 'CAMPAIGN',
+        targetId: campaign.id,
+        details: { cancelledExecutions: cancelledExecutions.modifiedCount }
+      });
+
       res.json({
         success: true,
         message: 'Campaign archived, active enrollments cancelled, and pending executions skipped',
@@ -678,32 +978,102 @@ campaignRouter.post(
 
 /**
  * GET /api/v1/campaigns/:id/enrollments
- * Real paginated enrollments and executions
+ * Real paginated enrollments and executions with masked phone and match explanations (Spec p.28, P2.j)
  */
 campaignRouter.get('/campaigns/:id/enrollments', async (req: Request, res: Response) => {
   try {
     const tenantId = (req as any).tenantId;
-    const enrollments = await CampaignEnrollmentModel.find({
-      tenantId,
-      campaignId: req.params.id
-    })
-      .sort({ createdAt: -1 })
-      .lean();
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+    const skip = (page - 1) * limit;
+
+    const [enrollments, total] = await Promise.all([
+      CampaignEnrollmentModel.find({ tenantId, campaignId: req.params.id })
+        .sort({ createdAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      CampaignEnrollmentModel.countDocuments({ tenantId, campaignId: req.params.id })
+    ]);
 
     const populated = await Promise.all(
       enrollments.map(async (enr) => {
+        const customer = await CustomerModel.findOne({ id: enr.customerId, tenantId }).lean();
         const executions = await CampaignExecutionModel.find({
           tenantId,
           enrollmentId: enr.id
         }).lean();
+
         return {
           ...enr,
+          customer: customer
+            ? {
+                id: customer.id,
+                firstName: customer.firstName,
+                lastName: customer.lastName,
+                maskedPhone: maskPhone(customer.phone)
+              }
+            : null,
           executions
         };
       })
     );
 
-    res.json({ success: true, enrollments: populated });
+    res.json({
+      success: true,
+      enrollments: populated,
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+    });
+  } catch (err: any) {
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * GET /api/v1/campaigns/:id/history
+ * Real paginated executions history with masked phone numbers (Spec p.28, P2.j)
+ */
+campaignRouter.get('/campaigns/:id/history', async (req: Request, res: Response) => {
+  try {
+    const tenantId = (req as any).tenantId;
+    const page = Math.max(1, parseInt(req.query.page as string, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit as string, 10) || 20));
+    const skip = (page - 1) * limit;
+
+    const [executions, total] = await Promise.all([
+      CampaignExecutionModel.find({ tenantId, campaignId: req.params.id })
+        .sort({ updatedAt: -1 })
+        .skip(skip)
+        .limit(limit)
+        .lean(),
+      CampaignExecutionModel.countDocuments({ tenantId, campaignId: req.params.id })
+    ]);
+
+    const populated = await Promise.all(
+      executions.map(async (exe) => {
+        const enrollment = await CampaignEnrollmentModel.findOne({ id: exe.enrollmentId, tenantId }).lean();
+        const customer = enrollment
+          ? await CustomerModel.findOne({ id: enrollment.customerId, tenantId }).lean()
+          : null;
+
+        return {
+          id: exe.id,
+          stepId: exe.stepId,
+          state: exe.state,
+          outcomeReason: exe.outcomeReason,
+          dueAt: exe.dueAt,
+          updatedAt: exe.updatedAt,
+          maskedPhone: customer ? maskPhone(customer.phone) : null,
+          customerName: customer ? `${customer.firstName} ${customer.lastName}` : null
+        };
+      })
+    );
+
+    res.json({
+      success: true,
+      history: populated,
+      pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
+    });
   } catch (err: any) {
     res.status(500).json({ success: false, error: err.message });
   }
@@ -711,67 +1081,97 @@ campaignRouter.get('/campaigns/:id/enrollments', async (req: Request, res: Respo
 
 /**
  * POST /api/v1/enrollments/:id/resolve-hold
- * Staff action to release a conversation hold after replying to a customer
+ * Staff action to release a conversation hold after replying to a customer (audited)
  */
-campaignRouter.post('/enrollments/:id/resolve-hold', async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const enrollment = await CampaignEnrollmentModel.findOne({ id: req.params.id, tenantId });
-    if (!enrollment) {
-      return res.status(404).json({ success: false, error: 'Enrollment not found' });
+campaignRouter.post(
+  '/enrollments/:id/resolve-hold',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER', 'STAFF']),
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = (req as any).tenantId;
+      const enrollment = await CampaignEnrollmentModel.findOne({ id: req.params.id, tenantId });
+      if (!enrollment) {
+        return res.status(404).json({ success: false, error: 'Enrollment not found' });
+      }
+
+      enrollment.replyHoldAt = null;
+      enrollment.planRevision += 1;
+      await enrollment.save();
+
+      // Append-only Audit Log
+      await AuditLogModel.create({
+        id: generateId('aud'),
+        tenantId,
+        userId: (req as any).user?.userId || 'staff',
+        action: 'RESOLVE_HOLD',
+        targetType: 'CAMPAIGN_ENROLLMENT',
+        targetId: enrollment.id,
+        details: { planRevision: enrollment.planRevision }
+      });
+
+      res.json({ success: true, message: 'Hold released by boutique staff', enrollment });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
     }
-
-    enrollment.replyHoldAt = null;
-    enrollment.planRevision += 1;
-    await enrollment.save();
-
-    res.json({ success: true, message: 'Hold released by boutique staff', enrollment });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
   }
-});
+);
 
 /**
  * POST /api/v1/enrollments/:id/mark-goal
- * Staff action to manually mark occasion purchase or goal reached
+ * Staff action to manually mark occasion purchase or goal reached (audited)
  */
-campaignRouter.post('/enrollments/:id/mark-goal', async (req: Request, res: Response) => {
-  try {
-    const tenantId = (req as any).tenantId;
-    const enrollment = await CampaignEnrollmentModel.findOne({ id: req.params.id, tenantId });
-    if (!enrollment) {
-      return res.status(404).json({ success: false, error: 'Enrollment not found' });
-    }
-
-    enrollment.goalReachedAt = new Date();
-    enrollment.goalOrderRef = req.body.orderRef || 'manual_staff_completion';
-    enrollment.planRevision += 1;
-    await enrollment.save();
-
-    // Mark pending executions as SKIPPED_GOAL_REACHED
-    await CampaignExecutionModel.updateMany(
-      {
-        tenantId,
-        enrollmentId: enrollment.id,
-        state: { $in: ['SCHEDULED', 'DEFERRED'] }
-      },
-      {
-        $set: {
-          state: 'SKIPPED',
-          outcomeReason: 'SKIPPED_GOAL_REACHED'
-        }
+campaignRouter.post(
+  '/enrollments/:id/mark-goal',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER', 'STAFF']),
+  async (req: Request, res: Response) => {
+    try {
+      const tenantId = (req as any).tenantId;
+      const enrollment = await CampaignEnrollmentModel.findOne({ id: req.params.id, tenantId });
+      if (!enrollment) {
+        return res.status(404).json({ success: false, error: 'Enrollment not found' });
       }
-    );
 
-    res.json({ success: true, message: 'Goal marked; pending sales follow-ups skipped', enrollment });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+      enrollment.goalReachedAt = new Date();
+      enrollment.goalOrderRef = req.body.orderRef || 'manual_staff_completion';
+      enrollment.planRevision += 1;
+      await enrollment.save();
+
+      // Mark pending executions as SKIPPED_GOAL_REACHED
+      await CampaignExecutionModel.updateMany(
+        {
+          tenantId,
+          enrollmentId: enrollment.id,
+          state: { $in: ['SCHEDULED', 'DEFERRED'] }
+        },
+        {
+          $set: {
+            state: 'SKIPPED',
+            outcomeReason: 'SKIPPED_GOAL_REACHED'
+          }
+        }
+      );
+
+      // Append-only Audit Log
+      await AuditLogModel.create({
+        id: generateId('aud'),
+        tenantId,
+        userId: (req as any).user?.userId || 'staff',
+        action: 'MARK_GOAL',
+        targetType: 'CAMPAIGN_ENROLLMENT',
+        targetId: enrollment.id,
+        details: { goalOrderRef: enrollment.goalOrderRef, planRevision: enrollment.planRevision }
+      });
+
+      res.json({ success: true, message: 'Goal marked; pending sales follow-ups skipped', enrollment });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
+    }
   }
-});
+);
 
 /**
  * GET /api/v1/campaign-activity
- * Activity log with plain-English explanation reasons (Handoff Page 28)
+ * Activity log with plain-English explanation reasons (Spec p.28)
  */
 campaignRouter.get('/campaign-activity', async (req: Request, res: Response) => {
   try {
@@ -801,6 +1201,12 @@ campaignRouter.get('/campaign-activity', async (req: Request, res: Response) => 
           explanation = 'Skipped because customer opted out of promotional messages.';
         } else if (exe.outcomeReason === 'SKIPPED_STEP_EXPIRED') {
           explanation = 'Skipped because step passed its useful expiry window.';
+        } else if (exe.outcomeReason === 'SKIPPED_ELAPSED') {
+          explanation = 'Skipped past step on activation (future-only policy).';
+        } else if (exe.outcomeReason === 'SKIPPED_CUSTOMER_DATE_REMOVED') {
+          explanation = 'Cancelled because saved occasion date was removed.';
+        } else if (exe.outcomeReason === 'SKIPPED_ALREADY_ACCEPTED') {
+          explanation = 'Step was already accepted under previous date correction.';
         }
 
         return {
@@ -848,4 +1254,3 @@ campaignRouter.get('/customers', async (req: Request, res: Response) => {
 campaignRouter.get('/templates', async (_req: Request, res: Response) => {
   res.json({ success: true, templates: APPROVED_TEMPLATES });
 });
-

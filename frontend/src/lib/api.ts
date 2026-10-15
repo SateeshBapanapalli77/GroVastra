@@ -215,5 +215,26 @@ export const api = {
 
   getTemplates: async (): Promise<{ success: boolean; templates: any[] }> => {
     return request('/templates');
+  },
+
+  // Tenant Settings (P2.j)
+  getSettings: async (): Promise<{ success: boolean; settings: any }> => {
+    return request('/campaign-settings');
+  },
+
+  updateSettings: async (settingsData: any): Promise<{ success: boolean; settings: any }> => {
+    return request('/campaign-settings', {
+      method: 'PATCH',
+      body: JSON.stringify(settingsData)
+    });
+  },
+
+  // Enrollments and History (P2.j)
+  getCampaignEnrollments: async (campaignId: string, page: number = 1, limit: number = 50): Promise<{ success: boolean; enrollments: any[]; total: number }> => {
+    return request(`/campaigns/${campaignId}/enrollments?page=${page}&limit=${limit}`);
+  },
+
+  getCampaignHistory: async (campaignId: string, page: number = 1, limit: number = 50): Promise<{ success: boolean; history: any[]; total: number }> => {
+    return request(`/campaigns/${campaignId}/history?page=${page}&limit=${limit}`);
   }
 };
