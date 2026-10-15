@@ -172,8 +172,17 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                   );
                 } else if (status === 'read') {
                   intent.readAt = providerTimestamp;
-                  if (!intent.deliveredAt) intent.deliveredAt = providerTimestamp;
+                  // Spec p.27: Read event implies delivery without supplying an exact earlier delivery timestamp.
+                  // Keep the actual delivery timestamp unknown when only read evidence exists!
                   await intent.save();
+
+                  const updateFields: any = {
+                    state: 'READ',
+                    readAt: providerTimestamp
+                  };
+                  if (intent.deliveredAt) {
+                    updateFields.deliveredAt = intent.deliveredAt;
+                  }
 
                   // Read can transition from PROVIDER_ACCEPTED, DELIVERED, or OUTCOME_UNKNOWN
                   await CampaignExecutionModel.updateOne(
@@ -183,11 +192,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                       state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'DELIVERED', 'OUTCOME_UNKNOWN'] }
                     },
                     {
-                      $set: {
-                        state: 'READ',
-                        readAt: providerTimestamp,
-                        deliveredAt: intent.deliveredAt
-                      }
+                      $set: updateFields
                     }
                   );
                 } else if (status === 'failed') {
@@ -292,7 +297,6 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
           );
         } else if (status === 'read') {
           intent.readAt = new Date();
-          if (!intent.deliveredAt) intent.deliveredAt = new Date();
           await intent.save();
 
           await CampaignExecutionModel.updateOne(

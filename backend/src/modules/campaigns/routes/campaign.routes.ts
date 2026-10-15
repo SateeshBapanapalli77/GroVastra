@@ -223,7 +223,7 @@ campaignRouter.get('/campaigns', async (req: Request, res: Response) => {
       campaigns.map(async (c) => {
         let activeVersion = null;
         if (c.activeVersionId) {
-          activeVersion = await CampaignVersionModel.findOne({ id: c.activeVersionId }).lean();
+          activeVersion = await CampaignVersionModel.findOne({ id: c.activeVersionId, tenantId }).lean();
         }
         const enrolledCount = await CampaignEnrollmentModel.countDocuments({
           tenantId,
@@ -367,12 +367,17 @@ campaignRouter.patch(
         return res.status(404).json({ success: false, error: 'Campaign not found' });
       }
 
-      // Optimistic concurrency control (Spec C16)
-      if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json({
-          success: false,
-          error: `Draft version conflict: expected version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-        });
+      // Optimistic concurrency control (Spec C16, Finding 6)
+      if (expectedVersion !== undefined) {
+        if (typeof expectedVersion !== 'number') {
+          return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
+        }
+        if (campaign.draftVersion !== expectedVersion) {
+          return res.status(409).json({
+            success: false,
+            error: `Draft version conflict: expected version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+          });
+        }
       }
 
       const draft = await CampaignVersionModel.findOne({
@@ -493,12 +498,17 @@ campaignRouter.post(
         return res.status(404).json({ success: false, error: 'Campaign not found' });
       }
 
-      // Concurrency check (C16)
-      if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json({
-          success: false,
-          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-        });
+      // Concurrency check (C16, Finding 6)
+      if (expectedVersion !== undefined) {
+        if (typeof expectedVersion !== 'number') {
+          return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
+        }
+        if (campaign.draftVersion !== expectedVersion) {
+          return res.status(409).json({
+            success: false,
+            error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+          });
+        }
       }
 
       const draft = await CampaignVersionModel.findOne({
@@ -541,15 +551,29 @@ campaignRouter.post(
         });
       }
 
-      // Activation Readiness Checks (Spec A05): Block activation if template, binding or connection missing
+      // Activation Readiness Checks (Spec A05, Finding 5): Exact approved template ID, revision, and locale
+      const { resolveApprovedTemplate } = await import('../adapters/templateCatalogue');
       for (const step of draft.steps || []) {
-        const template = getApprovedTemplate(step.templateRef?.id);
+        const template = await resolveApprovedTemplate(
+          step.templateRef?.id,
+          tenantId,
+          step.templateRef?.revision,
+          step.templateRef?.language
+        );
         if (!template || template.status === 'PAUSED') {
           return res.status(422).json({
             success: false,
-            error: `Activation blocked: Step '${step.stepId}' references unusable template '${step.templateRef?.id}'.`,
+            error: `Activation blocked: Step '${step.stepId}' references unusable template '${step.templateRef?.id}' (revision: ${step.templateRef?.revision}, locale: ${step.templateRef?.language}).`,
             fieldPath: `steps.${step.stepId}.templateRef.id`,
             resolutionOwner: 'INTEGRATION_DEVELOPER'
+          });
+        }
+        if (draft.purpose === 'ORDER_SERVICE' && template.category === 'MARKETING') {
+          return res.status(422).json({
+            success: false,
+            error: `Activation blocked: Step '${step.stepId}' template purpose mismatch. Service campaign cannot use marketing template.`,
+            fieldPath: `steps.${step.stepId}.templateRef.id`,
+            resolutionOwner: 'BOUTIQUE_OWNER'
           });
         }
       }
@@ -564,36 +588,81 @@ campaignRouter.post(
         });
       }
 
-      // Freeze immutable active version (Spec p.21)
-      draft.publishedAt = new Date();
-      draft.publishedBy = (req as any).user?.userId || 'owner';
-      await draft.save();
+      // Atomic MongoDB transaction for version publishing, campaign activation, and audit (Spec p.21, Finding 3)
+      const session = await CampaignModel.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const casFilter: any = {
+            id: campaign.id,
+            tenantId,
+            draftVersion: campaign.draftVersion
+          };
+          if (typeof expectedVersion === 'number') {
+            casFilter.draftVersion = expectedVersion;
+          }
 
-      campaign.status = 'ACTIVE';
-      campaign.activeVersionId = draft.id;
-      campaign.activatedAt = new Date();
-      await campaign.save();
+          const updatedCampaign = await CampaignModel.findOneAndUpdate(
+            casFilter,
+            {
+              $set: {
+                status: 'ACTIVE',
+                activeVersionId: draft.id,
+                activatedAt: new Date()
+              }
+            },
+            { session, new: true }
+          );
 
-      // Audit Log
-      await AuditLogModel.create({
-        id: generateId('aud'),
-        tenantId,
-        userId: (req as any).user?.userId || 'owner',
-        action: 'ACTIVATE_CAMPAIGN',
-        targetType: 'CAMPAIGN',
-        targetId: campaign.id,
-        details: { versionId: draft.id, version: draft.version, reviewFingerprint }
-      });
+          if (!updatedCampaign) {
+            throw new Error('VERSION_CONFLICT');
+          }
 
-      // Trigger calendar planning for annual date occasions
+          draft.publishedAt = new Date();
+          draft.publishedBy = (req as any).user?.userId || 'owner';
+          await draft.save({ session });
+
+          await AuditLogModel.create(
+            [
+              {
+                id: generateId('aud'),
+                tenantId,
+                userId: (req as any).user?.userId || 'owner',
+                action: 'ACTIVATE_CAMPAIGN',
+                targetType: 'CAMPAIGN',
+                targetId: campaign.id,
+                details: { versionId: draft.id, version: draft.version, reviewFingerprint }
+              }
+            ],
+            { session }
+          );
+        });
+      } catch (txErr: any) {
+        if (txErr.message === 'VERSION_CONFLICT') {
+          return res.status(409).json({
+            success: false,
+            error: 'Version conflict: campaign draft was modified concurrently.'
+          });
+        }
+        throw txErr;
+      } finally {
+        await session.endSession();
+      }
+
+      const finalCampaign = await CampaignModel.findOne({ id: campaign.id, tenantId });
+
+      // Trigger calendar planning for annual date occasions post-commit (idempotent, Spec p.17)
       let planningResult = null;
       if (draft.trigger.type === 'ANNUAL_DATE') {
-        planningResult = await planAnnualOccasions(draft);
+        try {
+          planningResult = await planAnnualOccasions(draft);
+        } catch (planErr: any) {
+          // Log error; background planner will reconcile
+        }
       }
 
       res.json({
         success: true,
-        campaign,
+        campaign: finalCampaign || campaign,
         activeVersion: draft,
         planningResult
       });
@@ -804,9 +873,25 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
     if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-    const version = campaign.activeVersionId
-      ? await CampaignVersionModel.findOne({ id: campaign.activeVersionId, tenantId })
-      : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
+    const { expectedVersion } = req.body || {};
+    if (expectedVersion !== undefined) {
+      if (typeof expectedVersion !== 'number') {
+        return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
+      }
+      if (campaign.draftVersion !== expectedVersion) {
+        return res.status(409).json({
+          success: false,
+          error: `Version conflict: expected draft version ${expectedVersion}, but current draft is version ${campaign.draftVersion}.`
+        });
+      }
+    }
+
+    // Always validate the draft version being edited/prepared (Spec p.21, Finding 2)
+    const version = await CampaignVersionModel.findOne({
+      campaignId: campaign.id,
+      tenantId,
+      version: campaign.draftVersion
+    }) || await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
 
     if (!version) {
       return res.status(400).json({ success: false, error: 'No campaign version found to validate' });
@@ -814,7 +899,7 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
 
     const { valid: isValid, errors, warnings } = await validateCampaignVersionDefinition(version, tenantId);
 
-    if (isValid) {
+    if (isValid && campaign.status === 'DRAFT') {
       campaign.status = 'VALIDATED';
       await campaign.save();
     }
@@ -826,6 +911,8 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
       warnings,
       campaign,
       versionId: version.id,
+      draftVersion: version.version,
+      reviewFingerprint: version.reviewFingerprint || null,
       validatedSteps: version.steps?.length || 0
     });
   } catch (err: any) {
@@ -849,12 +936,17 @@ campaignRouter.post(
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
       if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-      // 1. Optimistic Concurrency Control (expectedVersion check, C16)
-      if (typeof expectedVersion === 'number' && campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json({
-          success: false,
-          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-        });
+      // 1. Optimistic Concurrency Control (expectedVersion check, C16, Finding 6)
+      if (expectedVersion !== undefined) {
+        if (typeof expectedVersion !== 'number') {
+          return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
+        }
+        if (campaign.draftVersion !== expectedVersion) {
+          return res.status(409).json({
+            success: false,
+            error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
+          });
+        }
       }
 
       // 2. Mandatory dry-run reviewFingerprint
@@ -888,76 +980,110 @@ campaignRouter.post(
 
       const candidateSteps = req.body.steps || currentVersion.steps;
 
-      // 3. Template Validation
+      // 3. Template Validation (Finding 5)
+      const { resolveApprovedTemplate } = await import('../adapters/templateCatalogue');
       for (const step of candidateSteps) {
-        const tpl = getApprovedTemplate(step.templateRef?.id);
-        if (!tpl) {
+        const tpl = await resolveApprovedTemplate(
+          step.templateRef?.id,
+          tenantId,
+          step.templateRef?.revision,
+          step.templateRef?.language
+        );
+        if (!tpl || tpl.status === 'PAUSED') {
           return res.status(422).json({
             success: false,
-            error: `Step '${step.stepId}' references unapproved template '${step.templateRef?.id}'`
+            error: `Step '${step.stepId}' references unapproved or paused template '${step.templateRef?.id}' (revision: ${step.templateRef?.revision}, locale: ${step.templateRef?.language})`
           });
         }
       }
 
-      // 4. Atomic draftVersion CAS increment
-      const updatedCampaign = await CampaignModel.findOneAndUpdate(
-        { id: campaign.id, tenantId, draftVersion: campaign.draftVersion },
-        { $inc: { draftVersion: 1 } },
-        { new: true }
-      );
-
-      if (!updatedCampaign) {
-        return res.status(409).json({
-          success: false,
-          error: 'Concurrent version update conflict detected.'
-        });
-      }
-
+      // 4. Atomic draftVersion CAS increment and transaction (Finding 3)
       const baseVersion = currentVersion.toObject ? currentVersion.toObject() : currentVersion;
       const newVersionId = generateId('cv');
       const newVersionNumber = (currentVersion.version || 1) + 1;
+      let newVersion: any = null;
+      let finalCampaign: any = null;
 
-      const newVersion = await CampaignVersionModel.create({
-        id: newVersionId,
-        tenantId,
-        campaignId: campaign.id,
-        version: newVersionNumber,
-        name: baseVersion.name,
-        industry: baseVersion.industry,
-        purpose: baseVersion.purpose,
-        trigger: req.body.trigger || baseVersion.trigger,
-        timezone: req.body.timezone || baseVersion.timezone,
-        audience: req.body.audience || baseVersion.audience,
-        goal: req.body.goal || baseVersion.goal,
-        steps: candidateSteps,
-        priority: req.body.priority || baseVersion.priority,
-        resumePolicy: baseVersion.resumePolicy || 'FUTURE_ONLY',
-        importPolicy: 'FUTURE_ONLY',
-        enabledBranches: baseVersion.enabledBranches || [],
-        publishedBy: (req as any).user?.userId || 'boutique_manager',
-        publishedAt: new Date(),
-        reviewFingerprint
-      });
+      const session = await CampaignModel.startSession();
+      try {
+        await session.withTransaction(async () => {
+          const updatedCampaign = await CampaignModel.findOneAndUpdate(
+            { id: campaign.id, tenantId, draftVersion: campaign.draftVersion },
+            {
+              $inc: { draftVersion: 1 },
+              $set: {
+                activeVersionId: newVersionId,
+                status: 'ACTIVE'
+              }
+            },
+            { session, new: true }
+          );
 
-      updatedCampaign.activeVersionId = newVersion.id;
-      await updatedCampaign.save();
+          if (!updatedCampaign) {
+            throw new Error('VERSION_CONFLICT');
+          }
 
-      // Audit Log
-      await AuditLogModel.create({
-        id: generateId('aud'),
-        tenantId,
-        userId: (req as any).user?.userId || 'owner',
-        action: 'PUBLISH_REVISION',
-        targetType: 'CAMPAIGN',
-        targetId: campaign.id,
-        details: { versionId: newVersion.id, version: newVersion.version, reviewFingerprint }
-      });
+          newVersion = await CampaignVersionModel.create(
+            [
+              {
+                id: newVersionId,
+                tenantId,
+                campaignId: campaign.id,
+                version: newVersionNumber,
+                name: baseVersion.name,
+                industry: baseVersion.industry,
+                purpose: baseVersion.purpose,
+                trigger: req.body.trigger || baseVersion.trigger,
+                timezone: req.body.timezone || baseVersion.timezone,
+                audience: req.body.audience || baseVersion.audience,
+                goal: req.body.goal || baseVersion.goal,
+                steps: candidateSteps,
+                priority: req.body.priority || baseVersion.priority,
+                resumePolicy: baseVersion.resumePolicy || 'FUTURE_ONLY',
+                importPolicy: 'FUTURE_ONLY',
+                enabledBranches: baseVersion.enabledBranches || [],
+                publishedBy: (req as any).user?.userId || 'boutique_manager',
+                publishedAt: new Date(),
+                reviewFingerprint
+              }
+            ],
+            { session }
+          );
+
+          await AuditLogModel.create(
+            [
+              {
+                id: generateId('aud'),
+                tenantId,
+                userId: (req as any).user?.userId || 'owner',
+                action: 'PUBLISH_REVISION',
+                targetType: 'CAMPAIGN',
+                targetId: campaign.id,
+                details: { versionId: newVersionId, version: newVersionNumber, reviewFingerprint }
+              }
+            ],
+            { session }
+          );
+
+          finalCampaign = updatedCampaign;
+        });
+      } catch (txErr: any) {
+        if (txErr.message === 'VERSION_CONFLICT') {
+          return res.status(409).json({
+            success: false,
+            error: 'Concurrent version update conflict detected.'
+          });
+        }
+        throw txErr;
+      } finally {
+        await session.endSession();
+      }
 
       res.json({
         success: true,
         message: `Version ${newVersionNumber} published successfully`,
-        campaign: updatedCampaign,
-        activeVersion: newVersion
+        campaign: finalCampaign,
+        activeVersion: Array.isArray(newVersion) ? newVersion[0] : newVersion
       });
     } catch (err: any) {
       res.status(500).json({ success: false, error: err.message });

@@ -418,9 +418,19 @@ export async function processClaimedExecution(
         return 'FAILED';
       }
 
+      // Lease-fenced recovery write: match executionId, tenantId, state EVALUATING, claimVersion, planRevision, and lease token (Finding 4)
+      const recoveryFence = {
+        id: executionId,
+        tenantId,
+        state: 'EVALUATING',
+        claimVersion: execution.claimVersion,
+        planRevision: execution.planRevision,
+        'lease.token': execution.lease?.token
+      };
+
       if (errMsg === 'CAMPAIGN_OR_GLOBAL_PAUSED') {
-        await CampaignExecutionModel.updateOne(
-          { id: executionId, tenantId },
+        const updateRes = await CampaignExecutionModel.updateOne(
+          recoveryFence,
           {
             $set: {
               state: 'SKIPPED',
@@ -431,12 +441,16 @@ export async function processClaimedExecution(
             }
           }
         );
+        if (updateRes.matchedCount === 0) {
+          logger.warn({ executionId, claimVersion: execution.claimVersion }, 'Recovery CAS failed; stale worker aborted without mutating execution');
+          return 'FAILED';
+        }
         return 'SKIPPED';
       }
 
       if (errMsg === 'DEFERRED_CONTACT_CAP' || errMsg === 'SKIPPED_CONTACT_CAP') {
-        await CampaignExecutionModel.updateOne(
-          { id: executionId, tenantId },
+        const updateRes = await CampaignExecutionModel.updateOne(
+          recoveryFence,
           {
             $set: {
               state: errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED',
@@ -447,12 +461,16 @@ export async function processClaimedExecution(
             }
           }
         );
+        if (updateRes.matchedCount === 0) {
+          logger.warn({ executionId, claimVersion: execution.claimVersion }, 'Recovery CAS failed; stale worker aborted without mutating execution');
+          return 'FAILED';
+        }
         return errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED';
       }
 
       if (errMsg === 'SKIPPED_STOCK_DEPLETED') {
-        await CampaignExecutionModel.updateOne(
-          { id: executionId, tenantId },
+        const updateRes = await CampaignExecutionModel.updateOne(
+          recoveryFence,
           {
             $set: {
               state: 'SKIPPED',
@@ -463,12 +481,16 @@ export async function processClaimedExecution(
             }
           }
         );
+        if (updateRes.matchedCount === 0) {
+          logger.warn({ executionId, claimVersion: execution.claimVersion }, 'Recovery CAS failed; stale worker aborted without mutating execution');
+          return 'FAILED';
+        }
         return 'SKIPPED';
       }
 
       if (errMsg === 'BLOCKED_NO_TENANT_CONNECTION') {
-        await CampaignExecutionModel.updateOne(
-          { id: executionId, tenantId },
+        const updateRes = await CampaignExecutionModel.updateOne(
+          recoveryFence,
           {
             $set: {
               state: 'BLOCKED',
@@ -479,12 +501,16 @@ export async function processClaimedExecution(
             }
           }
         );
+        if (updateRes.matchedCount === 0) {
+          logger.warn({ executionId, claimVersion: execution.claimVersion }, 'Recovery CAS failed; stale worker aborted without mutating execution');
+          return 'FAILED';
+        }
         return 'BLOCKED';
       }
 
-      // Safe cleanup for failed or aborted transaction: ensure EVALUATING lease is released (Finding 1)
-      await CampaignExecutionModel.updateOne(
-        { id: executionId, tenantId, state: 'EVALUATING' },
+      // Safe cleanup for failed or aborted transaction: ensure EVALUATING lease is released (Finding 1 & Finding 4)
+      const cleanupRes = await CampaignExecutionModel.updateOne(
+        recoveryFence,
         {
           $set: {
             state: 'DEFERRED',
@@ -496,6 +522,9 @@ export async function processClaimedExecution(
           }
         }
       );
+      if (cleanupRes.matchedCount === 0) {
+        logger.warn({ executionId, claimVersion: execution.claimVersion }, 'Cleanup CAS failed; stale worker aborted without mutating execution');
+      }
 
       // Lease lost or expired CAS conflict
       return 'FAILED';
@@ -556,8 +585,9 @@ export async function processClaimedExecution(
         await refreshedIntent.save();
       }
 
+      // Monotonic progression: only update to PROVIDER_ACCEPTED if not already DELIVERED or READ (Finding 7)
       await CampaignExecutionModel.findOneAndUpdate(
-        { id: executionId, tenantId, state: 'DISPATCHING' },
+        { id: executionId, tenantId, state: { $in: ['DISPATCHING', 'OUTCOME_UNKNOWN'] } },
         {
           $set: {
             state: 'PROVIDER_ACCEPTED',
@@ -571,7 +601,7 @@ export async function processClaimedExecution(
       await updateContactReservationStatus(tenantId, customer.phone, executionId, 'ACCEPTED');
       logger.info({ executionId, providerId: sendResult.providerMessageId }, 'Message accepted by provider');
 
-      // Check if a late status event already arrived before response persistence (Test C12)
+      // Check if a late status event already arrived before response persistence (Test C12, Finding 7)
       if (sendResult.providerMessageId) {
         const earlyStatus = await CampaignEventInboxModel.findOne({
           tenantId,
@@ -581,19 +611,32 @@ export async function processClaimedExecution(
 
         if (earlyStatus) {
           const isRead = earlyStatus.type === 'whatsapp.status.read';
+          const updateFields: any = {
+            state: isRead ? 'READ' : 'DELIVERED'
+          };
+          if (isRead) {
+            updateFields.readAt = earlyStatus.occurredAt;
+            // Spec p.27: A read event implies delivery without supplying an exact earlier delivery timestamp.
+            // Keep the actual delivery timestamp unknown when only read evidence exists!
+          } else {
+            updateFields.deliveredAt = earlyStatus.occurredAt;
+          }
+
           await CampaignExecutionModel.updateOne(
-            { id: executionId, tenantId },
             {
-              $set: {
-                state: isRead ? 'READ' : 'DELIVERED',
-                deliveredAt: earlyStatus.occurredAt,
-                readAt: isRead ? earlyStatus.occurredAt : null
-              }
-            }
+              id: executionId,
+              tenantId,
+              state: isRead ? { $nin: ['READ'] } : { $nin: ['READ', 'DELIVERED'] }
+            },
+            { $set: updateFields }
           );
+
           if (refreshedIntent) {
-            refreshedIntent.deliveredAt = earlyStatus.occurredAt;
-            if (isRead) refreshedIntent.readAt = earlyStatus.occurredAt;
+            if (isRead) {
+              refreshedIntent.readAt = earlyStatus.occurredAt;
+            } else {
+              refreshedIntent.deliveredAt = earlyStatus.occurredAt;
+            }
             await refreshedIntent.save();
           }
         }
