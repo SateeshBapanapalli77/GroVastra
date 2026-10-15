@@ -5,7 +5,13 @@ import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/m
 import { sha256, encryptText } from '../src/shared/utils/crypto';
 import { ulid } from 'ulid';
 
+import { CampaignContactGateModel } from '../src/modules/campaigns/models/CampaignContactGate.model';
+
 describe('Milestone 3: Durable Execution & Safeguards Test Suite', () => {
+  beforeEach(async () => {
+    await CampaignContactGateModel.deleteMany({ tenantId: { $regex: /^tenant_/ } });
+  });
+
   describe('1. Contact Caps & Anti-Spam Gate (Handoff Page 18)', () => {
     it('allows the first marketing message to a new destination', async () => {
       const phone = `+919900${Math.floor(100000 + Math.random() * 900000)}`;

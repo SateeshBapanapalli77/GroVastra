@@ -31,19 +31,26 @@ import { CampaignContactGateModel } from '../src/modules/campaigns/models/Campai
 import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
 import crypto from 'crypto';
 
-const TEST_DB_URI = process.env.MONGODB_URI || 'mongodb://127.0.0.1:27017/grovastra_test';
+const TEST_DB_URI = process.env.MONGODB_URI;
 
 describe('Milestone 5: QA Acceptance Matrix (A, B, C) - Real Production Engine', () => {
   beforeAll(async () => {
-    mongoose.set('strictQuery', true);
-    await mongoose.connect(TEST_DB_URI, {
-      serverSelectionTimeoutMS: 5000,
-      autoIndex: true
-    });
+    if (!process.env.MONGODB_URI) {
+      throw new Error('MONGODB_URI must be provided by test harness (MongoMemoryReplSet)');
+    }
+    if (mongoose.connection.readyState === 0) {
+      mongoose.set('strictQuery', true);
+      await mongoose.connect(process.env.MONGODB_URI, {
+        serverSelectionTimeoutMS: 5000,
+        autoIndex: true
+      });
+    }
   });
 
   afterAll(async () => {
-    await mongoose.disconnect();
+    if (mongoose.connection.readyState !== 0) {
+      await mongoose.disconnect();
+    }
   });
 
   beforeEach(async () => {

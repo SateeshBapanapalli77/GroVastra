@@ -5,9 +5,9 @@
 [![React](https://img.shields.io/badge/React-19.0-blue?style=flat&logo=react)](https://react.dev/)
 [![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue?style=flat&logo=typescript)](https://www.typescriptlang.org/)
 [![Express](https://img.shields.io/badge/Express-5.0.1-black?style=flat&logo=express)](https://expressjs.com/)
-[![MongoDB](https://img.shields.io/badge/MongoDB-6.0%2B-green?style=flat&logo=mongodb)](https://www.mongodb.com/)
-[![Vitest](https://img.shields.io/badge/Tests-78%20Passed%20(Real%20DB)-success?style=flat&logo=vitest)](https://vitest.dev/)
-[![WhatsApp](https://img.shields.io/badge/WhatsApp-Cloud%20API%20Sandbox-25D366?style=flat&logo=whatsapp)](https://developers.facebook.com/)
+[![MongoDB](https://img.shields.io/badge/MongoDB-Replica%20Set%20(In--Memory%20ReplSet)-green?style=flat&logo=mongodb)](https://www.mongodb.com/)
+[![Vitest](https://img.shields.io/badge/Tests-Replica%20Set%20Backed-success?style=flat&logo=vitest)](https://vitest.dev/)
+[![Status](https://img.shields.io/badge/Specification%20Status-STATUS.md-blue?style=flat)](STATUS.md)
 [![Architecture](https://img.shields.io/badge/Architecture-Modular%20Monolith-orange?style=flat)](#2-system-architecture)
 
 ---
@@ -69,7 +69,7 @@ GroVastra is architected as a **Modular Monolith** using **Express 5** and **Nex
      +---------------v---------------+               +---------------v---------------+
      |  MockWhatsAppDeliveryAdapter  |               | WhatsAppSandboxDeliveryAdapter|
      |  - In-Memory Offline Dev      |               | - Live Meta Cloud API (v21.0) |
-     |  - Zero Network / 61 Tests    |               | - 100% Free Sandbox & Sandbox |
+     |  - Zero Network Mock Tests    |               | - Free Sandbox Integration |
      +-------------------------------+               +-------------------------------+
 ```
 
@@ -120,7 +120,7 @@ Every due step is evaluated at runtime against strict reason precedence before a
 | **Timezone & Dates** | **Luxon 3.5** | Accurate IANA timezone math in `Asia/Kolkata` and Leap-Year policies. |
 | **Identifiers** | **ULID** | Monotonically sortable prefixed IDs (`cmp_`, `enr_`, `exe_`, `di_`). |
 | **Security & Crypto** | **Node.js Crypto** | AES-256-GCM encryption & SHA-256 canonical hashing. |
-| **Automated Testing** | **Vitest 3.0** | Lightning-fast test runner executing 61 scenarios in 1.9s. |
+| **Automated Testing** | **Vitest 3.0** | Test runner executing tests against MongoDB replica set. See STATUS.md for verified scenarios. |
 
 ---
 
@@ -149,7 +149,7 @@ GroVastra/
 │   │   │   └── events.ts                  # Domain Event Consumer
 │   │   ├── scripts/                       # Database seed & Sandbox smoke test
 │   │   └── server.ts                      # Express 5 Server Entrypoint
-│   └── tests/                             # Vitest QA Acceptance Matrix (61 tests)
+│   └── tests/                             # Vitest QA Acceptance Matrix (ReplSet-backed)
 │
 ├── frontend/                              # Next.js 15 (App Router) Studio
 │   ├── src/
@@ -199,7 +199,7 @@ npm install
    ```bash
    cp .env.example .env
    ```
-2. By default, `WHATSAPP_MODE=mock` is set, allowing you to develop and run all 61 automated tests completely offline without external credentials.
+2. By default, `WHATSAPP_MODE=mock` is set, allowing you to develop and run automated tests completely offline without external credentials.
 
 *(Optional)* To connect to Meta's free Developer Sandbox:
 ```ini
@@ -270,7 +270,7 @@ npm test
 - **`execution.test.ts` (6 tests)**: Contact cap reservations and delivery adapters.
 - **`lifecycle.test.ts` (6 tests)**: Saree restock, boutique alteration, and win-back strategies.
 
-**Result**: **78 passed (100%) against live MongoDB.**
+**Result**: Real MongoDB replica set backed suite. Live status tracked in [STATUS.md](STATUS.md).
 
 ---
 
