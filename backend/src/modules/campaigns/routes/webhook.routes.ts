@@ -157,8 +157,9 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     errorReason: statusObj.errors?.[0]?.title || statusObj.errors?.[0]?.message
                   },
                   status: 'RECEIVED',
+                  nextAttemptAt: intent ? null : new Date(Date.now() + 5000),
                   processedAt: null,
-                  errorMessage: null
+                  errorMessage: intent ? null : 'Awaiting delivery intent association'
                 });
               } catch (err: any) {
                 if (err.code === 11000) {
@@ -228,6 +229,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                           status: 'PROCESSED',
                           entityId: intent.executionId,
                           processedAt: new Date(),
+                          nextAttemptAt: null,
                           errorMessage: null
                         }
                       }
@@ -252,6 +254,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                       $set: {
                         status: 'FAILED',
                         errorMessage: reconErr?.message || 'Reconciliation failed',
+                        nextAttemptAt: null,
                         updatedAt: new Date()
                       },
                       $inc: { retryCount: 1 }
@@ -267,7 +270,18 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 if (inboxDoc.status === 'PROCESSING') {
                   await CampaignEventInboxModel.updateOne(
                     { id: inboxDoc.id },
-                    { $set: { status: 'RECEIVED', updatedAt: new Date() } }
+                    {
+                      $set: {
+                        status: 'RECEIVED',
+                        nextAttemptAt: new Date(Date.now() + 5000),
+                        updatedAt: new Date()
+                      }
+                    }
+                  );
+                } else if (!inboxDoc.nextAttemptAt) {
+                  await CampaignEventInboxModel.updateOne(
+                    { id: inboxDoc.id },
+                    { $set: { nextAttemptAt: new Date(Date.now() + 5000) } }
                   );
                 }
                 logger.info({ providerMessageId, status, tenantId, inboxId: inboxDoc.id }, 'Durably retained status receipt before send response persistence (C12)');

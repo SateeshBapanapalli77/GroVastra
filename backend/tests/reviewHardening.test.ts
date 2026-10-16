@@ -26,6 +26,7 @@ import { IWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/deli
 import { reconcileDeliveryStatus } from '../src/modules/campaigns/services/deliveryStatusReconciliation';
 import * as deliveryRecon from '../src/modules/campaigns/services/deliveryStatusReconciliation';
 import { resolveTenantForConnection } from '../src/modules/campaigns/services/connectionRegistry';
+import { processNextPendingEvent, MAX_UNRESOLVED_INTENT_RETRIES, calculateIntentRetryBackoffMs } from '../src/workers/events';
 
 describe('Senior Technical Manager Review Hardening Verification', () => {
   const tenantA = 'audit_tenant_a';
@@ -1956,5 +1957,219 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     // Unknown connection fails closed
     const resolvedUnknown = await resolveTenantForConnection('unknown_phone_number_id_999');
     expect(resolvedUnknown).toBeNull();
+  });
+
+  it('Review 7 — P2: Early webhook without matching intent is deferred with backoff; newer event is processed without queue starvation; dead-letters after max retries; recovers on late association', async () => {
+    const testTenant = 'audit_tenant_r7_' + Date.now();
+    const now = new Date();
+
+    const oldProviderMsgId = 'wamid_r7_old_missing_' + Date.now();
+    const newProviderMsgId = 'wamid_r7_new_valid_' + Date.now();
+
+    // 1. Insert an older status event with NO matching delivery intent (arrived 10 minutes ago)
+    const oldEvent = await CampaignEventInboxModel.create({
+      id: generateId('evt'),
+      tenantId: testTenant,
+      producer: 'whatsapp_status_webhook',
+      eventId: `${oldProviderMsgId}_delivered_old`,
+      type: 'whatsapp.status.delivered',
+      entityId: oldProviderMsgId,
+      entityVersion: 1,
+      occurredAt: new Date(now.getTime() - 10 * 60 * 1000),
+      receivedAt: new Date(now.getTime() - 10 * 60 * 1000),
+      data: {
+        providerMessageId: oldProviderMsgId,
+        status: 'delivered'
+      },
+      status: 'RECEIVED',
+      retryCount: 0,
+      nextAttemptAt: null,
+      processedAt: null,
+      errorMessage: null
+    });
+
+    // 2. Insert a newer status event with a VALID matching intent (arrived 2 minutes ago)
+    const exeNew = await CampaignExecutionModel.create({
+      id: 'exe_r7_new_' + Date.now(),
+      tenantId: testTenant,
+      enrollmentId: 'enr_r7_1',
+      campaignId: 'cmp_r7_1',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DISPATCHING',
+      outcomeReason: null,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intentNew = await CampaignDeliveryIntentModel.create({
+      id: 'intent_r7_new_' + Date.now(),
+      tenantId: testTenant,
+      executionId: exeNew.id,
+      deliveryKey: exeNew.id,
+      connectionId: 'conn_r7',
+      customerId: 'cus_r7_1',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_r7',
+      templateRef: { id: 'tpl_r7', revision: 1, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_r7',
+      providerMessageId: newProviderMsgId,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const newEvent = await CampaignEventInboxModel.create({
+      id: generateId('evt'),
+      tenantId: testTenant,
+      producer: 'whatsapp_status_webhook',
+      eventId: `${newProviderMsgId}_delivered_new`,
+      type: 'whatsapp.status.delivered',
+      entityId: intentNew.executionId,
+      entityVersion: 1,
+      occurredAt: new Date(now.getTime() - 2 * 60 * 1000),
+      receivedAt: new Date(now.getTime() - 2 * 60 * 1000),
+      data: {
+        providerMessageId: newProviderMsgId,
+        status: 'delivered'
+      },
+      status: 'RECEIVED',
+      retryCount: 0,
+      nextAttemptAt: null,
+      processedAt: null,
+      errorMessage: null
+    });
+
+    // 3. First Worker Cycle:
+    // The worker queries the oldest eligible RECEIVED event. It picks oldEvent.
+    // Finding no intent, oldEvent must be deferred with backoff (nextAttemptAt in future) and NOT processed or immediately requeued.
+    const cycle1 = await processNextPendingEvent(testTenant);
+    expect(cycle1).not.toBeNull();
+    expect(cycle1?.id).toBe(oldEvent.id);
+    expect(cycle1?.status).toBe('RECEIVED');
+    expect(cycle1?.retryCount).toBe(1);
+    expect(cycle1?.nextAttemptAt).not.toBeNull();
+    expect(cycle1?.nextAttemptAt!.getTime()).toBeGreaterThan(Date.now());
+
+    // 4. Second Worker Cycle (Queue Starvation Test):
+    // Since oldEvent has nextAttemptAt scheduled in the future, it is excluded from the query.
+    // The worker must pick newEvent and process it to PROCESSED!
+    const cycle2 = await processNextPendingEvent(testTenant);
+    expect(cycle2).not.toBeNull();
+    expect(cycle2?.id).toBe(newEvent.id);
+    expect(cycle2?.status).toBe('PROCESSED');
+    expect(cycle2?.nextAttemptAt).toBeNull();
+
+    // Verify the newer execution and intent were updated to DELIVERED
+    const exeNewUpdated = await CampaignExecutionModel.findOne({ id: exeNew.id, tenantId: testTenant });
+    const intentNewUpdated = await CampaignDeliveryIntentModel.findOne({ id: intentNew.id, tenantId: testTenant });
+    expect(exeNewUpdated?.state).toBe('DELIVERED');
+    expect(intentNewUpdated?.state).toBe('DELIVERED');
+
+    // 5. Third Worker Cycle:
+    // With newEvent PROCESSED and oldEvent deferred in the future, no eligible event exists right now
+    const cycle3 = await processNextPendingEvent(testTenant);
+    expect(cycle3).toBeNull(); // Old event was NOT picked up repeatedly! Starvation prevented!
+
+    // 6. Dead-Letter Quarantine Test after bounded retries:
+    // Advance oldEvent retryCount to MAX_UNRESOLVED_INTENT_RETRIES - 1 (e.g. 4) and set nextAttemptAt to past
+    await CampaignEventInboxModel.updateOne(
+      { id: oldEvent.id },
+      {
+        $set: {
+          retryCount: MAX_UNRESOLVED_INTENT_RETRIES - 1,
+          nextAttemptAt: new Date(Date.now() - 1000)
+        }
+      }
+    );
+
+    const cycle4 = await processNextPendingEvent(testTenant);
+    expect(cycle4).not.toBeNull();
+    expect(cycle4?.id).toBe(oldEvent.id);
+    expect(cycle4?.status).toBe('QUARANTINE');
+    expect(cycle4?.retryCount).toBe(MAX_UNRESOLVED_INTENT_RETRIES);
+    expect(cycle4?.errorMessage).toContain('moved to dead-letter queue');
+
+    // 7. Late intent association recovery:
+    // Later, dispatch executor completes and associates oldProviderMsgId
+    const exeLate = await CampaignExecutionModel.create({
+      id: 'exe_r7_late_' + Date.now(),
+      tenantId: testTenant,
+      enrollmentId: 'enr_r7_late',
+      campaignId: 'cmp_r7_late',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DISPATCHING',
+      outcomeReason: null,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intentLate = await CampaignDeliveryIntentModel.create({
+      id: 'intent_r7_late_' + Date.now(),
+      tenantId: testTenant,
+      executionId: exeLate.id,
+      deliveryKey: exeLate.id,
+      connectionId: 'conn_r7',
+      customerId: 'cus_r7_late',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_r7_late',
+      templateRef: { id: 'tpl_r7', revision: 1, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_r7_late',
+      providerMessageId: oldProviderMsgId,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // Simulate dispatch executor finding early status receipts for oldProviderMsgId
+    const earlyRecovered = await CampaignEventInboxModel.find({
+      tenantId: testTenant,
+      type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read', 'whatsapp.status.failed'] },
+      'data.providerMessageId': oldProviderMsgId
+    });
+
+    expect(earlyRecovered.length).toBe(1);
+    for (const early of earlyRecovered) {
+      await reconcileDeliveryStatus({
+        tenantId: testTenant,
+        providerMessageId: oldProviderMsgId,
+        status: 'delivered',
+        providerTimestamp: early.occurredAt || new Date(),
+        inboxEventId: early.id
+      });
+      early.status = 'PROCESSED';
+      early.entityId = exeLate.id;
+      early.processedAt = new Date();
+      early.nextAttemptAt = null;
+      early.errorMessage = null;
+      await early.save();
+    }
+
+    const oldEventRecovered = await CampaignEventInboxModel.findOne({ id: oldEvent.id });
+    expect(oldEventRecovered?.status).toBe('PROCESSED');
+    expect(oldEventRecovered?.entityId).toBe(exeLate.id);
+    expect(oldEventRecovered?.nextAttemptAt).toBeNull();
+
+    const exeLateUpdated = await CampaignExecutionModel.findOne({ id: exeLate.id });
+    const intentLateUpdated = await CampaignDeliveryIntentModel.findOne({ id: intentLate.id });
+    expect(exeLateUpdated?.state).toBe('DELIVERED');
+    expect(intentLateUpdated?.state).toBe('DELIVERED');
   });
 });

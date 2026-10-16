@@ -14,12 +14,24 @@ export interface EventConsumerCycleResult {
   failedCount: number;
 }
 
+export const MAX_UNRESOLVED_INTENT_RETRIES = 5;
+export const BASE_INTENT_RETRY_BACKOFF_MS = 5000;
+export const MAX_INTENT_RETRY_BACKOFF_MS = 300000;
+
+export function calculateIntentRetryBackoffMs(retryCount: number): number {
+  const exponent = Math.max(0, retryCount - 1);
+  const backoff = BASE_INTENT_RETRY_BACKOFF_MS * Math.pow(2, exponent);
+  return Math.min(backoff, MAX_INTENT_RETRY_BACKOFF_MS);
+}
+
 /**
  * Consumes and routes domain events from campaignEventInbox
  */
 export async function processNextPendingEvent(
   tenantId: string
 ): Promise<ICampaignEventInbox | null> {
+  const now = new Date();
+
   // Recover any stalled events that crashed during processing (> 5 minutes old)
   await CampaignEventInboxModel.updateMany(
     {
@@ -28,7 +40,7 @@ export async function processNextPendingEvent(
       updatedAt: { $lte: new Date(Date.now() - 5 * 60 * 1000) }
     },
     {
-      $set: { status: 'RECEIVED' }
+      $set: { status: 'RECEIVED', nextAttemptAt: now }
     }
   );
 
@@ -41,14 +53,20 @@ export async function processNextPendingEvent(
       updatedAt: { $lte: new Date(Date.now() - 2 * 60 * 1000) }
     },
     {
-      $set: { status: 'RECEIVED' }
+      $set: { status: 'RECEIVED', nextAttemptAt: now }
     }
   );
 
+  // Exclude deferred events whose nextAttemptAt is scheduled for the future (P2: queue starvation prevention)
   const event = await CampaignEventInboxModel.findOneAndUpdate(
     {
       tenantId,
-      status: 'RECEIVED'
+      status: 'RECEIVED',
+      $or: [
+        { nextAttemptAt: null },
+        { nextAttemptAt: { $exists: false } },
+        { nextAttemptAt: { $lte: now } }
+      ]
     },
     {
       $set: { status: 'PROCESSING' }
@@ -99,14 +117,54 @@ export async function processNextPendingEvent(
             event.status = 'FAILED';
             event.errorMessage = reconResult.details;
             event.retryCount = (event.retryCount || 0) + 1;
+            event.nextAttemptAt = null;
             await event.save();
             return event;
           }
           event.entityId = intent.executionId;
         } else {
-          // Intent not yet available (out-of-order delivery); return to RECEIVED for next cycle
+          // Intent not yet available (early webhook delivered before provider message ID persisted)
+          const retries = (event.retryCount || 0) + 1;
+          event.retryCount = retries;
+
+          if (retries >= MAX_UNRESOLVED_INTENT_RETRIES) {
+            // Move to terminal dead-letter quarantine after bounded attempts
+            event.status = 'QUARANTINE';
+            event.errorMessage = `Missing delivery intent for providerMessageId: ${providerMessageId} after ${retries} attempts; moved to dead-letter queue`;
+            event.nextAttemptAt = null;
+            await event.save();
+
+            logger.warn(
+              {
+                inboxId: event.id,
+                eventId: event.eventId,
+                providerMessageId,
+                tenantId: event.tenantId,
+                retryCount: retries
+              },
+              'Early webhook status receipt reached maximum retry attempts with no matching intent. Moved to QUARANTINE dead-letter queue.'
+            );
+            return event;
+          }
+
+          // Defer next attempt with exponential backoff so subsequent queue events are not starved
+          const backoffMs = calculateIntentRetryBackoffMs(retries);
           event.status = 'RECEIVED';
+          event.nextAttemptAt = new Date(Date.now() + backoffMs);
+          event.errorMessage = `Awaiting delivery intent association (attempt ${retries}/${MAX_UNRESOLVED_INTENT_RETRIES}, next attempt at ${event.nextAttemptAt.toISOString()})`;
           await event.save();
+
+          logger.info(
+            {
+              inboxId: event.id,
+              eventId: event.eventId,
+              providerMessageId,
+              tenantId: event.tenantId,
+              retryCount: retries,
+              nextAttemptAt: event.nextAttemptAt
+            },
+            'Early webhook status receipt missing delivery intent; deferred with backoff to prevent queue starvation'
+          );
           return event;
         }
       }
@@ -114,6 +172,8 @@ export async function processNextPendingEvent(
 
     event.status = 'PROCESSED';
     event.processedAt = new Date();
+    event.nextAttemptAt = null;
+    event.errorMessage = null;
     await event.save();
 
     logger.info({ eventId: event.eventId, type: event.type }, 'Successfully processed domain event');
@@ -122,6 +182,7 @@ export async function processNextPendingEvent(
     event.status = 'FAILED';
     event.errorMessage = err.message || 'Unknown processing error';
     event.retryCount = (event.retryCount || 0) + 1;
+    event.nextAttemptAt = null;
     await event.save();
   }
 

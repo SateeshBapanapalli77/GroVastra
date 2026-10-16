@@ -238,4 +238,21 @@ Following Review 6 feedback from the Senior Technical Manager / Higher Authority
 - **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
 - **Frontend Production Build:** Next.js 16.4.0 Turbopack `next build` clean (0 errors)
 
+---
+
+## 15. Higher Authority Review 7 Resolution (16 October 2026)
+
+Following Review 7 feedback from the Senior Technical Manager / Higher Authority on commit `4e6c53a`, the P2 operational finding regarding queue starvation by early webhooks without matching intents has been strictly resolved and verified through live database-backed regression tests:
+
+| # | Review 7 Action | Implementation Details | Verification Evidence |
+| :--- | :--- | :--- | :--- |
+| **Finding P2** | **Non-Blocking Inbox Backoff Scheduling, Queue Starvation Prevention & Dead-Letter Quarantine** | 1. **Next Attempt Retry Metadata**: In [`CampaignEventInbox.model.ts`](backend/src/modules/campaigns/models/CampaignEventInbox.model.ts), added `nextAttemptAt?: Date \| null` to the interface, schema, and compound query index `{ tenantId: 1, status: 1, nextAttemptAt: 1, receivedAt: 1 }`.<br>2. **Exponential Backoff on Missing Intent**: In [`events.ts`](backend/src/workers/events.ts), when a `whatsapp.status.*` event arrives without a matching delivery intent (early status webhook before provider message ID persistence), the worker increments `retryCount`, calculates exponential backoff (`calculateIntentRetryBackoffMs`: 5s, 10s, 20s, 40s... capped at 300s), updates `nextAttemptAt = new Date(Date.now() + backoffMs)`, and sets `status = 'RECEIVED'`.<br>3. **Queue Starvation Prevention**: The background worker query in `processNextPendingEvent` strictly excludes deferred events (`$or: [{ nextAttemptAt: null }, { nextAttemptAt: { $exists: false } }, { nextAttemptAt: { $lte: now } }]`). Subsequent eligible events for the tenant are processed immediately in FIFO order without being blocked by early unresolved receipts.<br>4. **Bounded Retries & Dead-Letter Quarantine**: Defined `MAX_UNRESOLVED_INTENT_RETRIES = 5`. After 5 unresolved attempts, the event transitions to terminal `status: 'QUARANTINE'`, clears `nextAttemptAt: null`, logs a `logger.warn` alert with tenant and message ID metadata, and ceases consuming worker cycles.<br>5. **Late Intent Association Recovery**: In [`dispatchExecutor.ts`](backend/src/modules/campaigns/engine/dispatchExecutor.ts), early status receipts for a given provider message ID are recovered upon dispatch completion across all states (including deferred `RECEIVED` and `QUARANTINE`), atomically reconciled to `PROCESSED`, and correlated to `executionId` with `nextAttemptAt` and `errorMessage` cleared.<br>6. **Initial Grace Window**: In [`webhook.routes.ts`](backend/src/modules/campaigns/routes/webhook.routes.ts), early webhooks without an immediate intent are initialized with `nextAttemptAt: new Date(Date.now() + 5000)`, preventing immediate pick-up by background workers before dispatch persistence completes. | `backend/tests/reviewHardening.test.ts` ("Review 7 — P2: Early webhook without matching intent is deferred with backoff; newer event is processed without queue starvation; dead-letters after max retries; recovers on late association") |
+
+### Test Suite Execution Summary (16 October 2026 - Review 7 Verification)
+- **Backend Test Suites:** 14 passed (14/14)
+- **Individual Tests:** 183 passed (183/183, 0 failures, 0 skips)
+- **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
+- **Frontend Production Build:** Next.js 16.4.0 Turbopack `next build` clean (0 errors)
+
+
 

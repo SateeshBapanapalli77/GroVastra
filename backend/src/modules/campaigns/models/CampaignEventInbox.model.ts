@@ -18,6 +18,7 @@ export interface ICampaignEventInbox extends Document {
   processedAt?: Date | null;
   errorMessage?: string | null;
   retryCount?: number;
+  nextAttemptAt?: Date | null;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -43,7 +44,8 @@ const CampaignEventInboxSchema = new Schema<ICampaignEventInbox>(
     },
     processedAt: { type: Date, default: null },
     errorMessage: { type: String, default: null },
-    retryCount: { type: Number, default: 0 }
+    retryCount: { type: Number, default: 0 },
+    nextAttemptAt: { type: Date, default: null }
   },
   {
     timestamps: true,
@@ -57,6 +59,7 @@ CampaignEventInboxSchema.index(
   { unique: true }
 );
 
+CampaignEventInboxSchema.index({ tenantId: 1, status: 1, nextAttemptAt: 1, receivedAt: 1 });
 CampaignEventInboxSchema.index({ tenantId: 1, status: 1, receivedAt: 1 });
 
 export const CampaignEventInboxModel = mongoose.model<ICampaignEventInbox>(

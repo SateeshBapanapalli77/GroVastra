@@ -648,13 +648,16 @@ export async function processClaimedExecution(
             status,
             providerTimestamp,
             errorCode,
-            errorReason
+            errorReason,
+            inboxEventId: earlyEvent.id
           });
 
-          // Mark early event processed and correlated to executionId
+          // Mark early event processed and correlated to executionId (Review 7 recovery)
           earlyEvent.status = 'PROCESSED';
           earlyEvent.entityId = executionId;
           earlyEvent.processedAt = new Date();
+          earlyEvent.nextAttemptAt = null;
+          earlyEvent.errorMessage = null;
           await earlyEvent.save();
         }
       }

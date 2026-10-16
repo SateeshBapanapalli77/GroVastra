@@ -111,6 +111,7 @@ export async function reconcileDeliveryStatus(
             status: 'PROCESSED',
             entityId: execution.id,
             processedAt: new Date(),
+            nextAttemptAt: null,
             errorMessage: null
           }
         }
