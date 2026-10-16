@@ -201,7 +201,8 @@ export async function processNextPendingEvent(
             providerTimestamp: event.occurredAt || new Date(),
             errorCode: errorCode || 'PROVIDER_DELIVERY_FAILED',
             errorReason: errorReason || 'PROVIDER_DELIVERY_FAILED',
-            inboxEventId: event.id
+            inboxEventId: event.id,
+            claimToken
           });
           if (!reconResult.reconciled) {
             await CampaignEventInboxModel.updateOne(
@@ -224,6 +225,13 @@ export async function processNextPendingEvent(
             return event;
           }
           event.entityId = intent.executionId;
+          event.status = 'PROCESSED';
+          event.processedAt = new Date();
+          event.nextAttemptAt = null;
+          event.errorMessage = null;
+
+          logger.info({ eventId: event.eventId, type: event.type }, 'Successfully processed domain event via delivery reconciliation');
+          return event;
         } else {
           // Intent not yet available (early webhook delivered before provider message ID persisted)
           const retries = (event.retryCount || 0) + 1;
@@ -302,8 +310,8 @@ export async function processNextPendingEvent(
       await eventDef.evaluator(event);
     }
 
-    // Atomically mark PROCESSED (safe against stale claim overwrites)
-    await CampaignEventInboxModel.updateOne(
+    // Atomically mark PROCESSED (strictly fenced by claimToken)
+    const procRes = await CampaignEventInboxModel.updateOne(
       { id: event.id, tenantId, claimToken },
       {
         $set: {
@@ -317,6 +325,14 @@ export async function processNextPendingEvent(
       }
     );
 
+    if (procRes.matchedCount === 0) {
+      logger.warn(
+        { eventId: event.eventId, claimToken, tenantId },
+        'Lease expired or reclaimed by another worker; stale worker completion write rejected'
+      );
+      return null;
+    }
+
     event.status = 'PROCESSED';
     event.processedAt = new Date();
     event.nextAttemptAt = null;
@@ -325,9 +341,9 @@ export async function processNextPendingEvent(
     logger.info({ eventId: event.eventId, type: event.type }, 'Successfully processed domain event');
   } catch (err: any) {
     logger.error({ err, eventId: event.eventId }, 'Error processing domain event');
-    // Ensure failure never overwrites an already PROCESSED event
-    await CampaignEventInboxModel.updateOne(
-      { id: event.id, tenantId, status: { $ne: 'PROCESSED' } },
+    // Ensure failure never overwrites an active claim from another worker or an already PROCESSED event
+    const failRes = await CampaignEventInboxModel.updateOne(
+      { id: event.id, tenantId, claimToken, status: { $ne: 'PROCESSED' } },
       {
         $set: {
           status: 'FAILED',
@@ -339,6 +355,15 @@ export async function processNextPendingEvent(
         $inc: { retryCount: 1 }
       }
     );
+
+    if (failRes.matchedCount === 0) {
+      logger.warn(
+        { eventId: event.eventId, claimToken, tenantId },
+        'Lease expired or reclaimed by another worker; stale worker failure write rejected'
+      );
+      return null;
+    }
+
     event.status = 'FAILED';
     event.errorMessage = err.message || 'Unknown processing error';
     event.retryCount = (event.retryCount || 0) + 1;

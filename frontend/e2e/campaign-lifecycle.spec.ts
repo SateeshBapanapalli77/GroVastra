@@ -512,7 +512,7 @@ test.describe('GroVastra Auto Campaigns — Phase 6 E2E Verification', () => {
     await page.goto('/campaigns/cmp_e2e_test_001?tab=enrollments');
 
     // Assert "Held for staff" indicator
-    await expect(page.locator('text=Held for staff')).toBeVisible();
+    await expect(page.locator('span:has-text("Held for staff")').first()).toBeVisible();
 
     // Click Resolve Hold
     await page.click('button:has-text("Resolve Hold")');

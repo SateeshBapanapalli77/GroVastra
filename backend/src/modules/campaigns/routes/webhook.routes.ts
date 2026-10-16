@@ -225,19 +225,24 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
               }
 
               // Atomically claim the inbox event to coordinate between webhook HTTP retries and background workers (Requirement 5)
+              const now = new Date();
               const claimToken = generateId('claim');
               const claimedDoc = await CampaignEventInboxModel.findOneAndUpdate(
                 {
                   id: inboxDoc.id,
                   tenantId,
-                  status: { $in: ['RECEIVED', 'FAILED'] }
+                  $or: [
+                    { status: { $in: ['RECEIVED', 'FAILED'] } },
+                    { status: 'PROCESSING', claimedUntil: { $lte: now } },
+                    { status: 'PROCESSING', claimedUntil: null, updatedAt: { $lte: new Date(Date.now() - 60000) } }
+                  ]
                 },
                 {
                   $set: {
                     status: 'PROCESSING',
                     claimToken,
                     claimedUntil: new Date(Date.now() + 60000),
-                    updatedAt: new Date()
+                    updatedAt: now
                   }
                 },
                 { new: true }
@@ -260,13 +265,14 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     providerTimestamp,
                     errorCode: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED',
                     errorReason: statusObj.errors?.[0]?.title || statusObj.errors?.[0]?.message || 'PROVIDER_DELIVERY_FAILED',
-                    inboxEventId: claimedDoc.id
+                    inboxEventId: claimedDoc.id,
+                    claimToken
                   });
 
                   if (!reconResult.reconciled) {
-                    // Guard against overwriting an already PROCESSED state (Requirement 6)
+                    // Guard against overwriting an already PROCESSED state or losing lease (Requirement 6)
                     await CampaignEventInboxModel.updateOne(
-                      { id: claimedDoc.id, tenantId, status: { $ne: 'PROCESSED' } },
+                      { id: claimedDoc.id, tenantId, claimToken, status: { $ne: 'PROCESSED' } },
                       {
                         $set: {
                           status: 'FAILED',
@@ -294,7 +300,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 } catch (reconErr: any) {
                   // Guard against overwriting an already PROCESSED state on late error (Requirement 6)
                   await CampaignEventInboxModel.updateOne(
-                    { id: claimedDoc.id, tenantId, status: { $ne: 'PROCESSED' } },
+                    { id: claimedDoc.id, tenantId, claimToken, status: { $ne: 'PROCESSED' } },
                     {
                       $set: {
                         status: 'FAILED',
@@ -316,7 +322,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
               } else {
                 // Durably reset to RECEIVED with backoff nextAttemptAt; leave recoverable
                 await CampaignEventInboxModel.updateOne(
-                  { id: claimedDoc.id, tenantId, status: { $ne: 'PROCESSED' } },
+                  { id: claimedDoc.id, tenantId, claimToken, status: { $ne: 'PROCESSED' } },
                   {
                     $set: {
                       status: 'RECEIVED',

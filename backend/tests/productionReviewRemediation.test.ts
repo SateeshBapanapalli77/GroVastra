@@ -680,5 +680,207 @@ describe('Production Readiness Review Remediation & Verification Suite', () => {
       expect(exeBAfter?.state).toBe('DISPATCHING');
       expect(intentBAfter?.state).toBe('ACCEPTED');
     });
+
+    it('strictly fences event worker updates by claimToken so stale workers cannot overwrite active claims or fail active leases', async () => {
+      const inboxId = 'inbox_fence_' + Date.now();
+      const eventId = 'evt_fence_' + Date.now();
+
+      // Create an inbox event
+      await CampaignEventInboxModel.create({
+        id: inboxId,
+        tenantId: tenantA,
+        producer: 'crm',
+        eventId,
+        type: 'CUSTOMER_CREATED',
+        entityId: 'cus_fence_1',
+        entityVersion: 1,
+        occurredAt: new Date(),
+        receivedAt: new Date(),
+        status: 'RECEIVED',
+        retryCount: 0
+      });
+
+      // Worker A claims the event
+      const tokenA = 'token_worker_A_' + Date.now();
+      await CampaignEventInboxModel.updateOne(
+        { id: inboxId, tenantId: tenantA },
+        { $set: { status: 'PROCESSING', claimToken: tokenA, claimedUntil: new Date(Date.now() - 1000) } }
+      );
+
+      // Worker A's lease has expired. Worker B reclaims it atomically.
+      const tokenB = 'token_worker_B_' + Date.now();
+      const reclaimedByB = await CampaignEventInboxModel.findOneAndUpdate(
+        {
+          id: inboxId,
+          tenantId: tenantA,
+          $or: [
+            { status: { $in: ['RECEIVED', 'FAILED'] } },
+            { status: 'PROCESSING', claimedUntil: { $lte: new Date() } }
+          ]
+        },
+        {
+          $set: {
+            status: 'PROCESSING',
+            claimToken: tokenB,
+            claimedUntil: new Date(Date.now() + 60000)
+          }
+        },
+        { new: true }
+      );
+      expect(reclaimedByB).not.toBeNull();
+      expect(reclaimedByB?.claimToken).toBe(tokenB);
+
+      // Worker A finishes late and attempts completion update with tokenA
+      const staleCompletionRes = await CampaignEventInboxModel.updateOne(
+        { id: inboxId, tenantId: tenantA, claimToken: tokenA },
+        {
+          $set: {
+            status: 'PROCESSED',
+            processedAt: new Date(),
+            claimToken: null,
+            claimedUntil: null
+          }
+        }
+      );
+      // Fencing check: Stale worker A matches 0 records
+      expect(staleCompletionRes.matchedCount).toBe(0);
+
+      // Worker A encounters an error late and attempts failure update with tokenA
+      const staleFailureRes = await CampaignEventInboxModel.updateOne(
+        { id: inboxId, tenantId: tenantA, claimToken: tokenA, status: { $ne: 'PROCESSED' } },
+        {
+          $set: {
+            status: 'FAILED',
+            errorMessage: 'Stale error',
+            claimToken: null,
+            claimedUntil: null
+          },
+          $inc: { retryCount: 1 }
+        }
+      );
+      // Fencing check: Stale worker A matches 0 records
+      expect(staleFailureRes.matchedCount).toBe(0);
+
+      // Confirm Worker B's active processing lease was fully preserved in DB
+      const currentDoc = await CampaignEventInboxModel.findOne({ id: inboxId, tenantId: tenantA });
+      expect(currentDoc?.status).toBe('PROCESSING');
+      expect(currentDoc?.claimToken).toBe(tokenB);
+      expect(currentDoc?.retryCount).toBe(0);
+    });
+
+    it('allows webhook to atomically reclaim expired PROCESSING leases and advance delivery reconciliation', async () => {
+      const phoneId = 'phone_reclaim_' + Date.now();
+      const providerMsgId = 'msg_reclaim_' + Date.now();
+      const now = new Date();
+
+      // Configure tenant connection
+      await TenantConnectionModel.create({
+        id: generateId('conn'),
+        tenantId: tenantA,
+        connectionId: 'conn_rec_' + Date.now(),
+        provider: 'whatsapp_cloud',
+        status: 'ACTIVE',
+        metadata: { phoneNumberId: phoneId }
+      });
+
+      // Configure execution and delivery intent
+      const execution = await CampaignExecutionModel.create({
+        id: 'exe_rec_' + Date.now(),
+        tenantId: tenantA,
+        enrollmentId: 'enr_rec_' + Date.now(),
+        campaignId: 'cmp_rec_' + Date.now(),
+        stepId: 'step_announce',
+        dueAt: now,
+        expiresAt: new Date(now.getTime() + 3600000),
+        localDate: '2026-10-16',
+        localTime: '10:00',
+        timezone: 'Asia/Kolkata',
+        priority: 50,
+        planRevision: 1,
+        claimVersion: 1,
+        state: 'DISPATCHING'
+      });
+
+      await CampaignDeliveryIntentModel.create({
+        id: 'intent_rec_' + Date.now(),
+        tenantId: tenantA,
+        executionId: execution.id,
+        deliveryKey: execution.id,
+        connectionId: 'conn_rec_sandbox',
+        customerId: 'cus_rec_1',
+        recipientVersion: 1,
+        encryptedRecipient: 'enc_rec_recip',
+        payloadHash: 'hash_rec',
+        templateRef: { id: 'tpl_holiday_offer', revision: 2, language: 'en' },
+        state: 'ACCEPTED',
+        attemptId: 'att_rec_1',
+        providerMessageId: providerMsgId
+      });
+
+      // Insert an event inbox item previously stuck in PROCESSING with an EXPIRED lease
+      const timestampStr = Math.floor(now.getTime() / 1000).toString();
+      const statusEventKey = `${providerMsgId}_delivered_${timestampStr}`;
+      const inboxId = 'inbox_rec_' + Date.now();
+      await CampaignEventInboxModel.create({
+        id: inboxId,
+        tenantId: tenantA,
+        producer: 'whatsapp_status_webhook',
+        eventId: statusEventKey,
+        type: 'whatsapp.status.delivered',
+        entityId: execution.id,
+        entityVersion: 1,
+        occurredAt: new Date(Date.now() - 120000),
+        receivedAt: new Date(Date.now() - 120000),
+        status: 'PROCESSING',
+        claimToken: 'stale_expired_token_123',
+        claimedUntil: new Date(Date.now() - 30000), // Expired 30 seconds ago
+        retryCount: 0
+      });
+
+      // Webhook payload arrives for the same event
+      const webhookSecret = env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
+      const payload = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            id: 'waba_rec',
+            changes: [
+              {
+                field: 'messages',
+                value: {
+                  messaging_product: 'whatsapp',
+                  metadata: { phone_number_id: phoneId },
+                  statuses: [{ id: providerMsgId, status: 'delivered', timestamp: timestampStr }]
+                }
+              }
+            ]
+          }
+        ]
+      };
+      const rawBody = JSON.stringify(payload);
+      const signature = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+
+      const res = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', 'x-hub-signature-256': signature },
+        body: rawBody
+      });
+
+      expect(res.status).toBe(200);
+
+      // Verify inbox item was atomically reclaimed and transitioned to PROCESSED
+      const updatedInbox = await CampaignEventInboxModel.findOne({ id: inboxId, tenantId: tenantA });
+      expect(updatedInbox?.status).toBe('PROCESSED');
+      expect(updatedInbox?.claimToken).toBeNull();
+      expect(updatedInbox?.claimedUntil).toBeNull();
+
+      // Verify delivery intent was reconciled to DELIVERED
+      const updatedIntent = await CampaignDeliveryIntentModel.findOne({ providerMessageId: providerMsgId, tenantId: tenantA });
+      expect(updatedIntent?.state).toBe('DELIVERED');
+
+      // Verify execution state advanced to DELIVERED
+      const updatedExecution = await CampaignExecutionModel.findOne({ id: execution.id, tenantId: tenantA });
+      expect(updatedExecution?.state).toBe('DELIVERED');
+    });
   });
 });

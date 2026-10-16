@@ -15,6 +15,7 @@ export interface ReconcileDeliveryStatusParams {
   errorReason?: string;
   existingSession?: ClientSession;
   inboxEventId?: string;
+  claimToken?: string;
 }
 
 export interface ReconcileDeliveryStatusResult {
@@ -43,7 +44,7 @@ export interface ReconcileDeliveryStatusResult {
  * 7. Durable Webhook Inbox Lifecycle: If an inboxEventId is provided, the inbox event is atomically
  *    marked PROCESSED inside the exact same transaction committing the delivery state transition.
  */
-export async function reconcileDeliveryStatus(
+async function reconcileDeliveryStatusAttempt(
   params: ReconcileDeliveryStatusParams
 ): Promise<ReconcileDeliveryStatusResult> {
   const {
@@ -54,7 +55,8 @@ export async function reconcileDeliveryStatus(
     errorCode,
     errorReason,
     existingSession,
-    inboxEventId
+    inboxEventId,
+    claimToken
   } = params;
 
   const session = existingSession || (await mongoose.startSession());
@@ -104,18 +106,28 @@ export async function reconcileDeliveryStatus(
 
     const markInboxProcessed = async () => {
       if (!inboxEventId) return;
-      await CampaignEventInboxModel.updateOne(
-        { id: inboxEventId },
+      const filter: any = { id: inboxEventId, tenantId: intent.tenantId };
+      if (claimToken) {
+        filter.claimToken = claimToken;
+      }
+      const res = await CampaignEventInboxModel.updateOne(
+        filter,
         {
           $set: {
             status: 'PROCESSED',
             entityId: execution.id,
             processedAt: new Date(),
             nextAttemptAt: null,
-            errorMessage: null
+            errorMessage: null,
+            claimToken: null,
+            claimedUntil: null
           }
         }
       ).session(session);
+
+      if (claimToken && res.matchedCount === 0) {
+        throw new Error(`LEASE_LOST: Inbox event ${inboxEventId} claim token was expired or reclaimed by another worker`);
+      }
     };
 
     const commitAndReturn = async (result: ReconcileDeliveryStatusResult): Promise<ReconcileDeliveryStatusResult> => {
@@ -364,4 +376,39 @@ export async function reconcileDeliveryStatus(
       await session.endSession();
     }
   }
+}
+
+/**
+ * Resilient exported wrapper for delivery status reconciliation with automatic retries on transient transaction conflicts
+ */
+export async function reconcileDeliveryStatus(
+  params: ReconcileDeliveryStatusParams
+): Promise<ReconcileDeliveryStatusResult> {
+  const maxRetries = params.existingSession ? 1 : 3;
+  let lastError: any = null;
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return await reconcileDeliveryStatusAttempt(params);
+    } catch (err: any) {
+      lastError = err;
+      const isTransient =
+        err?.errorLabels?.has?.('TransientTransactionError') ||
+        (Array.isArray(err?.errorResponse?.errorLabels) && err.errorResponse.errorLabels.includes('TransientTransactionError')) ||
+        err?.code === 112 ||
+        err?.codeName === 'WriteConflict' ||
+        (typeof err?.message === 'string' && (err.message.includes('catalog changes') || err.message.includes('TransientTransactionError')));
+
+      if (isTransient && attempt < maxRetries) {
+        logger.warn(
+          { attempt, providerMessageId: params.providerMessageId, err: err.message },
+          'Transient transaction error in reconcileDeliveryStatus; retrying'
+        );
+        await new Promise((r) => setTimeout(r, 60 * attempt));
+        continue;
+      }
+      throw err;
+    }
+  }
+  throw lastError;
 }
