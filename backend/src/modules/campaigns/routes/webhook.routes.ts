@@ -220,20 +220,6 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                         $inc: { retryCount: 1 }
                       }
                     );
-                  } else {
-                    // Fallback ensure PROCESSED state if reconciliation was non-transactional
-                    await CampaignEventInboxModel.updateOne(
-                      { id: inboxDoc.id, status: { $ne: 'PROCESSED' } },
-                      {
-                        $set: {
-                          status: 'PROCESSED',
-                          entityId: intent.executionId,
-                          processedAt: new Date(),
-                          nextAttemptAt: null,
-                          errorMessage: null
-                        }
-                      }
-                    );
                   }
 
                   logger.info(
@@ -356,25 +342,84 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
       const resolvedTenantId = (req as any).tenantId || connectionTenantId;
       if (!resolvedTenantId) {
         logger.warn({ providerMessageId }, 'Flat status webhook rejected: missing or unresolvable tenant context (fail-closed)');
-      } else {
-        const intent = await CampaignDeliveryIntentModel.findOne({
+        return res.status(401).json({ success: false, error: 'Unauthorized: missing or unmapped connection tenant context' });
+      }
+
+      // Strictly tenant-scoped delivery intent lookup (no cross-tenant intent matching)
+      const intent = await CampaignDeliveryIntentModel.findOne({
+        providerMessageId,
+        tenantId: resolvedTenantId
+      });
+
+      if (!intent) {
+        logger.warn({ providerMessageId, tenantId: resolvedTenantId }, 'Flat status webhook dropped: no delivery intent matching providerMessageId for connection tenant (fail-closed)');
+        return res.status(404).json({ success: false, error: 'No delivery intent found for providerMessageId and connection tenant' });
+      }
+
+      // Route through durable inbox lifecycle & unified transactional reconciliation
+      const statusEventKey = `flat_${providerMessageId}_${status}_${Date.now()}`;
+      const inboxDoc = await CampaignEventInboxModel.create({
+        id: generateId('evt'),
+        tenantId: resolvedTenantId,
+        producer: 'whatsapp_status_webhook',
+        eventId: statusEventKey,
+        type: `whatsapp.status.${status}`,
+        entityId: intent.executionId,
+        entityVersion: 1,
+        occurredAt: new Date(),
+        receivedAt: new Date(),
+        data: {
           providerMessageId,
-          tenantId: resolvedTenantId
+          status,
+          errorCode: body.errorCode,
+          errorReason: body.errorReason
+        },
+        status: 'RECEIVED',
+        nextAttemptAt: null,
+        processedAt: null,
+        errorMessage: null
+      });
+
+      try {
+        const reconResult = await deliveryRecon.reconcileDeliveryStatus({
+          tenantId: resolvedTenantId,
+          providerMessageId,
+          status: status as 'delivered' | 'read' | 'failed',
+          providerTimestamp: new Date(),
+          errorCode: body.errorCode || 'PROVIDER_DELIVERY_FAILED',
+          errorReason: body.errorReason || 'PROVIDER_DELIVERY_FAILED',
+          inboxEventId: inboxDoc.id
         });
 
-        if (intent) {
-          await deliveryRecon.reconcileDeliveryStatus({
-            tenantId: resolvedTenantId,
-            providerMessageId,
-            status: status as 'delivered' | 'read' | 'failed',
-            providerTimestamp: new Date(),
-            errorCode: body.errorCode,
-            errorReason: body.errorReason
-          });
-          logger.info({ providerMessageId, status, tenantId: resolvedTenantId }, 'Reconciled flat delivery intent & execution status via unified policy');
-        } else {
-          logger.warn({ providerMessageId, tenantId: resolvedTenantId }, 'Flat webhook dropped: no delivery intent matching providerMessageId for tenant');
+        if (!reconResult.reconciled) {
+          await CampaignEventInboxModel.updateOne(
+            { id: inboxDoc.id },
+            {
+              $set: {
+                status: 'FAILED',
+                errorMessage: reconResult.details,
+                updatedAt: new Date()
+              },
+              $inc: { retryCount: 1 }
+            }
+          );
         }
+
+        logger.info({ providerMessageId, status, tenantId: resolvedTenantId, inboxId: inboxDoc.id }, 'Reconciled flat delivery intent & execution status via unified policy');
+      } catch (reconErr: any) {
+        await CampaignEventInboxModel.updateOne(
+          { id: inboxDoc.id },
+          {
+            $set: {
+              status: 'FAILED',
+              errorMessage: reconErr?.message || 'Reconciliation failed',
+              nextAttemptAt: null,
+              updatedAt: new Date()
+            },
+            $inc: { retryCount: 1 }
+          }
+        );
+        throw reconErr;
       }
     }
 

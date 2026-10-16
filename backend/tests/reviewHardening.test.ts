@@ -2172,4 +2172,272 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     expect(exeLateUpdated?.state).toBe('DELIVERED');
     expect(intentLateUpdated?.state).toBe('DELIVERED');
   });
+
+  it('Review 8 — P1: Normal Meta delivered webhook routes through transactional reconciliation; transaction failure leaves inbox event FAILED (not PROCESSED) and records unmutated', async () => {
+    const testTenant = 'audit_tenant_r8_tx_' + Date.now();
+    const phoneNumberId = 'phone_num_meta_r8_' + Date.now();
+    const providerMessageId = 'wam_r8_atomic_' + Date.now();
+    const now = new Date();
+
+    // 1. Provision active connection mapped to Meta phone number ID
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: testTenant,
+      connectionId: 'conn_r8_' + Date.now(),
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE',
+      metadata: { phoneNumberId }
+    });
+
+    // 2. Seed CampaignExecution and paired CampaignDeliveryIntent
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_r8_atomic_' + Date.now(),
+      tenantId: testTenant,
+      enrollmentId: 'enr_r8_1',
+      campaignId: 'cmp_r8_1',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DISPATCHING',
+      outcomeReason: null,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_r8_atomic_' + Date.now(),
+      tenantId: testTenant,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_r8',
+      customerId: 'cus_r8_1',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_r8',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_r8',
+      providerMessageId,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // 3. Construct standard Meta delivered status webhook
+    const webhookSecret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
+    const timestampStr = Math.floor(now.getTime() / 1000).toString();
+    const payload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'waba_r8_test',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: { phone_number_id: phoneNumberId },
+                statuses: [{ id: providerMessageId, status: 'delivered', timestamp: timestampStr }]
+              }
+            }
+          ]
+        }
+      ]
+    };
+    const rawBody = JSON.stringify(payload);
+    const signature = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+
+    // 4. Force reconciliation transaction to fail
+    const reconSpy = vi.spyOn(deliveryRecon, 'reconcileDeliveryStatus').mockImplementation(async () => {
+      throw new Error('Simulated transaction commit failure in reconciliation service');
+    });
+
+    try {
+      const res = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-hub-signature-256': signature
+        },
+        body: rawBody
+      });
+      expect(res.status).toBe(500);
+
+      // Verify inbox event was NOT marked PROCESSED (recorded as FAILED with error)
+      const statusEventKey = `${providerMessageId}_delivered_${timestampStr}`;
+      const inboxDoc = await CampaignEventInboxModel.findOne({
+        tenantId: testTenant,
+        eventId: statusEventKey
+      });
+      expect(inboxDoc).not.toBeNull();
+      expect(inboxDoc?.status).toBe('FAILED');
+      expect(inboxDoc?.errorMessage).toContain('Simulated transaction commit failure');
+      expect(inboxDoc?.processedAt).toBeNull();
+
+      // Verify domain records were NOT partially updated (atomicity guaranteed)
+      const exeAfter = await CampaignExecutionModel.findOne({ id: exe.id, tenantId: testTenant });
+      const intentAfter = await CampaignDeliveryIntentModel.findOne({ id: intent.id, tenantId: testTenant });
+
+      expect(exeAfter?.state).toBe('DISPATCHING');
+      expect(exeAfter?.deliveredAt).toBeNull();
+      expect(intentAfter?.state).toBe('ACCEPTED');
+      expect(intentAfter?.deliveredAt).toBeNull();
+    } finally {
+      reconSpy.mockRestore();
+    }
+  });
+
+  it('Review 8 — P1: Tenant isolation strictly enforced on standard Meta and flat-payload webhook routes; Tenant A connection with Tenant B message ID leaves Tenant B records completely unchanged', async () => {
+    const tenantTarget = 'audit_tenant_r8_target_' + Date.now();
+    const tenantAttacker = 'audit_tenant_r8_attacker_' + Date.now();
+    const now = new Date();
+
+    const providerMsgIdTarget = 'wam_r8_target_msg_' + Date.now();
+    const phoneAttacker = 'phone_attacker_' + Date.now();
+    const connAttackerId = 'conn_attacker_' + Date.now();
+
+    // 1. Provision Tenant Attacker connection
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantAttacker,
+      connectionId: connAttackerId,
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE',
+      metadata: { phoneNumberId: phoneAttacker }
+    });
+
+    // 2. Seed Tenant Target CampaignExecution & CampaignDeliveryIntent
+    const exeTarget = await CampaignExecutionModel.create({
+      id: 'exe_r8_target_' + Date.now(),
+      tenantId: tenantTarget,
+      enrollmentId: 'enr_r8_target',
+      campaignId: 'cmp_r8_target',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DISPATCHING',
+      outcomeReason: null,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intentTarget = await CampaignDeliveryIntentModel.create({
+      id: 'intent_r8_target_' + Date.now(),
+      tenantId: tenantTarget,
+      executionId: exeTarget.id,
+      deliveryKey: exeTarget.id,
+      connectionId: 'conn_target',
+      customerId: 'cus_r8_target',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_r8_target',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_r8_target',
+      providerMessageId: providerMsgIdTarget,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // 3. Attack attempt 1: Standard Meta webhook via Tenant Attacker connection submitting Tenant Target providerMessageId
+    const webhookSecret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
+    const timestampStr = Math.floor(now.getTime() / 1000).toString();
+    const standardPayload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'waba_r8_cross_tenant',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: { phone_number_id: phoneAttacker }, // Belongs to Attacker
+                statuses: [{ id: providerMsgIdTarget, status: 'delivered', timestamp: timestampStr }] // Belongs to Target!
+              }
+            }
+          ]
+        }
+      ]
+    };
+    const standardRaw = JSON.stringify(standardPayload);
+    const standardSig = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(standardRaw).digest('hex');
+
+    const resStandard = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub-signature-256': standardSig
+      },
+      body: standardRaw
+    });
+    expect(resStandard.status).toBe(200);
+
+    // Assert Tenant Target execution and intent remain completely UNTOUCHED
+    let exeTargetCurrent = await CampaignExecutionModel.findOne({ id: exeTarget.id, tenantId: tenantTarget });
+    let intentTargetCurrent = await CampaignDeliveryIntentModel.findOne({ id: intentTarget.id, tenantId: tenantTarget });
+    expect(exeTargetCurrent?.state).toBe('DISPATCHING');
+    expect(exeTargetCurrent?.deliveredAt).toBeNull();
+    expect(intentTargetCurrent?.state).toBe('ACCEPTED');
+    expect(intentTargetCurrent?.deliveredAt).toBeNull();
+
+    // 4. Attack attempt 2: Flat payload presenting Attacker connectionId and Target providerMessageId
+    const flatPayload = {
+      connectionId: connAttackerId, // Belongs to Attacker
+      providerMessageId: providerMsgIdTarget, // Belongs to Target!
+      status: 'read'
+    };
+    const flatRaw = JSON.stringify(flatPayload);
+    const flatSig = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(flatRaw).digest('hex');
+
+    const resFlat = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub-signature-256': flatSig
+      },
+      body: flatRaw
+    });
+    // Fails closed with 404 because intent is not found for Attacker tenant
+    expect([404, 401]).toContain(resFlat.status);
+
+    // Assert Tenant Target records are still completely UNTOUCHED
+    exeTargetCurrent = await CampaignExecutionModel.findOne({ id: exeTarget.id, tenantId: tenantTarget });
+    intentTargetCurrent = await CampaignDeliveryIntentModel.findOne({ id: intentTarget.id, tenantId: tenantTarget });
+    expect(exeTargetCurrent?.state).toBe('DISPATCHING');
+    expect(exeTargetCurrent?.deliveredAt).toBeNull();
+    expect(exeTargetCurrent?.readAt).toBeNull();
+    expect(intentTargetCurrent?.state).toBe('ACCEPTED');
+    expect(intentTargetCurrent?.deliveredAt).toBeNull();
+    expect(intentTargetCurrent?.readAt).toBeNull();
+
+    // 5. Unauthenticated flat payload with no tenant context: fails closed with 401
+    const unauthFlatPayload = {
+      providerMessageId: providerMsgIdTarget,
+      status: 'delivered'
+    };
+    const unauthRaw = JSON.stringify(unauthFlatPayload);
+    const unauthSig = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(unauthRaw).digest('hex');
+
+    const resUnauth = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub-signature-256': unauthSig
+      },
+      body: unauthRaw
+    });
+    expect(resUnauth.status).toBe(401);
+  });
 });
