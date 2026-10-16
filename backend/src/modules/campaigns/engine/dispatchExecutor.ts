@@ -579,13 +579,37 @@ export async function processClaimedExecution(
 
     // 4. Handle Adapter Response & Update States
     if (sendResult.state === 'ACCEPTED') {
-      if (refreshedIntent) {
-        refreshedIntent.state = 'ACCEPTED';
-        refreshedIntent.providerMessageId = sendResult.providerMessageId || null;
-        await refreshedIntent.save();
+      const nowAccepted = new Date();
+
+      // Monotonic progression for delivery intent: only update to ACCEPTED if still in SUBMITTING or OUTCOME_UNKNOWN.
+      // Never overwrite newer terminal delivery states (DELIVERED, READ, REJECTED) if a webhook arrived early!
+      await CampaignDeliveryIntentModel.updateOne(
+        {
+          executionId,
+          tenantId,
+          state: { $in: ['SUBMITTING', 'OUTCOME_UNKNOWN'] }
+        },
+        {
+          $set: {
+            state: 'ACCEPTED',
+            submittedAt: nowAccepted
+          }
+        }
+      );
+
+      // Persist the provider message ID with a conditional update preserving terminal delivery states
+      if (sendResult.providerMessageId) {
+        await CampaignDeliveryIntentModel.updateOne(
+          { executionId, tenantId },
+          {
+            $set: {
+              providerMessageId: sendResult.providerMessageId
+            }
+          }
+        );
       }
 
-      // Monotonic progression: only update to PROVIDER_ACCEPTED if not already DELIVERED or READ (Finding 7)
+      // Monotonic progression for execution: only update to PROVIDER_ACCEPTED if not already DELIVERED or READ (Finding 7)
       await CampaignExecutionModel.findOneAndUpdate(
         { id: executionId, tenantId, state: { $in: ['DISPATCHING', 'OUTCOME_UNKNOWN'] } },
         {
@@ -601,7 +625,7 @@ export async function processClaimedExecution(
       await updateContactReservationStatus(tenantId, customer.phone, executionId, 'ACCEPTED');
       logger.info({ executionId, providerId: sendResult.providerMessageId }, 'Message accepted by provider');
 
-      // Check if a late status event already arrived before response persistence (Test C12, Finding 7)
+      // Check if a late status event already arrived before response persistence (Test C12, Finding 7, Review 3 P2)
       if (sendResult.providerMessageId) {
         const earlyStatus = await CampaignEventInboxModel.findOne({
           tenantId,
@@ -611,15 +635,14 @@ export async function processClaimedExecution(
 
         if (earlyStatus) {
           const isRead = earlyStatus.type === 'whatsapp.status.read';
-          const updateFields: any = {
+          const occurredAt = earlyStatus.occurredAt || new Date();
+          const execUpdateFields: any = {
             state: isRead ? 'READ' : 'DELIVERED'
           };
           if (isRead) {
-            updateFields.readAt = earlyStatus.occurredAt;
-            // Spec p.27: A read event implies delivery without supplying an exact earlier delivery timestamp.
-            // Keep the actual delivery timestamp unknown when only read evidence exists!
+            execUpdateFields.readAt = occurredAt;
           } else {
-            updateFields.deliveredAt = earlyStatus.occurredAt;
+            execUpdateFields.deliveredAt = occurredAt;
           }
 
           await CampaignExecutionModel.updateOne(
@@ -628,17 +651,26 @@ export async function processClaimedExecution(
               tenantId,
               state: isRead ? { $nin: ['READ'] } : { $nin: ['READ', 'DELIVERED'] }
             },
-            { $set: updateFields }
+            { $set: execUpdateFields }
           );
 
-          if (refreshedIntent) {
-            if (isRead) {
-              refreshedIntent.readAt = earlyStatus.occurredAt;
-            } else {
-              refreshedIntent.deliveredAt = earlyStatus.occurredAt;
-            }
-            await refreshedIntent.save();
+          const intentUpdateFields: any = {
+            state: isRead ? 'READ' : 'DELIVERED'
+          };
+          if (isRead) {
+            intentUpdateFields.readAt = occurredAt;
+          } else {
+            intentUpdateFields.deliveredAt = occurredAt;
           }
+
+          await CampaignDeliveryIntentModel.updateOne(
+            {
+              executionId,
+              tenantId,
+              state: isRead ? { $nin: ['READ'] } : { $nin: ['READ', 'DELIVERED'] }
+            },
+            { $set: intentUpdateFields }
+          );
         }
       }
 

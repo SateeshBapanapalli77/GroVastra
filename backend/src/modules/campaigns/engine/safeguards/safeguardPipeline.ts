@@ -113,12 +113,18 @@ export async function executePreflightSafeguards(
   }
 
   // 6. Template Readiness Gate (Spec p.8, p.19, p.27, p.32 test C02, C19)
-  const template = await resolveApprovedTemplate(
-    stepDef.templateRef.id,
-    tenantId,
-    stepDef.templateRef.revision,
-    stepDef.templateRef.language
-  );
+  let template;
+  try {
+    template = await resolveApprovedTemplate(
+      stepDef.templateRef.id,
+      tenantId,
+      stepDef.templateRef.revision,
+      stepDef.templateRef.language
+    );
+  } catch (tmplErr: any) {
+    logger.error({ tmplErr: tmplErr?.message, executionId: execution.id }, 'Template resolution failed closed due to DB error');
+    return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
+  }
   if (!template || template.status === 'PAUSED') {
     return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
   }

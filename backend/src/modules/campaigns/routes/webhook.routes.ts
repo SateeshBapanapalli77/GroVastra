@@ -153,10 +153,27 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
               if (intent) {
                 if (status === 'delivered') {
-                  intent.deliveredAt = providerTimestamp;
-                  await intent.save();
+                  // Monotonically update intent: always persist deliveredAt, but preserve terminal READ state
+                  await CampaignDeliveryIntentModel.updateOne(
+                    { id: intent.id, tenantId: intent.tenantId },
+                    { $set: { deliveredAt: providerTimestamp } }
+                  );
+                  await CampaignDeliveryIntentModel.updateOne(
+                    {
+                      id: intent.id,
+                      tenantId: intent.tenantId,
+                      state: { $nin: ['READ'] }
+                    },
+                    {
+                      $set: { state: 'DELIVERED' }
+                    }
+                  );
 
                   // State monotonic progression: delivered cannot overwrite read, failed, or skipped
+                  await CampaignExecutionModel.updateOne(
+                    { id: intent.executionId, tenantId: intent.tenantId },
+                    { $set: { deliveredAt: providerTimestamp } }
+                  );
                   await CampaignExecutionModel.updateOne(
                     {
                       id: intent.executionId,
@@ -165,16 +182,24 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     },
                     {
                       $set: {
-                        state: 'DELIVERED',
-                        deliveredAt: providerTimestamp
+                        state: 'DELIVERED'
                       }
                     }
                   );
                 } else if (status === 'read') {
-                  intent.readAt = providerTimestamp;
-                  // Spec p.27: Read event implies delivery without supplying an exact earlier delivery timestamp.
-                  // Keep the actual delivery timestamp unknown when only read evidence exists!
-                  await intent.save();
+                  // Monotonically update intent: read is terminal successful state
+                  await CampaignDeliveryIntentModel.updateOne(
+                    {
+                      id: intent.id,
+                      tenantId: intent.tenantId
+                    },
+                    {
+                      $set: {
+                        state: 'READ',
+                        readAt: providerTimestamp
+                      }
+                    }
+                  );
 
                   const updateFields: any = {
                     state: 'READ',
@@ -196,9 +221,19 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     }
                   );
                 } else if (status === 'failed') {
-                  intent.state = 'REJECTED';
-                  intent.errorCode = statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED';
-                  await intent.save();
+                  await CampaignDeliveryIntentModel.updateOne(
+                    {
+                      id: intent.id,
+                      tenantId: intent.tenantId,
+                      state: { $nin: ['READ', 'DELIVERED'] }
+                    },
+                    {
+                      $set: {
+                        state: 'REJECTED',
+                        errorCode: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED'
+                      }
+                    }
+                  );
 
                   await CampaignExecutionModel.updateOne(
                     {
@@ -209,7 +244,7 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     {
                       $set: {
                         state: 'FAILED',
-                        outcomeReason: intent.errorCode
+                        outcomeReason: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED'
                       }
                     }
                   );

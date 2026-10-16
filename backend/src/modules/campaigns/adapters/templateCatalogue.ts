@@ -1,3 +1,12 @@
+import { logger } from '../../../config/logger';
+
+export class TemplateCatalogueUnavailableError extends Error {
+  constructor(message: string, public readonly cause?: any) {
+    super(message);
+    this.name = 'TemplateCatalogueUnavailableError';
+  }
+}
+
 export interface ApprovedTemplate {
   id: string;
   name: string;
@@ -192,9 +201,9 @@ export async function resolveApprovedTemplate(
   revision?: number,
   language?: string
 ): Promise<ApprovedTemplate | null> {
-  try {
-    const { TemplateCatalogModel } = await import('../models/TemplateCatalog.model');
-    if (tenantId) {
+  if (tenantId) {
+    try {
+      const { TemplateCatalogModel } = await import('../models/TemplateCatalog.model');
       const query: any = {
         id: templateId,
         $or: [{ tenantId }, { tenantId: null }]
@@ -231,11 +240,31 @@ export async function resolveApprovedTemplate(
       if (dbCount > 0) {
         return null;
       }
+    } catch (err: any) {
+      const allowStaticFallbackOnDbError =
+        process.env.ALLOW_STATIC_TEMPLATE_FALLBACK === 'true' &&
+        process.env.NODE_ENV !== 'production';
+
+      if (!allowStaticFallbackOnDbError) {
+        logger.error(
+          { err: err?.message, templateId, tenantId },
+          'Template catalogue database error in production/strict mode; failing closed'
+        );
+        throw new TemplateCatalogueUnavailableError(
+          `Template catalogue database error resolving template '${templateId}' for tenant '${tenantId}': ${err?.message || 'Database unavailable'}`,
+          err
+        );
+      }
+
+      logger.warn(
+        { err: err?.message, templateId, tenantId },
+        'Template catalogue database error; falling back to static catalogue (ALLOW_STATIC_TEMPLATE_FALLBACK enabled)'
+      );
     }
-  } catch {
-    // If DB is disconnected or during standalone unit tests, use fallback catalogue
   }
 
+  // Fallback to static catalogue (only permitted when tenantId is not provided, or in dev/test when dbCount is 0,
+  // or explicitly permitted via ALLOW_STATIC_TEMPLATE_FALLBACK on DB error)
   const staticTmpl = APPROVED_TEMPLATES[templateId] || null;
   if (!staticTmpl) return null;
 

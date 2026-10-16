@@ -255,7 +255,7 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
       // Attempting to activate with stale reviewFingerprint must be rejected
       const res = await apiPost(
         `/api/v1/campaigns/${cmp.id}/activate`,
-        { reviewFingerprint: 'fp_valid_original', expectedVersion: 1 },
+        { reviewFingerprint: 'fp_valid_original', expectedVersion: patchRes.body.campaign?.draftVersion || 2 },
         { Authorization: `Bearer ${ownerToken}` }
       );
 

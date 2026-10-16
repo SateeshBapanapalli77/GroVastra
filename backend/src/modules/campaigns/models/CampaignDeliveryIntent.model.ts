@@ -1,6 +1,13 @@
 import mongoose, { Document, Schema } from 'mongoose';
 
-export type DeliveryIntentState = 'SUBMITTING' | 'ACCEPTED' | 'REJECTED' | 'OUTCOME_UNKNOWN';
+export type DeliveryIntentState =
+  | 'SUBMITTING'
+  | 'ACCEPTED'
+  | 'DELIVERED'
+  | 'READ'
+  | 'REJECTED'
+  | 'OUTCOME_UNKNOWN'
+  | 'EXPIRED';
 
 export interface ICampaignDeliveryIntent extends Document {
   id: string;
@@ -49,7 +56,7 @@ const CampaignDeliveryIntentSchema = new Schema<ICampaignDeliveryIntent>(
     state: {
       type: String,
       required: true,
-      enum: ['SUBMITTING', 'ACCEPTED', 'REJECTED', 'OUTCOME_UNKNOWN'],
+      enum: ['SUBMITTING', 'ACCEPTED', 'DELIVERED', 'READ', 'REJECTED', 'OUTCOME_UNKNOWN', 'EXPIRED'],
       default: 'SUBMITTING'
     },
     attemptId: { type: String, required: true },

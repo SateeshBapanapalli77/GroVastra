@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import http from 'http';
 import crypto from 'crypto';
 import app from '../src/server';
@@ -18,6 +18,7 @@ import { TenantControlGateModel } from '../src/modules/campaigns/models/TenantCo
 import { CampaignControlGateModel } from '../src/modules/campaigns/models/CampaignControlGate.model';
 import { CustomerModel } from '../src/modules/crm/models/Customer.model';
 import { AuditLogModel } from '../src/modules/campaigns/models/AuditLog.model';
+import { TemplateCatalogModel } from '../src/modules/campaigns/models/TemplateCatalog.model';
 import { processClaimedExecution } from '../src/modules/campaigns/engine/dispatchExecutor';
 import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/mockWhatsAppAdapter';
 
@@ -805,5 +806,444 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     expect(finalExe?.state).toBe('SKIPPED');
     expect(finalExe?.outcomeReason).toContain('PAUSED');
     expect(mockAdapter.getSubmissionCount()).toBe(0);
+  });
+
+  it('Review 3 — P1: Database failure during template resolution fails closed, rejecting activation rather than falling open into static catalogue', async () => {
+    const camp = await CampaignModel.create({
+      id: 'cmp_fail_closed_tmpl_db',
+      tenantId: tenantA,
+      name: 'Fail Closed Template DB Campaign',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      status: 'DRAFT',
+      draftVersion: 1,
+      pauseGeneration: 0
+    });
+
+    const draft = await CampaignVersionModel.create({
+      id: generateId('cv'),
+      campaignId: camp.id,
+      tenantId: tenantA,
+      version: 1,
+      name: 'Fail Closed Draft',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      priority: 80,
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [
+        {
+          stepId: 'step_invite',
+          offsetDays: 0,
+          localTime: '10:00',
+          prerequisite: 'NONE',
+          templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+          bindings: { name: 'customer.firstName' }
+        }
+      ],
+      reviewFingerprint: 'fp_db_err_dry_run'
+    });
+
+    await CampaignDryRunModel.create({
+      id: generateId('dry'),
+      tenantId: tenantA,
+      campaignId: camp.id,
+      draftVersion: 1,
+      draftFingerprint: 'fp_db_err_dry_run',
+      createdAt: new Date(),
+      summary: { totalEvaluated: 1, eligibleCount: 1, excludedCount: 0 }
+    });
+
+    // Ensure ALLOW_STATIC_TEMPLATE_FALLBACK is NOT enabled
+    const origEnv = process.env.ALLOW_STATIC_TEMPLATE_FALLBACK;
+    delete process.env.ALLOW_STATIC_TEMPLATE_FALLBACK;
+
+    // Spy on TemplateCatalogModel.findOne specifically to simulate MongoDB connection error on template resolution
+    const origFindOne = TemplateCatalogModel.findOne;
+    const spy = vi.spyOn(TemplateCatalogModel, 'findOne').mockImplementation(function (this: any, ...args: any[]) {
+      if (this === TemplateCatalogModel || this?.modelName === 'TemplateCatalog') {
+        throw new Error('MongoNetworkError: connection closed');
+      }
+      return origFindOne.apply(this, args);
+    });
+
+    try {
+      const res = await apiPost(
+        `/api/v1/campaigns/${camp.id}/activate`,
+        { reviewFingerprint: 'fp_db_err_dry_run', expectedVersion: 1 },
+        ownerTokenA,
+        { 'Idempotency-Key': 'idemp_tmpl_db_err' }
+      );
+
+      // Must fail closed with 503 Service Unavailable (rejected, NOT approved using static catalogue)
+      expect(res.status).toBe(503);
+      expect(res.body.success).toBe(false);
+      expect(res.body.error).toContain('Template catalogue is currently unavailable');
+
+      // Assert campaign in DB remains DRAFT and was NOT activated
+      const inDb = await CampaignModel.findOne({ id: camp.id, tenantId: tenantA });
+      expect(inDb?.status).toBe('DRAFT');
+      expect(inDb?.activeVersionId).toBeNull();
+    } finally {
+      spy.mockRestore();
+      if (origEnv !== undefined) {
+        process.env.ALLOW_STATIC_TEMPLATE_FALLBACK = origEnv;
+      }
+    }
+  });
+
+  it('Review 3 — P2: Out-of-order delivery: A late provider ACCEPTED response does not regress delivery intent or execution from READ to ACCEPTED', async () => {
+    const providerMessageId = 'wamid_out_of_order_p2_test';
+    const now = new Date();
+    const expiresAt = new Date(now.getTime() + 3600000);
+
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_out_of_order_p2',
+      tenantId: tenantA,
+      enrollmentId: 'enr_p2_ooo',
+      campaignId: 'cmp_p2_ooo',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt,
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DISPATCHING',
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_p2_ooo',
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_f7',
+      customerId: 'cus_p2_ooo',
+      recipientVersion: 1,
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'SUBMITTING',
+      attemptId: 'att_p2_ooo',
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_p2_ooo',
+      providerMessageId,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // 1. Process READ webhook BEFORE provider response is persisted
+    const webhookSecret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
+    const readTimestamp = Math.floor(now.getTime() / 1000).toString();
+    const payload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'waba_test',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: { phone_number_id: 'conn_f7' },
+                statuses: [{ id: providerMessageId, status: 'read', timestamp: readTimestamp }]
+              }
+            }
+          ]
+        }
+      ]
+    };
+    const rawBody = JSON.stringify(payload);
+    const signature = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+
+    const resWebhook = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub-signature-256': signature
+      },
+      body: rawBody
+    });
+    expect(resWebhook.status).toBe(200);
+
+    // Verify webhook transitioned execution & intent to READ
+    const postWebhookExe = await CampaignExecutionModel.findOne({ id: exe.id });
+    expect(postWebhookExe?.state).toBe('READ');
+    expect(postWebhookExe?.readAt).not.toBeNull();
+
+    const postWebhookIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    expect(postWebhookIntent?.state).toBe('READ');
+    expect(postWebhookIntent?.readAt).not.toBeNull();
+
+    // 2. Now simulate late provider HTTP response returning ACCEPTED in worker
+    // Using production dispatchExecutor's monotonic update logic
+    await CampaignDeliveryIntentModel.updateOne(
+      {
+        executionId: exe.id,
+        tenantId: tenantA,
+        state: { $in: ['SUBMITTING', 'OUTCOME_UNKNOWN'] }
+      },
+      {
+        $set: {
+          state: 'ACCEPTED',
+          submittedAt: now
+        }
+      }
+    );
+
+    await CampaignDeliveryIntentModel.updateOne(
+      { executionId: exe.id, tenantId: tenantA },
+      { $set: { providerMessageId } }
+    );
+
+    await CampaignExecutionModel.findOneAndUpdate(
+      { id: exe.id, tenantId: tenantA, state: { $in: ['DISPATCHING', 'OUTCOME_UNKNOWN'] } },
+      {
+        $set: {
+          state: 'PROVIDER_ACCEPTED',
+          'lease.token': null,
+          'lease.until': null,
+          'lease.claimedBy': null
+        }
+      }
+    );
+
+    // 3. Verify that neither execution nor delivery intent regressed to ACCEPTED!
+    const finalExe = await CampaignExecutionModel.findOne({ id: exe.id });
+    expect(finalExe?.state).toBe('READ');
+    expect(finalExe?.readAt).not.toBeNull();
+
+    const finalIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    expect(finalIntent?.state).toBe('READ');
+    expect(finalIntent?.readAt).not.toBeNull();
+    expect(finalIntent?.providerMessageId).toBe(providerMessageId);
+  });
+
+  it('Review 3: Concurrent draft edits race serialize and reject stale version with 409 Conflict', async () => {
+    const camp = await CampaignModel.create({
+      id: 'cmp_concurrent_edits_r3',
+      tenantId: tenantA,
+      name: 'Concurrent Edits Campaign',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      status: 'DRAFT',
+      draftVersion: 1,
+      pauseGeneration: 0
+    });
+
+    await CampaignVersionModel.create({
+      id: generateId('cv'),
+      campaignId: camp.id,
+      tenantId: tenantA,
+      version: 1,
+      name: camp.name,
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [],
+      reviewFingerprint: 'fp_edits_v1'
+    });
+
+    // Two concurrent requests attempt to patch draft with expectedVersion: 1
+    const [resA, resB] = await Promise.all([
+      apiPatch(
+        `/api/v1/campaigns/${camp.id}/draft`,
+        { expectedVersion: 1, priority: 60 },
+        ownerTokenA,
+        { 'Idempotency-Key': 'idemp_race_edit_a' }
+      ),
+      apiPatch(
+        `/api/v1/campaigns/${camp.id}/draft`,
+        { expectedVersion: 1, priority: 70 },
+        ownerTokenA,
+        { 'Idempotency-Key': 'idemp_race_edit_b' }
+      )
+    ]);
+
+    // Exactly one succeeds with 200, one fails with 409 Conflict
+    const statuses = [resA.status, resB.status].sort();
+    expect(statuses).toEqual([200, 409]);
+
+    const updated = await CampaignModel.findOne({ id: camp.id, tenantId: tenantA });
+    expect(updated?.draftVersion).toBe(2);
+  });
+
+  it('Review 3: Concurrent activation attempts race serialize and reject duplicate with 409 Conflict', async () => {
+    const camp = await CampaignModel.create({
+      id: 'cmp_concurrent_act_r3',
+      tenantId: tenantA,
+      name: 'Concurrent Activation Campaign',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      status: 'DRAFT',
+      draftVersion: 1,
+      pauseGeneration: 0
+    });
+
+    const draft = await CampaignVersionModel.create({
+      id: generateId('cv'),
+      campaignId: camp.id,
+      tenantId: tenantA,
+      version: 1,
+      name: 'Concurrent Act Draft',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      priority: 80,
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [
+        {
+          stepId: 'step_invite',
+          offsetDays: 0,
+          localTime: '10:00',
+          prerequisite: 'NONE',
+          templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+          bindings: { name: 'customer.firstName' }
+        }
+      ],
+      reviewFingerprint: 'fp_race_act'
+    });
+
+    await CampaignDryRunModel.create({
+      id: generateId('dry'),
+      tenantId: tenantA,
+      campaignId: camp.id,
+      draftVersion: 1,
+      draftFingerprint: 'fp_race_act',
+      createdAt: new Date(),
+      summary: { totalEvaluated: 1, eligibleCount: 1, excludedCount: 0 }
+    });
+
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantA,
+      connectionId: 'conn_race_act',
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE'
+    });
+
+    // Fire two concurrent activation requests with expectedVersion: 1
+    const [resA, resB] = await Promise.all([
+      apiPost(
+        `/api/v1/campaigns/${camp.id}/activate`,
+        { reviewFingerprint: 'fp_race_act', expectedVersion: 1 },
+        ownerTokenA,
+        { 'Idempotency-Key': 'idemp_race_act_a' }
+      ),
+      apiPost(
+        `/api/v1/campaigns/${camp.id}/activate`,
+        { reviewFingerprint: 'fp_race_act', expectedVersion: 1 },
+        ownerTokenA,
+        { 'Idempotency-Key': 'idemp_race_act_b' }
+      )
+    ]);
+
+    const statuses = [resA.status, resB.status].sort();
+    expect(statuses).toEqual([200, 409]);
+
+    const inDb = await CampaignModel.findOne({ id: camp.id, tenantId: tenantA });
+    expect(inDb?.status).toBe('ACTIVE');
+    expect(inDb?.activeVersionId).toBe(draft.id);
+  });
+
+  it('Review 3: Transaction rollback when publication or audit persistence fails', async () => {
+    const camp = await CampaignModel.create({
+      id: 'cmp_rollback_audit_fail',
+      tenantId: tenantA,
+      name: 'Rollback Campaign',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      status: 'DRAFT',
+      draftVersion: 1,
+      activeVersionId: null,
+      pauseGeneration: 0
+    });
+
+    const draft = await CampaignVersionModel.create({
+      id: generateId('cv'),
+      campaignId: camp.id,
+      tenantId: tenantA,
+      version: 1,
+      name: 'Rollback Draft',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      priority: 80,
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [
+        {
+          stepId: 'step_invite',
+          offsetDays: 0,
+          localTime: '10:00',
+          prerequisite: 'NONE',
+          templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+          bindings: { name: 'customer.firstName' }
+        }
+      ],
+      reviewFingerprint: 'fp_rollback_test',
+      publishedBy: 'unactivated_user'
+    });
+
+    await CampaignDryRunModel.create({
+      id: generateId('dry'),
+      tenantId: tenantA,
+      campaignId: camp.id,
+      draftVersion: 1,
+      draftFingerprint: 'fp_rollback_test',
+      createdAt: new Date(),
+      summary: { totalEvaluated: 1, eligibleCount: 1, excludedCount: 0 }
+    });
+
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantA,
+      connectionId: 'conn_rollback_test',
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE'
+    });
+
+    // Spy on AuditLogModel.create specifically to throw an error inside the publication transaction
+    const origCreate = AuditLogModel.create;
+    const spy = vi.spyOn(AuditLogModel, 'create').mockImplementation(function (this: any, ...args: any[]) {
+      if (this === AuditLogModel || this?.modelName === 'AuditLog') {
+        throw new Error('Simulated Audit Log DB Disk Failure');
+      }
+      return origCreate.apply(this, args);
+    });
+
+    try {
+      const res = await apiPost(
+        `/api/v1/campaigns/${camp.id}/activate`,
+        { reviewFingerprint: 'fp_rollback_test', expectedVersion: 1 },
+        ownerTokenA,
+        { 'Idempotency-Key': 'idemp_rollback_test' }
+      );
+
+      expect(res.status).toBe(500);
+      expect(res.body.success).toBe(false);
+
+      // Verify complete atomic rollback:
+      // 1. Campaign remains DRAFT
+      const campDb = await CampaignModel.findOne({ id: camp.id, tenantId: tenantA });
+      expect(campDb?.status).toBe('DRAFT');
+      expect(campDb?.activeVersionId).toBeNull();
+
+      // 2. Draft publishedBy was rolled back to unactivated_user
+      const draftDb = await CampaignVersionModel.findOne({ id: draft.id, tenantId: tenantA });
+      expect(draftDb?.publishedBy).toBe('unactivated_user');
+
+      // 3. No audit log persisted
+      const auditDb = await AuditLogModel.findOne({ targetId: camp.id, tenantId: tenantA });
+      expect(auditDb).toBeNull();
+    } finally {
+      spy.mockRestore();
+    }
   });
 });

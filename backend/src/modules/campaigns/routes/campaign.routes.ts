@@ -20,6 +20,7 @@ import { generateId } from '../../../shared/utils/id';
 import { maskPhone } from '../../../shared/utils/phone';
 import { requireAuth, requireRole } from '../../../shared/middleware/auth.middleware';
 import { requireIdempotency } from '../../../shared/middleware/idempotency.middleware';
+import { logger } from '../../../config/logger';
 import {
   generateOwnerOverviewReport,
   getCustomerTimeline,
@@ -500,6 +501,7 @@ campaignRouter.patch(
             finalDraft = clonedDraft[0];
           } else {
             // Updating an unpublished draft revision
+            const nextVersion = expectedVersion + 1;
             if (name) {
               draft.name = name;
             }
@@ -508,6 +510,7 @@ campaignRouter.patch(
             if (steps) draft.steps = steps;
             if (priority) draft.priority = priority;
             if (timezone) draft.timezone = timezone;
+            draft.version = nextVersion;
 
             draft.reviewFingerprint = `draft_${Date.now()}`;
             await draft.save({ session });
@@ -516,6 +519,7 @@ campaignRouter.patch(
               { id: campaign.id, tenantId, draftVersion: expectedVersion },
               {
                 $set: {
+                  draftVersion: nextVersion,
                   ...(name ? { name } : {})
                 }
               },
@@ -662,12 +666,23 @@ campaignRouter.post(
 
       // Activation Readiness Checks (Spec A05, Finding 5): Exact approved template ID, revision, and locale
       for (const step of draft.steps || []) {
-        const template = await resolveApprovedTemplate(
-          step.templateRef?.id,
-          tenantId,
-          step.templateRef?.revision,
-          step.templateRef?.language
-        );
+        let template;
+        try {
+          template = await resolveApprovedTemplate(
+            step.templateRef?.id,
+            tenantId,
+            step.templateRef?.revision,
+            step.templateRef?.language
+          );
+        } catch (tmplErr: any) {
+          logger.error({ tmplErr: tmplErr?.message, stepId: step.stepId }, 'Template resolution failed closed due to database error');
+          return res.status(503).json({
+            success: false,
+            error: `Activation failed: Template catalogue is currently unavailable for step '${step.stepId}'.`,
+            fieldPath: `steps.${step.stepId}.templateRef.id`,
+            resolutionOwner: 'INTEGRATION_DEVELOPER'
+          });
+        }
         if (!template || template.status === 'PAUSED') {
           return res.status(422).json({
             success: false,
@@ -704,9 +719,11 @@ campaignRouter.post(
             {
               id: campaign.id,
               tenantId,
+              status: 'DRAFT',
               draftVersion: expectedVersion
             },
             {
+              $inc: { draftVersion: 1 },
               $set: {
                 status: 'ACTIVE',
                 activeVersionId: draft.id,
@@ -997,12 +1014,22 @@ export async function validateCampaignVersionDefinition(version: any, tenantId: 
     });
   } else {
     for (const step of version.steps) {
-      const template = await resolveApprovedTemplate(
-        step.templateRef?.id,
-        tenantId,
-        step.templateRef?.revision,
-        step.templateRef?.language
-      );
+      let template;
+      try {
+        template = await resolveApprovedTemplate(
+          step.templateRef?.id,
+          tenantId,
+          step.templateRef?.revision,
+          step.templateRef?.language
+        );
+      } catch (tmplErr: any) {
+        errors.push({
+          fieldPath: `steps.${step.stepId}.templateRef.id`,
+          message: `Template catalogue is currently unavailable due to database error.`,
+          resolutionOwner: 'INTEGRATION_DEVELOPER'
+        });
+        continue;
+      }
       if (!template) {
         errors.push({
           fieldPath: `steps.${step.stepId}.templateRef.id`,
@@ -1179,12 +1206,21 @@ campaignRouter.post(
 
       // 3. Template Validation (Finding 5)
       for (const step of candidateSteps) {
-        const tpl = await resolveApprovedTemplate(
-          step.templateRef?.id,
-          tenantId,
-          step.templateRef?.revision,
-          step.templateRef?.language
-        );
+        let tpl;
+        try {
+          tpl = await resolveApprovedTemplate(
+            step.templateRef?.id,
+            tenantId,
+            step.templateRef?.revision,
+            step.templateRef?.language
+          );
+        } catch (tmplErr: any) {
+          logger.error({ tmplErr: tmplErr?.message, stepId: step.stepId }, 'Template resolution failed closed due to database error');
+          return res.status(503).json({
+            success: false,
+            error: `Publishing revision failed: Template catalogue is currently unavailable for step '${step.stepId}'.`
+          });
+        }
         if (!tpl || tpl.status === 'PAUSED') {
           return res.status(422).json({
             success: false,
