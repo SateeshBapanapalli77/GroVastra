@@ -12,6 +12,7 @@
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
     "test": "vitest run",
+    "test:ci": "tsc --noEmit && vitest run",
     "seed": "tsx src/scripts/seed.ts"
   },
   "dependencies": {

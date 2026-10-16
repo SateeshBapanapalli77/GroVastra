@@ -1,0 +1,38 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  backend-test:
+    name: Backend Tests & Typecheck
+    runs-on: ubuntu-latest
+
+    defaults:
+      run:
+        working-directory: backend
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run CI tests (typecheck + vitest against MongoMemoryReplSet)
+        run: npm run test:ci
+        env:
+          NODE_ENV: test
+          JWT_SECRET: test_jwt_secret_ci_key_long_enough_1234567890
+          WHATSAPP_APP_SECRET: test_whatsapp_webhook_secret_ci_1234567890
+          DEFAULT_TENANT_ID: default_tenant_ci
