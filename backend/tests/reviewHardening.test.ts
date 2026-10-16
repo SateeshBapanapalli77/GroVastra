@@ -21,6 +21,9 @@ import { AuditLogModel } from '../src/modules/campaigns/models/AuditLog.model';
 import { TemplateCatalogModel } from '../src/modules/campaigns/models/TemplateCatalog.model';
 import { processClaimedExecution } from '../src/modules/campaigns/engine/dispatchExecutor';
 import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/mockWhatsAppAdapter';
+import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
+import { IWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/deliveryAdapter.interface';
+import { reconcileDeliveryStatus } from '../src/modules/campaigns/services/deliveryStatusReconciliation';
 
 describe('Senior Technical Manager Review Hardening Verification', () => {
   const tenantA = 'audit_tenant_a';
@@ -104,7 +107,9 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       TenantControlGateModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
       CampaignControlGateModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
       CustomerModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
-      AuditLogModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } })
+      AuditLogModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
+      CampaignEventInboxModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } }),
+      TemplateCatalogModel.deleteMany({ tenantId: { $regex: /^audit_tenant_/ } })
     ]);
   });
 
@@ -893,16 +898,104 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     }
   });
 
-  it('Review 3 — P2: Out-of-order delivery: A late provider ACCEPTED response does not regress delivery intent or execution from READ to ACCEPTED', async () => {
-    const providerMessageId = 'wamid_out_of_order_p2_test';
+  it('Review 4 — P2: Out-of-order delivery end-to-end: Webhook arrives before provider response, worker runs processClaimedExecution, resolves to READ without regressing to ACCEPTED', async () => {
+    const providerMessageId = 'wamid_r4_e2e_prod_worker';
     const now = new Date();
     const expiresAt = new Date(now.getTime() + 3600000);
 
-    const exe = await CampaignExecutionModel.create({
-      id: 'exe_out_of_order_p2',
+    // 1. Setup Active Connection for tenantA
+    await TenantConnectionModel.create({
+      id: 'conn_r4_e2e',
       tenantId: tenantA,
-      enrollmentId: 'enr_p2_ooo',
-      campaignId: 'cmp_p2_ooo',
+      connectionId: 'phone_num_r4_e2e',
+      status: 'ACTIVE'
+    });
+
+    // 2. Setup Gates and Campaign
+    await TenantControlGateModel.create({
+      id: 'tg_r4_e2e',
+      tenantId: tenantA,
+      globalPause: false,
+      gateVersion: 1
+    });
+
+    await CampaignControlGateModel.create({
+      id: 'cg_r4_e2e',
+      tenantId: tenantA,
+      campaignId: 'cmp_r4_e2e',
+      paused: false,
+      pauseGeneration: 1,
+      gateVersion: 1
+    });
+
+    await CampaignModel.create({
+      id: 'cmp_r4_e2e',
+      tenantId: tenantA,
+      name: 'Review 4 E2E Campaign',
+      industry: 'BOUTIQUE',
+      status: 'ACTIVE',
+      purpose: 'MARKETING',
+      pauseGeneration: 1,
+      draftVersion: 1,
+      activeVersionId: 'ver_r4_e2e'
+    });
+
+    await CampaignVersionModel.create({
+      id: 'ver_r4_e2e',
+      campaignId: 'cmp_r4_e2e',
+      tenantId: tenantA,
+      version: 1,
+      name: 'Review 4 E2E Version',
+      industry: 'BOUTIQUE',
+      purpose: 'MARKETING',
+      priority: 80,
+      trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday', leapDayPolicy: 'FEB_28' },
+      timezone: 'Asia/Kolkata',
+      audience: { mode: 'ALL_ELIGIBLE' },
+      steps: [
+        {
+          stepId: 'step_1',
+          offsetDays: 0,
+          localTime: '10:00',
+          prerequisite: 'NONE',
+          templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+          bindings: { name: 'customer.firstName' }
+        }
+      ],
+      reviewFingerprint: 'fp_r4_e2e'
+    });
+
+    const customer = await CustomerModel.create({
+      id: 'cus_r4_e2e',
+      tenantId: tenantA,
+      firstName: 'Aarav',
+      lastName: 'Sharma',
+      phone: '+919876543210',
+      status: 'ACTIVE',
+      optedInMarketing: true
+    });
+
+    await CampaignEnrollmentModel.create({
+      id: 'enr_r4_e2e',
+      tenantId: tenantA,
+      campaignId: 'cmp_r4_e2e',
+      campaignVersionId: 'ver_r4_e2e',
+      customerId: customer.id,
+      occurrenceId: 'birthday:2026',
+      sourceRef: {
+        type: 'CUSTOMER_DATE',
+        id: customer.id,
+        version: 1
+      },
+      status: 'ACTIVE'
+    });
+
+    // 3. Create execution claimed by worker (EVALUATING state with valid lease)
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_r4_e2e',
+      tenantId: tenantA,
+      enrollmentId: 'enr_r4_e2e',
+      campaignId: 'cmp_r4_e2e',
       stepId: 'step_1',
       dueAt: now,
       expiresAt,
@@ -912,43 +1005,50 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       priority: 80,
       planRevision: 1,
       claimVersion: 1,
-      state: 'DISPATCHING',
+      pauseGeneration: 1,
+      state: 'EVALUATING',
+      lease: {
+        token: 'tok_r4_worker',
+        until: new Date(now.getTime() + 600000),
+        claimedBy: 'worker_r4'
+      },
       deliveredAt: null,
       readAt: null
     });
 
+    // 4. Start with an intent that has NO provider message ID (Review 4 P2 requirement)
     const intent = await CampaignDeliveryIntentModel.create({
-      id: 'intent_p2_ooo',
+      id: 'intent_r4_e2e',
       tenantId: tenantA,
       executionId: exe.id,
       deliveryKey: exe.id,
-      connectionId: 'conn_f7',
-      customerId: 'cus_p2_ooo',
+      connectionId: 'conn_r4_e2e',
+      customerId: customer.id,
       recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_r4_e2e',
       templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
       state: 'SUBMITTING',
-      attemptId: 'att_p2_ooo',
-      encryptedRecipient: 'dummy_enc',
-      payloadHash: 'hash_p2_ooo',
-      providerMessageId,
+      attemptId: 'att_r4_e2e',
+      providerMessageId: null, // NO provider message ID initially!
       deliveredAt: null,
       readAt: null
     });
 
-    // 1. Process READ webhook BEFORE provider response is persisted
+    // 5. Have the webhook arrive FIRST and be durably stored as an uncorrelated event in CampaignEventInboxModel
     const webhookSecret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
     const readTimestamp = Math.floor(now.getTime() / 1000).toString();
     const payload = {
       object: 'whatsapp_business_account',
       entry: [
         {
-          id: 'waba_test',
+          id: 'waba_test_r4',
           changes: [
             {
               field: 'messages',
               value: {
                 messaging_product: 'whatsapp',
-                metadata: { phone_number_id: 'conn_f7' },
+                metadata: { phone_number_id: 'phone_num_r4_e2e' },
                 statuses: [{ id: providerMessageId, status: 'read', timestamp: readTimestamp }]
               }
             }
@@ -969,49 +1069,33 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     });
     expect(resWebhook.status).toBe(200);
 
-    // Verify webhook transitioned execution & intent to READ
-    const postWebhookExe = await CampaignExecutionModel.findOne({ id: exe.id });
-    expect(postWebhookExe?.state).toBe('READ');
-    expect(postWebhookExe?.readAt).not.toBeNull();
+    // Verify the uncorrelated event is durably stored in CampaignEventInboxModel with status RECEIVED
+    const inboxEvent = await CampaignEventInboxModel.findOne({
+      tenantId: tenantA,
+      'data.providerMessageId': providerMessageId
+    });
+    expect(inboxEvent).not.toBeNull();
+    expect(inboxEvent?.status).toBe('RECEIVED');
 
-    const postWebhookIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
-    expect(postWebhookIntent?.state).toBe('READ');
-    expect(postWebhookIntent?.readAt).not.toBeNull();
+    // Intent in DB still has no provider message ID and remains SUBMITTING at this point
+    const preWorkerIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    expect(preWorkerIntent?.providerMessageId).toBeNull();
+    expect(preWorkerIntent?.state).toBe('SUBMITTING');
 
-    // 2. Now simulate late provider HTTP response returning ACCEPTED in worker
-    // Using production dispatchExecutor's monotonic update logic
-    await CampaignDeliveryIntentModel.updateOne(
-      {
-        executionId: exe.id,
-        tenantId: tenantA,
-        state: { $in: ['SUBMITTING', 'OUTCOME_UNKNOWN'] }
-      },
-      {
-        $set: {
-          state: 'ACCEPTED',
-          submittedAt: now
-        }
-      }
-    );
+    // 6. Controlled mock adapter returning ACCEPTED with the provider message ID
+    const mockAdapter: IWhatsAppDeliveryAdapter = {
+      sendCampaignStep: vi.fn().mockResolvedValue({
+        state: 'ACCEPTED',
+        providerMessageId
+      })
+    };
 
-    await CampaignDeliveryIntentModel.updateOne(
-      { executionId: exe.id, tenantId: tenantA },
-      { $set: { providerMessageId } }
-    );
+    // 7. Run the REAL worker production path: processClaimedExecution!
+    const workerResult = await processClaimedExecution(exe.id, mockAdapter, now);
+    expect(workerResult).toBe('ACCEPTED');
+    expect(mockAdapter.sendCampaignStep).toHaveBeenCalledTimes(1);
 
-    await CampaignExecutionModel.findOneAndUpdate(
-      { id: exe.id, tenantId: tenantA, state: { $in: ['DISPATCHING', 'OUTCOME_UNKNOWN'] } },
-      {
-        $set: {
-          state: 'PROVIDER_ACCEPTED',
-          'lease.token': null,
-          'lease.until': null,
-          'lease.claimedBy': null
-        }
-      }
-    );
-
-    // 3. Verify that neither execution nor delivery intent regressed to ACCEPTED!
+    // 8. Assert that BOTH execution and intent end in READ, retain the message ID, and do NOT regress to ACCEPTED
     const finalExe = await CampaignExecutionModel.findOne({ id: exe.id });
     expect(finalExe?.state).toBe('READ');
     expect(finalExe?.readAt).not.toBeNull();
@@ -1020,6 +1104,253 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     expect(finalIntent?.state).toBe('READ');
     expect(finalIntent?.readAt).not.toBeNull();
     expect(finalIntent?.providerMessageId).toBe(providerMessageId);
+
+    // 9. Verify the early inbox event was correlated and marked PROCESSED
+    const postWorkerInboxEvent = await CampaignEventInboxModel.findOne({
+      tenantId: tenantA,
+      'data.providerMessageId': providerMessageId
+    });
+    expect(postWorkerInboxEvent?.status).toBe('PROCESSED');
+    expect(postWorkerInboxEvent?.entityId).toBe(exe.id);
+  });
+
+  it('Review 4 — P1: Webhook consistency: Late DELIVERED or READ on FAILED/REJECTED does not resurrect records', async () => {
+    const providerMessageId = 'wamid_p1_failed_conflict';
+    const now = new Date();
+
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_p1_fail',
+      tenantId: tenantA,
+      enrollmentId: 'enr_p1_fail',
+      campaignId: 'cmp_p1_fail',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'FAILED',
+      outcomeReason: 'PROVIDER_TIMEOUT_TERMINAL',
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_p1_fail',
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_p1',
+      customerId: 'cus_p1_fail',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_p1',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'REJECTED',
+      attemptId: 'att_p1_fail',
+      providerMessageId,
+      errorCode: 'PROVIDER_TIMEOUT'
+    });
+
+    // Late delivered webhook arrives
+    const reconDelivered = await reconcileDeliveryStatus({
+      tenantId: tenantA,
+      providerMessageId,
+      status: 'delivered',
+      providerTimestamp: now
+    });
+    expect(reconDelivered.policyResult).toBe('TERMINAL_PRESERVED');
+
+    // Both records must remain FAILED and REJECTED
+    const exeAfterDelivered = await CampaignExecutionModel.findOne({ id: exe.id });
+    const intentAfterDelivered = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    expect(exeAfterDelivered?.state).toBe('FAILED');
+    expect(intentAfterDelivered?.state).toBe('REJECTED');
+
+    // Late read webhook arrives
+    const reconRead = await reconcileDeliveryStatus({
+      tenantId: tenantA,
+      providerMessageId,
+      status: 'read',
+      providerTimestamp: now
+    });
+    expect(reconRead.policyResult).toBe('TERMINAL_PRESERVED');
+
+    // Both records must still remain FAILED and REJECTED
+    const exeAfterRead = await CampaignExecutionModel.findOne({ id: exe.id });
+    const intentAfterRead = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    expect(exeAfterRead?.state).toBe('FAILED');
+    expect(intentAfterRead?.state).toBe('REJECTED');
+  });
+
+  it('Review 4 — P1: Webhook consistency: Late DELIVERED or READ on SKIPPED/EXPIRED preserves terminal state', async () => {
+    const providerMessageId = 'wamid_p1_skipped_conflict';
+    const now = new Date();
+
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_p1_skip',
+      tenantId: tenantA,
+      enrollmentId: 'enr_p1_skip',
+      campaignId: 'cmp_p1_skip',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'SKIPPED',
+      outcomeReason: 'SKIPPED_STEP_EXPIRED'
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_p1_skip',
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_p1',
+      customerId: 'cus_p1_skip',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_p1_skip',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'EXPIRED',
+      attemptId: 'att_p1_skip',
+      providerMessageId
+    });
+
+    const recon = await reconcileDeliveryStatus({
+      tenantId: tenantA,
+      providerMessageId,
+      status: 'read',
+      providerTimestamp: now
+    });
+    expect(recon.policyResult).toBe('TERMINAL_PRESERVED');
+
+    const finalExe = await CampaignExecutionModel.findOne({ id: exe.id });
+    const finalIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    expect(finalExe?.state).toBe('SKIPPED');
+    expect(finalIntent?.state).toBe('EXPIRED');
+  });
+
+  it('Review 4 — P1: Webhook consistency: Delayed DELIVERED after READ preserves READ state monotonically', async () => {
+    const providerMessageId = 'wamid_p1_read_monotonic';
+    const now = new Date();
+    const deliveredAt = new Date(now.getTime() - 10000);
+    const readAt = now;
+
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_p1_mono',
+      tenantId: tenantA,
+      enrollmentId: 'enr_p1_mono',
+      campaignId: 'cmp_p1_mono',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'READ',
+      readAt
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_p1_mono',
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_p1',
+      customerId: 'cus_p1_mono',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_p1_mono',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'READ',
+      attemptId: 'att_p1_mono',
+      providerMessageId,
+      readAt
+    });
+
+    // Late delivered webhook arrives AFTER read
+    const recon = await reconcileDeliveryStatus({
+      tenantId: tenantA,
+      providerMessageId,
+      status: 'delivered',
+      providerTimestamp: deliveredAt
+    });
+    expect(recon.policyResult).toBe('MONOTONIC_PRESERVED');
+
+    const finalExe = await CampaignExecutionModel.findOne({ id: exe.id });
+    const finalIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    // State remains READ!
+    expect(finalExe?.state).toBe('READ');
+    expect(finalIntent?.state).toBe('READ');
+    // deliveredAt timestamp was safely populated
+    expect(finalExe?.deliveredAt).not.toBeNull();
+    expect(finalIntent?.deliveredAt).not.toBeNull();
+  });
+
+  it('Review 4 — P1: Webhook consistency: Late FAILED event cannot regress confirmed DELIVERED or READ message', async () => {
+    const providerMessageId = 'wamid_p1_delivered_protect';
+    const now = new Date();
+
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_p1_prot',
+      tenantId: tenantA,
+      enrollmentId: 'enr_p1_prot',
+      campaignId: 'cmp_p1_prot',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DELIVERED',
+      deliveredAt: now
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_p1_prot',
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_p1',
+      customerId: 'cus_p1_prot',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_p1_prot',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'DELIVERED',
+      attemptId: 'att_p1_prot',
+      providerMessageId,
+      deliveredAt: now
+    });
+
+    // Out-of-order failed event arrives
+    const recon = await reconcileDeliveryStatus({
+      tenantId: tenantA,
+      providerMessageId,
+      status: 'failed',
+      errorCode: 'LATE_ERROR_CODE'
+    });
+    expect(recon.policyResult).toBe('MONOTONIC_PRESERVED');
+
+    const finalExe = await CampaignExecutionModel.findOne({ id: exe.id });
+    const finalIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id });
+    // Terminal delivery protected: stays DELIVERED!
+    expect(finalExe?.state).toBe('DELIVERED');
+    expect(finalIntent?.state).toBe('DELIVERED');
   });
 
   it('Review 3: Concurrent draft edits race serialize and reject stale version with 409 Conflict', async () => {

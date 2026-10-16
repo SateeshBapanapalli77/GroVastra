@@ -12,6 +12,7 @@ import { IWhatsAppDeliveryAdapter } from '../adapters/deliveryAdapter.interface'
 import { getWhatsAppDeliveryAdapter } from '../adapters/adapterFactory';
 import { encryptText, decryptText, sha256 } from '../../../shared/utils/crypto';
 import { generateId } from '../../../shared/utils/id';
+import { reconcileDeliveryStatus } from '../services/deliveryStatusReconciliation';
 import { logger } from '../../../config/logger';
 import { env } from '../../../config/env';
 import { ulid } from 'ulid';
@@ -625,52 +626,36 @@ export async function processClaimedExecution(
       await updateContactReservationStatus(tenantId, customer.phone, executionId, 'ACCEPTED');
       logger.info({ executionId, providerId: sendResult.providerMessageId }, 'Message accepted by provider');
 
-      // Check if a late status event already arrived before response persistence (Test C12, Finding 7, Review 3 P2)
+      // Check if any late status events already arrived before response persistence (Test C12, Review 3 P2, Review 4 P2)
       if (sendResult.providerMessageId) {
-        const earlyStatus = await CampaignEventInboxModel.findOne({
+        const earlyEvents = await CampaignEventInboxModel.find({
           tenantId,
-          type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read'] },
+          type: { $in: ['whatsapp.status.delivered', 'whatsapp.status.read', 'whatsapp.status.failed'] },
           'data.providerMessageId': sendResult.providerMessageId
-        }).exec();
+        })
+          .sort({ occurredAt: 1 })
+          .exec();
 
-        if (earlyStatus) {
-          const isRead = earlyStatus.type === 'whatsapp.status.read';
-          const occurredAt = earlyStatus.occurredAt || new Date();
-          const execUpdateFields: any = {
-            state: isRead ? 'READ' : 'DELIVERED'
-          };
-          if (isRead) {
-            execUpdateFields.readAt = occurredAt;
-          } else {
-            execUpdateFields.deliveredAt = occurredAt;
-          }
+        for (const earlyEvent of earlyEvents) {
+          const status = earlyEvent.type.replace('whatsapp.status.', '') as 'delivered' | 'read' | 'failed';
+          const providerTimestamp = earlyEvent.occurredAt || new Date();
+          const errorCode = earlyEvent.data?.errors?.[0]?.code?.toString() || earlyEvent.data?.errorCode;
+          const errorReason = earlyEvent.data?.errors?.[0]?.title || earlyEvent.data?.errors?.[0]?.message;
 
-          await CampaignExecutionModel.updateOne(
-            {
-              id: executionId,
-              tenantId,
-              state: isRead ? { $nin: ['READ'] } : { $nin: ['READ', 'DELIVERED'] }
-            },
-            { $set: execUpdateFields }
-          );
+          await reconcileDeliveryStatus({
+            tenantId,
+            providerMessageId: sendResult.providerMessageId,
+            status,
+            providerTimestamp,
+            errorCode,
+            errorReason
+          });
 
-          const intentUpdateFields: any = {
-            state: isRead ? 'READ' : 'DELIVERED'
-          };
-          if (isRead) {
-            intentUpdateFields.readAt = occurredAt;
-          } else {
-            intentUpdateFields.deliveredAt = occurredAt;
-          }
-
-          await CampaignDeliveryIntentModel.updateOne(
-            {
-              executionId,
-              tenantId,
-              state: isRead ? { $nin: ['READ'] } : { $nin: ['READ', 'DELIVERED'] }
-            },
-            { $set: intentUpdateFields }
-          );
+          // Mark early event processed and correlated to executionId
+          earlyEvent.status = 'PROCESSED';
+          earlyEvent.entityId = executionId;
+          earlyEvent.processedAt = new Date();
+          await earlyEvent.save();
         }
       }
 

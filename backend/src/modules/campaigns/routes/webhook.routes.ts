@@ -12,6 +12,7 @@ import { normalizeE164 } from '../../../shared/utils/phone';
 import { resolveTenantForConnection } from '../services/connectionRegistry';
 import { requireInternalAuth } from '../../../shared/middleware/internalAuth.middleware';
 import { evaluateOrderCompletedGoal } from '../engine/orderGoalEvaluator';
+import { reconcileDeliveryStatus } from '../services/deliveryStatusReconciliation';
 import crypto from 'crypto';
 
 export const webhookRouter = Router();
@@ -152,105 +153,25 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
               }
 
               if (intent) {
-                if (status === 'delivered') {
-                  // Monotonically update intent: always persist deliveredAt, but preserve terminal READ state
-                  await CampaignDeliveryIntentModel.updateOne(
-                    { id: intent.id, tenantId: intent.tenantId },
-                    { $set: { deliveredAt: providerTimestamp } }
-                  );
-                  await CampaignDeliveryIntentModel.updateOne(
-                    {
-                      id: intent.id,
-                      tenantId: intent.tenantId,
-                      state: { $nin: ['READ'] }
-                    },
-                    {
-                      $set: { state: 'DELIVERED' }
-                    }
-                  );
+                const reconResult = await reconcileDeliveryStatus({
+                  tenantId: intent.tenantId,
+                  providerMessageId,
+                  status: status as 'delivered' | 'read' | 'failed',
+                  providerTimestamp,
+                  errorCode: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED',
+                  errorReason: statusObj.errors?.[0]?.title || statusObj.errors?.[0]?.message || 'PROVIDER_DELIVERY_FAILED'
+                });
 
-                  // State monotonic progression: delivered cannot overwrite read, failed, or skipped
-                  await CampaignExecutionModel.updateOne(
-                    { id: intent.executionId, tenantId: intent.tenantId },
-                    { $set: { deliveredAt: providerTimestamp } }
-                  );
-                  await CampaignExecutionModel.updateOne(
-                    {
-                      id: intent.executionId,
-                      tenantId: intent.tenantId,
-                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'OUTCOME_UNKNOWN'] }
-                    },
-                    {
-                      $set: {
-                        state: 'DELIVERED'
-                      }
-                    }
-                  );
-                } else if (status === 'read') {
-                  // Monotonically update intent: read is terminal successful state
-                  await CampaignDeliveryIntentModel.updateOne(
-                    {
-                      id: intent.id,
-                      tenantId: intent.tenantId
-                    },
-                    {
-                      $set: {
-                        state: 'READ',
-                        readAt: providerTimestamp
-                      }
-                    }
-                  );
-
-                  const updateFields: any = {
-                    state: 'READ',
-                    readAt: providerTimestamp
-                  };
-                  if (intent.deliveredAt) {
-                    updateFields.deliveredAt = intent.deliveredAt;
-                  }
-
-                  // Read can transition from PROVIDER_ACCEPTED, DELIVERED, or OUTCOME_UNKNOWN
-                  await CampaignExecutionModel.updateOne(
-                    {
-                      id: intent.executionId,
-                      tenantId: intent.tenantId,
-                      state: { $in: ['SCHEDULED', 'EVALUATING', 'DISPATCHING', 'PROVIDER_ACCEPTED', 'DELIVERED', 'OUTCOME_UNKNOWN'] }
-                    },
-                    {
-                      $set: updateFields
-                    }
-                  );
-                } else if (status === 'failed') {
-                  await CampaignDeliveryIntentModel.updateOne(
-                    {
-                      id: intent.id,
-                      tenantId: intent.tenantId,
-                      state: { $nin: ['READ', 'DELIVERED'] }
-                    },
-                    {
-                      $set: {
-                        state: 'REJECTED',
-                        errorCode: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED'
-                      }
-                    }
-                  );
-
-                  await CampaignExecutionModel.updateOne(
-                    {
-                      id: intent.executionId,
-                      tenantId: intent.tenantId,
-                      state: { $nin: ['READ', 'DELIVERED'] }
-                    },
-                    {
-                      $set: {
-                        state: 'FAILED',
-                        outcomeReason: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED'
-                      }
-                    }
-                  );
-                }
-
-                logger.info({ providerMessageId, status, tenantId: intent.tenantId }, 'Updated execution & intent states from Meta status receipt');
+                logger.info(
+                  {
+                    providerMessageId,
+                    status,
+                    tenantId: intent.tenantId,
+                    policyResult: reconResult.policyResult,
+                    details: reconResult.details
+                  },
+                  'Reconciled delivery status via unified policy'
+                );
               } else {
                 logger.info({ providerMessageId, status, tenantId }, 'Durably retained status receipt before send response persistence (C12)');
               }
@@ -319,28 +240,18 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     // 3. Flat Payload Support (Direct test scripts & backwards compatibility)
     const { providerMessageId, status, customerPhone, messageText } = body;
 
-    if (providerMessageId && status) {
+    if (providerMessageId && status && ['delivered', 'read', 'failed'].includes(status)) {
       const intent = await CampaignDeliveryIntentModel.findOne({ providerMessageId });
-      if (intent) {
-        if (status === 'delivered') {
-          intent.deliveredAt = new Date();
-          await intent.save();
-
-          await CampaignExecutionModel.updateOne(
-            { id: intent.executionId, tenantId: intent.tenantId },
-            { $set: { state: 'DELIVERED', deliveredAt: new Date() } }
-          );
-        } else if (status === 'read') {
-          intent.readAt = new Date();
-          await intent.save();
-
-          await CampaignExecutionModel.updateOne(
-            { id: intent.executionId, tenantId: intent.tenantId },
-            { $set: { state: 'READ', readAt: new Date() } }
-          );
-        }
-        logger.info({ providerMessageId, status }, 'Updated flat delivery intent & execution status');
-      }
+      const tenantId = (req as any).tenantId || intent?.tenantId || (body.connectionId ? await resolveTenantForConnection(body.connectionId) : null) || 'default';
+      await reconcileDeliveryStatus({
+        tenantId,
+        providerMessageId,
+        status: status as 'delivered' | 'read' | 'failed',
+        providerTimestamp: new Date(),
+        errorCode: body.errorCode,
+        errorReason: body.errorReason
+      });
+      logger.info({ providerMessageId, status }, 'Reconciled flat delivery intent & execution status via unified policy');
     }
 
     if (customerPhone && messageText) {
