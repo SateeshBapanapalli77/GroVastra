@@ -77,6 +77,20 @@ export async function evaluateOrderCompletedGoal(params: OrderCompletedEventData
         }
       );
     }
+
+    // When all pending executions are terminal, mark the enrollment COMPLETED (Spec p.16, Step 13)
+    const pendingCount = await CampaignExecutionModel.countDocuments({
+      tenantId,
+      enrollmentId: enrollment.id,
+      state: { $in: ['SCHEDULED', 'DEFERRED', 'EVALUATING', 'DISPATCHING', 'RETRY_WAIT'] }
+    });
+
+    if (pendingCount === 0) {
+      await CampaignEnrollmentModel.updateOne(
+        { id: enrollment.id, tenantId },
+        { $set: { status: 'COMPLETED' } }
+      );
+    }
   }
 
   logger.info(

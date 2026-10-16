@@ -25,13 +25,17 @@ declare global {
 /**
  * Creates a signed JWT with HMAC-SHA256 signature
  */
-export function signJwt(payload: AuthPayload, secret: string = env.JWT_SECRET): string {
+export function signJwt(
+  payload: AuthPayload,
+  secret: string = env.JWT_SECRET,
+  expiresInSeconds: number = 12 * 3600 // 12-hour token lifetime
+): string {
   const header = { alg: 'HS256', typ: 'JWT' };
   const now = Math.floor(Date.now() / 1000);
   const fullPayload = {
     ...payload,
     iat: now,
-    exp: now + 30 * 86400 // 30-day token lifetime
+    exp: now + expiresInSeconds
   };
 
   const b64Header = Buffer.from(JSON.stringify(header)).toString('base64url');
@@ -97,7 +101,8 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     if (!devBypass) {
       return res.status(401).json({
         success: false,
-        error: 'Authentication required. Missing Bearer token in Authorization header.'
+        error: 'Authentication required. Missing Bearer token in Authorization header.',
+        code: 'UNAUTHORIZED'
       });
     }
     logger.warn('INSECURE DEV AUTH BYPASS in use. Never enable this outside a local machine.');
@@ -120,7 +125,8 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
       );
       return res.status(403).json({
         success: false,
-        error: 'Forbidden: Cannot access resources outside your authenticated tenant scope.'
+        error: 'Forbidden: Cannot access resources outside your authenticated tenant scope.',
+        code: 'CROSS_TENANT_FORBIDDEN'
       });
     }
 
@@ -131,7 +137,8 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     logger.warn({ err: err.message }, 'Failed JWT authentication check');
     return res.status(401).json({
       success: false,
-      error: `Unauthorized: ${err.message}`
+      error: `Unauthorized: ${err.message}`,
+      code: 'INVALID_TOKEN'
     });
   }
 }
@@ -142,13 +149,14 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 export function requireRole(allowedRoles: UserRole[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) {
-      return res.status(401).json({ success: false, error: 'Authentication required' });
+      return res.status(401).json({ success: false, error: 'Authentication required', code: 'UNAUTHORIZED' });
     }
 
     if (!allowedRoles.includes(req.user.role) && req.user.role !== 'SYSTEM') {
       return res.status(403).json({
         success: false,
-        error: `Forbidden: Role '${req.user.role}' lacks permission for this action.`
+        error: `Forbidden: Role '${req.user.role}' lacks permission for this action.`,
+        code: 'FORBIDDEN_ROLE'
       });
     }
 

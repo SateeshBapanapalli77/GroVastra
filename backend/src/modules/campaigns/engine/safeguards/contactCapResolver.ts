@@ -7,6 +7,19 @@ import { normalizeE164 } from '../../../../shared/utils/phone';
 import { DateTime } from 'luxon';
 import { logger } from '../../../../config/logger';
 
+export class ContactCapExceededError extends Error {
+  readonly reason: 'DEFERRED_CONTACT_CAP' | 'SKIPPED_CONTACT_CAP';
+  readonly nextAvailableAt?: Date;
+
+  constructor(reason: 'DEFERRED_CONTACT_CAP' | 'SKIPPED_CONTACT_CAP', nextAvailableAt?: Date) {
+    super(reason);
+    this.name = 'ContactCapExceededError';
+    this.reason = reason;
+    this.nextAvailableAt = nextAvailableAt;
+    Object.setPrototypeOf(this, ContactCapExceededError.prototype);
+  }
+}
+
 export interface CapCheckResult {
   allowed: boolean;
   reason?: 'SKIPPED_CONTACT_CAP' | 'DEFERRED_CONTACT_CAP';
@@ -142,7 +155,10 @@ export async function checkAndReserveContactCapacity(
         session ? { session } : {}
       );
     } else {
-      const earliestRelease = new Date(contactsIn24h[0].reservedAt.getTime() + 24 * 60 * 60 * 1000 + 1000);
+      const oldestIn24h = [...contactsIn24h].sort(
+        (a: IContactReservation, b: IContactReservation) => a.reservedAt.getTime() - b.reservedAt.getTime()
+      )[0];
+      const earliestRelease = new Date(oldestIn24h.reservedAt.getTime() + 24 * 60 * 60 * 1000 + 1000);
       logger.info(
         {
           executionId,
@@ -162,7 +178,8 @@ export async function checkAndReserveContactCapacity(
       }
       return {
         allowed: false,
-        reason: 'SKIPPED_CONTACT_CAP'
+        reason: 'SKIPPED_CONTACT_CAP',
+        nextAvailableAt: earliestRelease
       };
     }
   }
@@ -187,7 +204,8 @@ export async function checkAndReserveContactCapacity(
     }
     return {
       allowed: false,
-      reason: 'SKIPPED_CONTACT_CAP'
+      reason: 'SKIPPED_CONTACT_CAP',
+      nextAvailableAt: earliestRelease
     };
   }
 

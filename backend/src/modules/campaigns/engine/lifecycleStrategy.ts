@@ -60,6 +60,43 @@ export async function updateCustomerPurchaseFact(
   }
 
   await fact.save();
+
+  // A13: New purchase cancels active win-back enrollments and resets anchor
+  const activeWinbacks = await CampaignEnrollmentModel.find({
+    tenantId,
+    customerId: targetCustomerId,
+    status: 'ACTIVE',
+    occurrenceId: { $regex: /^winback:/ }
+  });
+
+  if (activeWinbacks.length > 0) {
+    const enrIds = activeWinbacks.map((e) => e.id);
+    await CampaignEnrollmentModel.updateMany(
+      { tenantId, id: { $in: enrIds } },
+      {
+        $set: {
+          status: 'CANCELLED',
+          goalReachedAt: purchaseAt,
+          goalOrderRef: orderId
+        }
+      }
+    );
+
+    await CampaignExecutionModel.updateMany(
+      {
+        tenantId,
+        enrollmentId: { $in: enrIds },
+        state: { $in: ['SCHEDULED', 'DEFERRED', 'RETRY_WAIT'] }
+      },
+      {
+        $set: {
+          state: 'SKIPPED',
+          outcomeReason: 'SKIPPED_GOAL_REACHED'
+        }
+      }
+    );
+  }
+
   return fact;
 }
 

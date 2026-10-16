@@ -8,12 +8,14 @@
     "worker:planner": "tsx watch src/workers/planner.ts",
     "worker:executor": "tsx watch src/workers/executor.ts",
     "worker:events": "tsx watch src/workers/events.ts",
+    "worker:scanner": "tsx watch src/workers/scanner.ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit",
     "start": "node dist/server.js",
     "test": "vitest run",
     "test:ci": "tsc --noEmit && vitest run",
-    "seed": "tsx src/scripts/seed.ts"
+    "seed": "tsx src/scripts/seed.ts",
+    "status:generate": "tsx scripts/generateStatus.ts"
   },
   "dependencies": {
     "cors": "^2.8.5",
@@ -35,6 +37,7 @@
     "pino-pretty": "^13.0.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.3",
-    "vitest": "^3.0.4"
+    "vitest": "^3.0.4",
+    "yaml": "^2.9.1"
   }
 }

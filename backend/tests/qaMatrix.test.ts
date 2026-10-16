@@ -169,6 +169,7 @@ describe('Milestone 5: QA Acceptance Matrix (A01-A18, B01-B20, C01-C20) — Real
       provider: 'mock',
       status: 'ACTIVE',
       metadata: {
+        storeName: 'Matrix Boutique',
         wabaId: 'waba_matrix',
         phoneNumberId: 'phone_matrix',
         displayPhoneNumber: '+919876500000'

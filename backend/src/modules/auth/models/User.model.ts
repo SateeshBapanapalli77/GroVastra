@@ -12,7 +12,7 @@ export interface IUser extends Document {
   shopName: string;
   createdAt: Date;
   updatedAt: Date;
-  verifyPassword(password: string): boolean;
+  verifyPassword(password: string): Promise<boolean>;
 }
 
 const UserSchema = new Schema<IUser>(
@@ -38,17 +38,76 @@ const UserSchema = new Schema<IUser>(
 UserSchema.index({ username: 1 }, { unique: true });
 UserSchema.index({ tenantId: 1, role: 1 });
 
-export function hashPassword(password: string): string {
-  const salt = 'grovastra_salt_heritage_boutique';
-  return crypto.pbkdf2Sync(password, salt, 10000, 64, 'sha512').toString('hex');
+const LEGACY_SALT = 'grovastra_salt_heritage_boutique';
+const DUMMY_SALT = '0123456789abcdef0123456789abcdef';
+
+/**
+ * Derives password hash using async scrypt with a per-user random 16-byte salt.
+ * Format: scheme$salt$hash
+ */
+export async function hashPassword(password: string): Promise<string> {
+  const salt = crypto.randomBytes(16).toString('hex');
+  const derivedKey = await new Promise<Buffer>((resolve, reject) => {
+    crypto.scrypt(password, salt, 64, (err, derived) => {
+      if (err) reject(err);
+      else resolve(derived);
+    });
+  });
+  return `scrypt$${salt}$${derivedKey.toString('hex')}`;
 }
 
-UserSchema.methods.verifyPassword = function (password: string): boolean {
-  const hash = hashPassword(password);
-  const bufA = Buffer.from(this.passwordHash);
-  const bufB = Buffer.from(hash);
-  if (bufA.length !== bufB.length) return false;
-  return crypto.timingSafeEqual(bufA, bufB);
+/**
+ * Checks if a stored password hash was created with the legacy scheme and requires upgrading.
+ */
+export function needsRehash(storedHash: string): boolean {
+  return !storedHash.startsWith('scrypt$');
+}
+
+/**
+ * Executes dummy scrypt hash computation to prevent username enumeration timing attacks.
+ */
+export async function dummyHash(password: string): Promise<void> {
+  await new Promise<Buffer>((resolve, reject) => {
+    crypto.scrypt(password, DUMMY_SALT, 64, (err, derived) => {
+      if (err) reject(err);
+      else resolve(derived);
+    });
+  });
+}
+
+/**
+ * Verifies a password against either modern scrypt$salt$hash or legacy PBKDF2 hash.
+ */
+export async function verifyPasswordHash(password: string, storedHash: string): Promise<boolean> {
+  if (storedHash.startsWith('scrypt$')) {
+    const parts = storedHash.split('$');
+    if (parts.length !== 3) return false;
+    const [, salt, expectedHashHex] = parts;
+    const derivedKey = await new Promise<Buffer>((resolve, reject) => {
+      crypto.scrypt(password, salt, 64, (err, derived) => {
+        if (err) reject(err);
+        else resolve(derived);
+      });
+    });
+    const expectedBuf = Buffer.from(expectedHashHex, 'hex');
+    if (derivedKey.length !== expectedBuf.length) return false;
+    return crypto.timingSafeEqual(derivedKey, expectedBuf);
+  }
+
+  // Legacy PBKDF2 fallback verification
+  const derivedKey = await new Promise<Buffer>((resolve, reject) => {
+    crypto.pbkdf2(password, LEGACY_SALT, 10000, 64, 'sha512', (err, derived) => {
+      if (err) reject(err);
+      else resolve(derived);
+    });
+  });
+  const expectedBuf = Buffer.from(storedHash, 'hex');
+  if (derivedKey.length !== expectedBuf.length) return false;
+  return crypto.timingSafeEqual(derivedKey, expectedBuf);
+}
+
+UserSchema.methods.verifyPassword = async function (password: string): Promise<boolean> {
+  return verifyPasswordHash(password, this.passwordHash);
 };
 
 export const UserModel = mongoose.model<IUser>('User', UserSchema);

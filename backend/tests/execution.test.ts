@@ -333,6 +333,7 @@ describe('Milestone 3: Durable Execution & Safeguards Test Suite', () => {
         campaignId: campaign.id,
         version: 1,
         name: campaign.name,
+        brandName: 'Heritage Silks',
         industry: 'BOUTIQUE',
         purpose: 'MARKETING',
         trigger: { type: 'ANNUAL_DATE', field: 'customer.birthday' },

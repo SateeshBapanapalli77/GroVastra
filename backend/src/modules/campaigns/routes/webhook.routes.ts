@@ -15,6 +15,7 @@ import { evaluateOrderCompletedGoal } from '../engine/orderGoalEvaluator';
 import { reconcileDeliveryStatus } from '../services/deliveryStatusReconciliation';
 import * as deliveryRecon from '../services/deliveryStatusReconciliation';
 import crypto from 'crypto';
+import { validateEventPayload } from '../../../shared/events/registry';
 
 export const webhookRouter = Router();
 
@@ -90,7 +91,11 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     const secret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET;
     if (!secret) {
       logger.error('WhatsApp webhook secret is not configured; rejecting request (fail-closed)');
-      return res.status(500).json({ success: false, error: 'Webhook secret is not configured' });
+      return res.status(500).json({
+        success: false,
+        error: 'Webhook secret is not configured',
+        code: 'WEBHOOK_SECRET_NOT_CONFIGURED'
+      });
     }
 
     const signatureHeader = req.headers['x-hub-signature-256'] as string;
@@ -98,11 +103,41 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     const isValid = verifyMetaSignature(signatureHeader, rawBody, secret);
     if (!isValid) {
       logger.warn('WhatsApp webhook signature verification failed (forged or unsigned payload)');
-      return res.status(401).json({ success: false, error: 'Invalid or missing webhook signature' });
+      return res.status(401).json({
+        success: false,
+        error: 'Invalid or missing webhook signature',
+        code: 'INVALID_SIGNATURE'
+      });
     }
 
     const body = req.body;
-    logger.info({ body }, 'Processing WhatsApp webhook notification');
+    const entryCount = Array.isArray(body?.entry) ? body.entry.length : 0;
+    let statusCount = 0;
+    let logProviderMessageId: string | undefined = body?.providerMessageId;
+
+    if (Array.isArray(body?.entry)) {
+      for (const entry of body.entry) {
+        for (const change of entry.changes || []) {
+          if (Array.isArray(change.value?.statuses)) {
+            statusCount += change.value.statuses.length;
+            if (!logProviderMessageId && change.value.statuses[0]?.id) {
+              logProviderMessageId = change.value.statuses[0].id;
+            }
+          }
+        }
+      }
+    } else if (body?.status) {
+      statusCount = 1;
+    }
+
+    logger.info(
+      {
+        entryCount,
+        statusCount,
+        ...(logProviderMessageId ? { providerMessageId: logProviderMessageId } : {})
+      },
+      'Processing WhatsApp webhook notification'
+    );
 
     // 2. Parse Meta Standard Cloud API Payload Structure: entry[].changes[].value
     if (body.object === 'whatsapp_business_account' && Array.isArray(body.entry)) {
@@ -342,7 +377,11 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
       const resolvedTenantId = (req as any).tenantId || connectionTenantId;
       if (!resolvedTenantId) {
         logger.warn({ providerMessageId }, 'Flat status webhook rejected: missing or unresolvable tenant context (fail-closed)');
-        return res.status(401).json({ success: false, error: 'Unauthorized: missing or unmapped connection tenant context' });
+        return res.status(401).json({
+          success: false,
+          error: 'Unauthorized: missing or unmapped connection tenant context',
+          code: 'UNAUTHORIZED_CONNECTION'
+        });
       }
 
       // Strictly tenant-scoped delivery intent lookup (no cross-tenant intent matching)
@@ -353,7 +392,11 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
       if (!intent) {
         logger.warn({ providerMessageId, tenantId: resolvedTenantId }, 'Flat status webhook dropped: no delivery intent matching providerMessageId for connection tenant (fail-closed)');
-        return res.status(404).json({ success: false, error: 'No delivery intent found for providerMessageId and connection tenant' });
+        return res.status(404).json({
+          success: false,
+          error: 'No delivery intent found for providerMessageId and connection tenant',
+          code: 'DELIVERY_INTENT_NOT_FOUND'
+        });
       }
 
       // Route through durable inbox lifecycle & unified transactional reconciliation
@@ -428,14 +471,24 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
       try {
         normalizedPhone = normalizeE164(customerPhone);
       } catch {
-        return res.status(400).json({ success: false, error: 'Invalid customer phone number' });
+        return res.status(400).json({
+          success: false,
+          error: 'Invalid customer phone number',
+          code: 'INVALID_PHONE_NUMBER',
+          fieldPath: 'customerPhone'
+        });
       }
 
       const connectionId = body.connectionId;
       const tenantId = (req as any).tenantId || (connectionId ? await resolveTenantForConnection(connectionId) : null);
       if (!tenantId) {
         logger.warn('Flat customer reply rejected: missing or unmapped tenant context');
-        return res.status(400).json({ success: false, error: 'Tenant context could not be resolved from connection' });
+        return res.status(400).json({
+          success: false,
+          error: 'Tenant context could not be resolved from connection',
+          code: 'TENANT_RESOLUTION_FAILED',
+          fieldPath: 'connectionId'
+        });
       }
 
       const customer = await CustomerModel.findOne({
@@ -473,7 +526,11 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     return res.status(200).json({ success: true, received: true });
   } catch (err: any) {
     logger.error({ err }, 'Error handling WhatsApp webhook');
-    return res.status(500).json({ success: false, error: err.message });
+    return res.status(500).json({
+      success: false,
+      error: err.message || 'Internal server error',
+      code: 'INTERNAL_ERROR'
+    });
   }
 });
 
@@ -495,15 +552,10 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
     const parsedOccurredAt = occurredAt ? new Date(occurredAt) : new Date();
     const parsedEntityVersion = typeof entityVersion === 'number' ? entityVersion : 1;
 
-    // 1. Schema Validation (Spec p.24: "incompatible schema produces a visible quarantine state")
-    const isValidSchema =
-      (schemaVersion === 1 || schemaVersion === undefined) &&
-      typeof type === 'string' &&
-      !isNaN(parsedOccurredAt.getTime()) &&
-      typeof entityId === 'string';
-
-    if (!isValidSchema) {
-      logger.warn({ id, tenantId, type }, 'Incompatible event schema sent to QUARANTINE');
+    // 1. Schema Validation via Event Registry (Spec p.24: "incompatible schema produces a visible quarantine state")
+    const validation = validateEventPayload(req.body);
+    if (!validation.success) {
+      logger.warn({ id, tenantId, type, error: validation.error }, 'Event failed registry validation; sent to QUARANTINE');
       await CampaignEventInboxModel.create({
         id,
         tenantId,
@@ -517,12 +569,13 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
         customerId: customerId || undefined,
         data: data || {},
         status: 'QUARANTINE',
-        errorMessage: 'INCOMPATIBLE_SCHEMA: Invalid or unrecognized event schema structure'
+        errorMessage: validation.error
       });
       return res.status(422).json({
         success: false,
         status: 'QUARANTINE',
-        error: 'Event sent to quarantine: incompatible or unknown event schema'
+        error: validation.error,
+        code: 'SCHEMA_VALIDATION_FAILED'
       });
     }
 
@@ -553,7 +606,8 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
       return res.status(409).json({
         success: false,
         status: 'QUARANTINE',
-        error: `Stale entity version ${parsedEntityVersion} superseded by ${latestEvent.entityVersion}`
+        error: `Stale entity version ${parsedEntityVersion} superseded by ${latestEvent.entityVersion}`,
+        code: 'STALE_ENTITY_VERSION'
       });
     }
 
@@ -618,7 +672,11 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
     }
   } catch (err: any) {
     logger.error({ err }, 'Error ingesting internal campaign event');
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message || 'Internal server error',
+      code: 'INTERNAL_ERROR'
+    });
   }
 });
 
@@ -637,7 +695,13 @@ webhookRouter.post('/webhooks/orders', requireInternalAuth('orders'), async (req
     const { orderId, customerId, occasionRef, netPaise } = req.body;
 
     if (!orderId || !customerId) {
-      return res.status(400).json({ success: false, error: 'orderId and customerId are required' });
+      const fieldPath = !orderId ? 'orderId' : 'customerId';
+      return res.status(400).json({
+        success: false,
+        error: 'orderId and customerId are required',
+        code: 'MISSING_REQUIRED_FIELDS',
+        fieldPath
+      });
     }
 
     // 1. Evaluate goal attribution strictly per spec p.11, p.16
@@ -675,7 +739,11 @@ webhookRouter.post('/webhooks/orders', requireInternalAuth('orders'), async (req
     });
   } catch (err: any) {
     logger.error({ err }, 'Error processing orders webhook');
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message || 'Internal server error',
+      code: 'INTERNAL_ERROR'
+    });
   }
 });
 

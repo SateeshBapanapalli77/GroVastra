@@ -3,7 +3,7 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface ITenantConnection extends Document {
   id: string;
   tenantId: string;
-  connectionId: string; // WhatsApp Phone Number ID / Connection ID e.g. 'conn_padmavati' or Meta phone number ID
+  connectionId: string; // WhatsApp Phone Number ID / Connection ID
   provider: 'mock' | 'whatsapp_cloud';
   status: 'ACTIVE' | 'REVOKED';
   metadata?: Record<string, any>;

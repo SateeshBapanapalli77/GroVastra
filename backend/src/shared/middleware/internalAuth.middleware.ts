@@ -39,7 +39,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       logger.warn({ ip: req.ip, path: req.path }, 'Rejected request: Missing internal service credential');
       return res.status(401).json({
         success: false,
-        error: 'Unauthorized: Internal service credential is required'
+        error: 'Unauthorized: Internal service credential is required',
+        code: 'INTERNAL_AUTH_REQUIRED'
       });
     }
 
@@ -51,7 +52,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       logger.warn({ err: err.message, path: req.path }, 'Failed internal service credential verification');
       return res.status(401).json({
         success: false,
-        error: `Unauthorized internal service call: ${err.message}`
+        error: `Unauthorized internal service call: ${err.message}`,
+        code: 'INVALID_CREDENTIAL'
       });
     }
 
@@ -60,7 +62,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       logger.warn({ role: payload.role, userId: payload.userId }, 'Internal service credential lacks SYSTEM permissions');
       return res.status(403).json({
         success: false,
-        error: 'Forbidden: Credential does not have system service access'
+        error: 'Forbidden: Credential does not have system service access',
+        code: 'FORBIDDEN_ROLE'
       });
     }
 
@@ -68,7 +71,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       logger.warn({ userId: payload.userId }, 'Internal service credential missing mandatory eventFamily claim');
       return res.status(403).json({
         success: false,
-        error: 'Forbidden: Internal service credential must be scoped with a mandatory eventFamily claim'
+        error: 'Forbidden: Internal service credential must be scoped with a mandatory eventFamily claim',
+        code: 'MISSING_EVENT_FAMILY'
       });
     }
 
@@ -79,7 +83,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       );
       return res.status(403).json({
         success: false,
-        error: `Forbidden: Credential is scoped for event family '${payload.eventFamily}', but '${requiredEventFamily}' is required`
+        error: `Forbidden: Credential is scoped for event family '${payload.eventFamily}', but '${requiredEventFamily}' is required`,
+        code: 'EVENT_FAMILY_MISMATCH'
       });
     }
 
@@ -91,7 +96,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       logger.warn({ bodyTenant, credentialTenant: payload.tenantId }, 'Cross-tenant payload rejection');
       return res.status(403).json({
         success: false,
-        error: 'Forbidden: Request body tenantId does not match authenticated credential tenant'
+        error: 'Forbidden: Request body tenantId does not match authenticated credential tenant',
+        code: 'CROSS_TENANT_PAYLOAD'
       });
     }
 
@@ -99,7 +105,8 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       logger.warn({ headerTenant, credentialTenant: payload.tenantId }, 'Cross-tenant header rejection');
       return res.status(403).json({
         success: false,
-        error: 'Forbidden: x-tenant-id header does not match authenticated credential tenant'
+        error: 'Forbidden: x-tenant-id header does not match authenticated credential tenant',
+        code: 'CROSS_TENANT_HEADER'
       });
     }
 

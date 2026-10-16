@@ -3,6 +3,7 @@ import mongoose, { Document, Schema } from 'mongoose';
 export interface ITenantSettings extends Document {
   id: string;
   tenantId: string;
+  storeName?: string;
   version: number;
   timezone: string;
   allowedHours: {
@@ -30,6 +31,7 @@ const TenantSettingsSchema = new Schema<ITenantSettings>(
   {
     id: { type: String, required: true, unique: true },
     tenantId: { type: String, required: true, unique: true },
+    storeName: { type: String, default: null },
     version: { type: Number, required: true, default: 1 },
     timezone: { type: String, required: true, default: 'Asia/Kolkata' },
     allowedHours: {

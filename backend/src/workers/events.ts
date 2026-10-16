@@ -8,6 +8,7 @@ import { evaluateAlterationReadyEvent } from '../modules/campaigns/engine/boutiq
 import { evaluateOrderCompletedGoal } from '../modules/campaigns/engine/orderGoalEvaluator';
 import { env } from '../config/env';
 import { logger } from '../config/logger';
+import { getEventDefinition } from '../shared/events/registry';
 
 export interface EventConsumerCycleResult {
   processedCount: number;
@@ -82,21 +83,17 @@ export async function processNextPendingEvent(
   try {
     logger.info({ eventId: event.eventId, type: event.type }, 'Processing domain event');
 
-    if (event.type === 'stock.published') {
-      await evaluateRestockEvent(event as any);
-    } else if (event.type === 'enquiry.received') {
-      await evaluateEnquiryEvent(event as any);
-    } else if (event.type === 'alteration.completed') {
-      await evaluateAlterationReadyEvent(event as any);
-    } else if (event.type === 'order.completed') {
-      await evaluateOrderCompletedGoal({
-        tenantId: event.tenantId,
-        customerId: event.customerId,
-        orderId: event.entityId,
-        occasionRef: event.data?.occasionRef,
-        netPaise: event.data?.netPaise
-      });
-    } else if (event.type.startsWith('whatsapp.status.')) {
+    const eventDef = getEventDefinition(event.type);
+    if (!eventDef) {
+      event.status = 'QUARANTINE';
+      event.errorMessage = `UNKNOWN_EVENT_TYPE: Event type '${event.type}' is not registered`;
+      event.nextAttemptAt = null;
+      await event.save();
+      logger.warn({ eventId: event.eventId, type: event.type }, 'Moved unknown event to QUARANTINE');
+      return event;
+    }
+
+    if (event.type.startsWith('whatsapp.status.')) {
       const { providerMessageId, status, errorCode, errorReason } = event.data || {};
       if (providerMessageId && status) {
         const intent = await CampaignDeliveryIntentModel.findOne({
@@ -168,6 +165,8 @@ export async function processNextPendingEvent(
           return event;
         }
       }
+    } else {
+      await eventDef.evaluator(event);
     }
 
     event.status = 'PROCESSED';

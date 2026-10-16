@@ -6,6 +6,7 @@ import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/m
 import {
   claimNextDueExecution,
   processClaimedExecution,
+  runDispatchCycle,
   replanExecution,
   sweepStaleDispatching,
   sweepOutcomeUnknownExecutions
@@ -31,6 +32,12 @@ import { TenantControlGateModel } from '../src/modules/campaigns/models/TenantCo
 import { CampaignTombstoneModel } from '../src/modules/campaigns/models/CampaignTombstone.model';
 import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
 import { TenantConnectionModel } from '../src/modules/campaigns/models/TenantConnection.model';
+import { TenantSettingsModel } from '../src/modules/campaigns/models/TenantSettings.model';
+import { OrderModel } from '../src/modules/orders/models/Order.model';
+import { ProductModel } from '../src/modules/inventory/models/Product.model';
+import { executePreflightSafeguards } from '../src/modules/campaigns/engine/safeguards/safeguardPipeline';
+import { resolveShopDisplayName } from '../src/modules/campaigns/services/shopResolver';
+import { validateCampaignVersionDefinition } from '../src/modules/campaigns/routes/campaign.routes';
 import { webhookRouter } from '../src/modules/campaigns/routes/webhook.routes';
 import express from 'express';
 import http from 'http';
@@ -69,11 +76,14 @@ describe('Work Package P1: Execution Correctness & Concurrency', () => {
       TenantControlGateModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
       CampaignTombstoneModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
       CampaignEventInboxModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
-      TenantConnectionModel.deleteMany({ tenantId: { $regex: /^p1_/ } })
+      TenantConnectionModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
+      TenantSettingsModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
+      OrderModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
+      ProductModel.deleteMany({ tenantId: { $regex: /^p1_/ } })
     ]);
   });
 
-  const createTestFixture = async (tenantId: string, overrides: { phone?: string; priority?: number } = {}) => {
+  const createTestFixture = async (tenantId: string, overrides: { phone?: string; priority?: number; brandName?: string } = {}) => {
     const existingConn = await TenantConnectionModel.findOne({ connectionId: `conn_${tenantId}` });
     if (!existingConn) {
       await TenantConnectionModel.create({
@@ -113,6 +123,7 @@ describe('Work Package P1: Execution Correctness & Concurrency', () => {
       campaignId: campaign.id,
       version: 1,
       name: 'Padmavati Handlooms Birthday v1',
+      brandName: overrides.brandName || null,
       status: 'PUBLISHED',
       reviewFingerprint: 'fp_test_padmavati_bday_v1',
       purpose: 'MARKETING',
@@ -717,5 +728,604 @@ describe('Work Package P1: Execution Correctness & Concurrency', () => {
     expect(finalExec!.state).toBe('BLOCKED');
     expect(finalExec!.outcomeReason).toBe('BLOCKED_STALE_INTENT');
     expect(mockAdapter.getSubmissionCount()).toBe(1); // Provider not called on retry!
+  });
+
+  describe('Step 3: Contact-Cap Deferral Loop & nextAvailableAt Scheduling', () => {
+    it('contact cap deferral: (a) capped step is not claimable on the next cycle; (b) exactly one transaction attempt happens before nextAvailableAt; (c) it dispatches once the cap window clears', async () => {
+      const tenantId = 'p1_cap_deferral';
+      const phone = '+919876543299';
+      const t0 = new Date('2026-10-16T10:00:00.000Z');
+
+      // 1. Existing execution reserves 24h capacity for this phone at t0
+      const { execution: priorExec } = await createTestFixture(tenantId, { phone, priority: 80 });
+      priorExec.state = 'PROVIDER_ACCEPTED';
+      priorExec.expiresAt = new Date(t0.getTime() + 48 * 3600 * 1000);
+      await priorExec.save();
+
+      const priorCap = await checkAndReserveContactCapacity(
+        tenantId,
+        phone,
+        priorExec.campaignId,
+        priorExec.id,
+        priorExec.expiresAt,
+        80,
+        t0
+      );
+      expect(priorCap.allowed).toBe(true);
+
+      // 2. Candidate execution (lower priority 50, so cannot displace) is due at t0
+      const { execution: candidateExec } = await createTestFixture(tenantId, { phone, priority: 50 });
+      candidateExec.dueAt = t0;
+      candidateExec.expiresAt = new Date(t0.getTime() + 48 * 3600 * 1000);
+      await candidateExec.save();
+
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+
+      // Cycle 1 at t0: claims candidate execution
+      const claimedCycle1 = await claimNextDueExecution(tenantId, t0);
+      expect(claimedCycle1).not.toBeNull();
+      expect(claimedCycle1!.id).toBe(candidateExec.id);
+
+      const outcome1 = await processClaimedExecution(claimedCycle1!, mockAdapter, t0);
+      expect(outcome1).toBe('DEFERRED');
+
+      // Assert DB state after first attempt:
+      // State is DEFERRED, dueAt is set to nextAvailableAt (t0 + 24h + 1s), claimVersion was incremented to 1
+      const dbAfterCycle1 = await CampaignExecutionModel.findOne({ id: candidateExec.id });
+      expect(dbAfterCycle1!.state).toBe('DEFERRED');
+      expect(dbAfterCycle1!.outcomeReason).toBe('DEFERRED_CONTACT_CAP');
+      const expectedNextAvailableAt = new Date(t0.getTime() + 24 * 3600 * 1000 + 1000);
+      expect(dbAfterCycle1!.dueAt.getTime()).toBe(expectedNextAvailableAt.getTime());
+      expect(dbAfterCycle1!.claimVersion).toBe(1);
+      expect(mockAdapter.getSubmissionCount()).toBe(0);
+
+      // (a) Test: A capped step is NOT claimable on the next cycle (e.g. 5 seconds later)
+      const tNextCycle = new Date(t0.getTime() + 5000);
+      const claimedNextCycle = await claimNextDueExecution(tenantId, tNextCycle);
+      expect(claimedNextCycle).toBeNull();
+
+      // (b) Test: Exactly one transaction attempt happens before nextAvailableAt
+      // Simulate multiple intervening worker cycles before nextAvailableAt
+      const checkTimes = [
+        new Date(t0.getTime() + 60 * 1000),         // 1 minute later
+        new Date(t0.getTime() + 3600 * 1000),       // 1 hour later
+        new Date(t0.getTime() + 12 * 3600 * 1000),  // 12 hours later
+        new Date(expectedNextAvailableAt.getTime() - 1000) // 1 second before nextAvailableAt
+      ];
+
+      for (const tCheck of checkTimes) {
+        const cycleResult = await runDispatchCycle(tenantId, 5, mockAdapter, tCheck);
+        expect(cycleResult.claimedCount).toBe(0);
+      }
+
+      // Assert DB state: claimVersion is STILL 1 (no re-claim or transaction attempt happened!)
+      const dbBeforeClear = await CampaignExecutionModel.findOne({ id: candidateExec.id });
+      expect(dbBeforeClear!.claimVersion).toBe(1);
+      expect(dbBeforeClear!.state).toBe('DEFERRED');
+      expect(mockAdapter.getSubmissionCount()).toBe(0);
+
+      // (c) Test: It dispatches once the cap window clears
+      const tCleared = new Date(expectedNextAvailableAt.getTime() + 1000); // 1s after nextAvailableAt
+      const claimedAfterClear = await claimNextDueExecution(tenantId, tCleared);
+      expect(claimedAfterClear).not.toBeNull();
+      expect(claimedAfterClear!.id).toBe(candidateExec.id);
+
+      const outcomeCleared = await processClaimedExecution(claimedAfterClear!, mockAdapter, tCleared);
+      expect(outcomeCleared).toBe('ACCEPTED');
+
+      // Assert DB state and provider call count after dispatch
+      const dbDispatched = await CampaignExecutionModel.findOne({ id: candidateExec.id });
+      expect(dbDispatched!.state).toBe('PROVIDER_ACCEPTED');
+      expect(dbDispatched!.claimVersion).toBe(2);
+      expect(mockAdapter.getSubmissionCount()).toBe(1);
+
+      // Assert intent created and accepted
+      const deliveryIntent = await CampaignDeliveryIntentModel.findOne({ executionId: candidateExec.id });
+      expect(deliveryIntent).not.toBeNull();
+      expect(deliveryIntent!.state).toBe('ACCEPTED');
+    });
+
+    it('sets SKIPPED with reason SKIPPED_CONTACT_CAP when nextAvailableAt >= expiresAt', async () => {
+      const tenantId = 'p1_cap_expired';
+      const phone = '+919876543298';
+      const t0 = new Date('2026-10-16T10:00:00.000Z');
+
+      // 1. Existing execution reserves 24h capacity at t0
+      const { execution: priorExec } = await createTestFixture(tenantId, { phone, priority: 80 });
+      priorExec.state = 'PROVIDER_ACCEPTED';
+      await priorExec.save();
+
+      await checkAndReserveContactCapacity(
+        tenantId,
+        phone,
+        priorExec.campaignId,
+        priorExec.id,
+        new Date(t0.getTime() + 48 * 3600 * 1000),
+        80,
+        t0
+      );
+
+      // 2. Candidate execution whose expiresAt is ONLY 6 hours from t0 (less than 24h release time)
+      const { execution: candidateExec } = await createTestFixture(tenantId, { phone, priority: 50 });
+      candidateExec.dueAt = t0;
+      candidateExec.expiresAt = new Date(t0.getTime() + 6 * 3600 * 1000); // Expires before 24h window clears
+      await candidateExec.save();
+
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+      const claimed = await claimNextDueExecution(tenantId, t0);
+      expect(claimed).not.toBeNull();
+      expect(claimed!.id).toBe(candidateExec.id);
+
+      const outcome = await processClaimedExecution(claimed!, mockAdapter, t0);
+      expect(outcome).toBe('SKIPPED');
+
+      // Assert DB state: SKIPPED with SKIPPED_CONTACT_CAP, zero provider calls
+      const dbExec = await CampaignExecutionModel.findOne({ id: candidateExec.id });
+      expect(dbExec!.state).toBe('SKIPPED');
+      expect(dbExec!.outcomeReason).toBe('SKIPPED_CONTACT_CAP');
+      expect(mockAdapter.getSubmissionCount()).toBe(0);
+    });
+  });
+
+  describe('Step 4: Remove Hardcoded "Padmavati Silks" Fallback & Authoritative Shop Resolution', () => {
+    it('resolveShopDisplayName helper strictly respects precedence: version.brandName > tenantSettings.storeName > connection.metadata > null', async () => {
+      const tenantId = 'p1_shop_precedence';
+
+      // 1. When nothing is configured, returns null (fail-closed, no hardcoded fallback!)
+      const nullShop = await resolveShopDisplayName(tenantId, {});
+      expect(nullShop).toBeNull();
+
+      // 2. Priority 3: Connection metadata
+      await TenantConnectionModel.create({
+        id: generateId('conn'),
+        tenantId,
+        connectionId: `conn_${tenantId}`,
+        provider: 'mock',
+        status: 'ACTIVE',
+        metadata: { storeName: 'Meta Connection Handlooms' }
+      });
+      const metaShop = await resolveShopDisplayName(tenantId, {});
+      expect(metaShop).toBe('Meta Connection Handlooms');
+
+      // 3. Priority 2: Tenant settings storeName overrides connection metadata
+      await TenantSettingsModel.create({
+        id: generateId('set'),
+        tenantId,
+        version: 1,
+        timezone: 'Asia/Kolkata',
+        allowedHours: { start: '10:00', end: '19:00' },
+        caps: { marketing24h: 1, marketing7d: 3 },
+        globalPause: false,
+        outageGraceMinutes: 120,
+        leapDayPolicy: 'FEB_28',
+        holidays: [],
+        blackouts: [],
+        storeName: 'Settings Handlooms',
+        notice: 'NOTICE'
+      });
+      const settingsShop = await resolveShopDisplayName(tenantId, {});
+      expect(settingsShop).toBe('Settings Handlooms');
+
+      // 4. Priority 1: version.brandName overrides tenant settings & connection metadata
+      const versionShop = await resolveShopDisplayName(tenantId, { brandName: 'Brand Version Handlooms' });
+      expect(versionShop).toBe('Brand Version Handlooms');
+    });
+
+    it('Two tenants each send their own configured shop name without cross-talk or hardcoded fallback', async () => {
+      const tenantA = 'tenant_kanchipuram';
+      const tenantB = 'tenant_banarasi';
+      const shopA = 'Kanchipuram Silks';
+      const shopB = 'Banarasi Weaves';
+
+      // Tenant A configures shop name via version.brandName
+      const { execution: execA } = await createTestFixture(tenantA, {
+        brandName: shopA,
+        phone: '+919876543201'
+      });
+      const versionA = await CampaignVersionModel.findOne({ tenantId: tenantA });
+      versionA!.steps[0].bindings = new Map([['name', 'customer.firstName'], ['shop', 'shop.displayName']]);
+      versionA!.brandName = shopA;
+      await versionA!.save();
+
+      // Tenant B configures shop name via TenantSettingsModel.storeName
+      const { execution: execB } = await createTestFixture(tenantB, {
+        phone: '+919876543202'
+      });
+      await TenantSettingsModel.create({
+        id: generateId('set'),
+        tenantId: tenantB,
+        version: 1,
+        timezone: 'Asia/Kolkata',
+        allowedHours: { start: '10:00', end: '19:00' },
+        caps: { marketing24h: 1, marketing7d: 3 },
+        globalPause: false,
+        outageGraceMinutes: 120,
+        leapDayPolicy: 'FEB_28',
+        holidays: [],
+        blackouts: [],
+        storeName: shopB,
+        notice: 'NOTICE'
+      });
+      const versionB = await CampaignVersionModel.findOne({ tenantId: tenantB });
+      versionB!.steps[0].bindings = new Map([['name', 'customer.firstName']]); // Default binds 'shop' to storeDisplayName
+      versionB!.brandName = null as any;
+      await versionB!.save();
+
+      const mockAdapterA = new MockWhatsAppDeliveryAdapter();
+      const mockAdapterB = new MockWhatsAppDeliveryAdapter();
+      const now = new Date();
+
+      // Dispatch Tenant A
+      const claimedA = await claimNextDueExecution(tenantA, now);
+      expect(claimedA).not.toBeNull();
+      const outcomeA = await processClaimedExecution(claimedA!, mockAdapterA, now);
+      expect(outcomeA).toBe('ACCEPTED');
+      expect(mockAdapterA.getSubmissionCount()).toBe(1);
+
+      // Verify Provider submission parameters and DB DeliveryIntent for Tenant A
+      const sentParamsA = mockAdapterA.getSubmissions()[0].parameters;
+      expect(sentParamsA.shop).toBe(shopA);
+      const intentA = await CampaignDeliveryIntentModel.findOne({ tenantId: tenantA, executionId: execA.id });
+      expect(intentA).not.toBeNull();
+      const getParam = (intent: any, key: string) => (intent.parameters instanceof Map || typeof intent.parameters?.get === 'function') ? intent.parameters.get(key) : intent.parameters?.[key];
+      expect(getParam(intentA, 'shop')).toBe(shopA);
+      expect(getParam(intentA, 'shop')).not.toBe(shopB);
+      expect(getParam(intentA, 'shop')).not.toBe('Padmavati Silks');
+
+      // Dispatch Tenant B
+      const claimedB = await claimNextDueExecution(tenantB, now);
+      expect(claimedB).not.toBeNull();
+      const outcomeB = await processClaimedExecution(claimedB!, mockAdapterB, now);
+      expect(outcomeB).toBe('ACCEPTED');
+      expect(mockAdapterB.getSubmissionCount()).toBe(1);
+
+      // Verify Provider submission parameters and DB DeliveryIntent for Tenant B
+      const sentParamsB = mockAdapterB.getSubmissions()[0].parameters;
+      expect(sentParamsB.shop).toBe(shopB);
+      const intentB = await CampaignDeliveryIntentModel.findOne({ tenantId: tenantB, executionId: execB.id });
+      expect(intentB).not.toBeNull();
+      expect(getParam(intentB, 'shop')).toBe(shopB);
+      expect(getParam(intentB, 'shop')).not.toBe(shopA);
+      expect(getParam(intentB, 'shop')).not.toBe('Padmavati Silks');
+    });
+
+    it('A tenant without a shop name is blocked (BLOCKED_SHOP_NAME_NOT_CONFIGURED), adapter is never called, and validate endpoint reports fieldPath settings.storeName with resolutionOwner BOUTIQUE_OWNER', async () => {
+      const tenantC = 'tenant_unconfigured_shop';
+
+      // 1. Create fixture for Tenant C with NO brandName, NO settings storeName, and NO connection metadata
+      const { execution: execC, version } = await createTestFixture(tenantC, {
+        phone: '+919876543203'
+      });
+
+      // Template requires 'shop' variable
+      version.steps[0].templateRef = { id: 'tpl_birthday_invite', revision: 3, language: 'en' };
+      version.steps[0].bindings = new Map([['name', 'customer.firstName']]); // Default binds 'shop' to shop display name
+      version.brandName = null as any;
+      await version.save();
+
+      // Ensure NO settings and connection has empty metadata
+      await TenantSettingsModel.deleteMany({ tenantId: tenantC });
+      await TenantConnectionModel.updateOne({ tenantId: tenantC }, { $set: { metadata: {} } });
+
+      // 2. Validate endpoint assertion: validateCampaignVersionDefinition returns structured error
+      const valResult = await validateCampaignVersionDefinition(version, tenantC);
+      expect(valResult.valid).toBe(false);
+      expect(valResult.errors).toEqual(
+        expect.arrayContaining([
+          expect.objectContaining({
+            fieldPath: 'settings.storeName',
+            resolutionOwner: 'BOUTIQUE_OWNER'
+          })
+        ])
+      );
+
+      // 3. Execution worker assertion: processClaimedExecution blocks step and NEVER calls adapter
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+      const now = new Date();
+      const claimed = await claimNextDueExecution(tenantC, now);
+      expect(claimed).not.toBeNull();
+      expect(claimed!.id).toBe(execC.id);
+
+      const outcome = await processClaimedExecution(claimed!, mockAdapter, now);
+      expect(outcome).toBe('BLOCKED');
+
+      // Assert DB state in MongoMemoryReplSet
+      const dbExec = await CampaignExecutionModel.findOne({ tenantId: tenantC, id: execC.id });
+      expect(dbExec).not.toBeNull();
+      expect(dbExec!.state).toBe('BLOCKED');
+      expect(dbExec!.outcomeReason).toBe('BLOCKED_SHOP_NAME_NOT_CONFIGURED');
+
+      // Assert adapter is NEVER called (call count strictly 0)
+      expect(mockAdapter.getSubmissionCount()).toBe(0);
+      expect(mockAdapter.getCallCount()).toBe(0);
+
+      // Assert zero delivery intents created for this execution
+      const intentCount = await CampaignDeliveryIntentModel.countDocuments({ tenantId: tenantC, executionId: execC.id });
+      expect(intentCount).toBe(0);
+    });
+  });
+
+  describe('Step 5: Pipeline Hygiene & Reason Precedence Hierarchy', () => {
+    it('Empty customer-specific variable returns SKIP with SKIPPED_MISSING_VARIABLE (not blocked)', async () => {
+      const tenantId = 'p1_step5_empty_var';
+      const { execution: exec, customer } = await createTestFixture(tenantId);
+      await CustomerModel.updateOne({ id: customer.id, tenantId }, { $set: { firstName: '' } });
+
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+      const claimed = await claimNextDueExecution(tenantId, new Date());
+      expect(claimed).not.toBeNull();
+      const outcome = await processClaimedExecution(claimed!, mockAdapter, new Date());
+
+      expect(outcome).toBe('SKIPPED');
+      const dbExec = await CampaignExecutionModel.findOne({ tenantId, id: exec.id });
+      expect(dbExec?.state).toBe('SKIPPED');
+      expect(dbExec?.outcomeReason).toBe('SKIPPED_MISSING_VARIABLE');
+      expect(mockAdapter.getCallCount()).toBe(0);
+    });
+
+    it('Missing order item title skips with SKIPPED_MISSING_VARIABLE instead of invented "Boutique Order #xxxx"', async () => {
+      const tenantId = 'p1_step5_no_invented';
+      const { execution: exec, enrollment, version } = await createTestFixture(tenantId);
+
+      // Order event with order that has empty items array
+      const order = await OrderModel.create({
+        id: 'ord_empty_items',
+        tenantId,
+        customerId: enrollment.customerId,
+        netPaise: 500000,
+        status: 'COMPLETED'
+      });
+      enrollment.sourceRef = { type: 'ORDER_EVENT', id: order.id, version: 1 };
+      await enrollment.save();
+
+      // Configure shop name and utility template requiring outfit
+      version.purpose = 'ORDER_SERVICE';
+      version.brandName = 'Silk Boutique';
+      version.steps[0].templateRef = { id: 'tpl_alteration_ready', revision: 1, language: 'en' };
+      version.steps[0].bindings = new Map([
+        ['name', 'customer.firstName'],
+        ['store', 'shop.displayName'],
+        ['outfit', 'order.itemTitle']
+      ]);
+      await version.save();
+
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+      const claimed = await claimNextDueExecution(tenantId, new Date());
+      expect(claimed).not.toBeNull();
+      const outcome = await processClaimedExecution(claimed!, mockAdapter, new Date());
+
+      expect(outcome).toBe('SKIPPED');
+      const dbExec = await CampaignExecutionModel.findOne({ tenantId, id: exec.id });
+      expect(dbExec?.state).toBe('SKIPPED');
+      expect(dbExec?.outcomeReason).toBe('SKIPPED_MISSING_VARIABLE');
+      expect(mockAdapter.getCallCount()).toBe(0);
+    });
+
+    it('Configuration problem remains BLOCKED with BLOCKED_MISSING_VARIABLE_BINDING (unallowlisted expression)', async () => {
+      const tenantId = 'p1_step5_unallowlisted';
+      const { execution: exec, version } = await createTestFixture(tenantId);
+      version.steps[0].bindings = new Map([['name', 'customer.arbitraryUnknownAttribute']]);
+      await version.save();
+
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+      const claimed = await claimNextDueExecution(tenantId, new Date());
+      expect(claimed).not.toBeNull();
+      const outcome = await processClaimedExecution(claimed!, mockAdapter, new Date());
+
+      expect(outcome).toBe('BLOCKED');
+      const dbExec = await CampaignExecutionModel.findOne({ tenantId, id: exec.id });
+      expect(dbExec?.state).toBe('BLOCKED');
+      expect(dbExec?.outcomeReason).toBe('BLOCKED_MISSING_VARIABLE_BINDING');
+      expect(mockAdapter.getCallCount()).toBe(0);
+    });
+
+    it('Pair 1: Customer deleted/suppressed (Level 1) wins over Campaign/global pause (Level 2)', async () => {
+      const tenantId = 'p1_precedence_1_vs_2';
+      const { execution: exec, customer, campaign } = await createTestFixture(tenantId);
+      customer.channelSuppressed = true;
+      await customer.save();
+      campaign.status = 'PAUSED';
+      await campaign.save();
+
+      const safeguardResult = await executePreflightSafeguards(exec);
+      expect(safeguardResult.status).toBe('SKIP');
+      expect(safeguardResult.reason).toBe('SKIPPED_CHANNEL_SUPPRESSED');
+    });
+
+    it('Pair 2: Campaign/global pause (Level 2) wins over Invalid source (Level 3)', async () => {
+      const tenantId = 'p1_precedence_2_vs_3';
+      const { execution: exec, campaign, enrollment } = await createTestFixture(tenantId);
+      campaign.status = 'PAUSED';
+      await campaign.save();
+      enrollment.status = 'CANCELLED';
+      await enrollment.save();
+
+      const safeguardResult = await executePreflightSafeguards(exec);
+      expect(safeguardResult.status).toBe('SKIP');
+      expect(safeguardResult.reason).toBe('SKIPPED_CAMPAIGN_PAUSED');
+    });
+
+    it('Pair 3: Invalid source (Level 3) wins over Expiry (Level 4)', async () => {
+      const tenantId = 'p1_precedence_3_vs_4';
+      const { execution: exec, enrollment } = await createTestFixture(tenantId);
+      const product = await ProductModel.create({
+        id: generateId('prd'),
+        tenantId,
+        sku: 'SKU_P1_DEPLETED_STOCK',
+        title: 'Kanjeevaram Saree',
+        weave: 'Kanjeevaram',
+        color: 'Gold',
+        pricePaise: 3000000,
+        stockCount: 0,
+        isSellable: true
+      });
+      enrollment.sourceRef = { type: 'STOCK_EVENT', id: product.sku, version: 1 };
+      await enrollment.save();
+
+      exec.expiresAt = new Date(Date.now() - 3600000);
+      await exec.save();
+
+      const safeguardResult = await executePreflightSafeguards(exec, new Date());
+      expect(safeguardResult.status).toBe('SKIP');
+      expect(safeguardResult.reason).toBe('SKIPPED_STOCK_DEPLETED');
+    });
+
+    it('Pair 4: Expiry (Level 4) wins over Goal/reply stop (Level 5)', async () => {
+      const tenantId = 'p1_precedence_4_vs_5';
+      const { execution: exec, enrollment } = await createTestFixture(tenantId);
+      enrollment.goalReachedAt = new Date(Date.now() - 10000);
+      enrollment.replyHoldAt = new Date(Date.now() - 10000);
+      await enrollment.save();
+
+      exec.expiresAt = new Date(Date.now() - 3600000);
+      await exec.save();
+
+      const safeguardResult = await executePreflightSafeguards(exec, new Date());
+      expect(safeguardResult.status).toBe('SKIP');
+      expect(safeguardResult.reason).toBe('SKIPPED_STEP_EXPIRED');
+    });
+
+    it('Pair 5: Goal/reply stop (Level 5) wins over Content/template readiness (Level 6)', async () => {
+      const tenantId = 'p1_precedence_5_vs_6';
+      const { execution: exec, enrollment, version } = await createTestFixture(tenantId);
+      enrollment.goalReachedAt = new Date();
+      await enrollment.save();
+
+      // Content readiness failure: unallowlisted variable binding
+      version.steps[0].bindings = new Map([['name', 'customer.unallowlistedVar']]);
+      await version.save();
+
+      const safeguardResult = await executePreflightSafeguards(exec);
+      expect(safeguardResult.status).toBe('SKIP');
+      expect(safeguardResult.reason).toBe('SKIPPED_GOAL_REACHED');
+    });
+
+    it('Pair 6: Content/template readiness (Level 6) wins over Prerequisite (Level 7)', async () => {
+      const tenantId = 'p1_precedence_6_vs_7';
+      const { execution: exec, customer, version } = await createTestFixture(tenantId);
+      // Empty customer variable
+      await CustomerModel.updateOne({ id: customer.id, tenantId }, { $set: { firstName: '' } });
+
+      // Prior step execution marked terminal failure
+      await CampaignExecutionModel.updateOne(
+        { id: exec.id },
+        { $set: { state: 'SKIPPED', outcomeReason: 'SKIPPED_CHANNEL_SUPPRESSED' } }
+      );
+
+      version.steps.push({
+        stepId: 'followup',
+        offsetDays: 1,
+        localTime: '11:00',
+        templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+        bindings: new Map([['name', 'customer.firstName'], ['shop', 'literal:Silk Boutique']]),
+        stopOnReply: true,
+        stopOnGoal: true,
+        prerequisite: 'PREVIOUS_ACCEPTED'
+      });
+      await version.save();
+
+      const followupExec = await CampaignExecutionModel.create({
+        id: generateId('exe'),
+        tenantId,
+        enrollmentId: exec.enrollmentId,
+        campaignId: exec.campaignId,
+        stepId: 'followup',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-15',
+        localTime: '11:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        claimVersion: 1,
+        state: 'SCHEDULED',
+        prerequisite: 'PREVIOUS_ACCEPTED'
+      });
+
+      const safeguardResult = await executePreflightSafeguards(followupExec);
+      expect(safeguardResult.status).toBe('SKIP');
+      expect(safeguardResult.reason).toBe('SKIPPED_MISSING_VARIABLE');
+    });
+
+    it('Pair 7: Prerequisite (Level 7) wins over Contact cap (Level 8)', async () => {
+      const tenantId = 'p1_precedence_7_vs_8';
+      const { execution: exec, version } = await createTestFixture(tenantId);
+
+      // Setup tenant settings with marketing24h cap = 1
+      await TenantSettingsModel.create({
+        id: generateId('ts'),
+        tenantId,
+        version: 1,
+        timezone: 'Asia/Kolkata',
+        allowedHours: { start: '10:00', end: '19:00' },
+        caps: { marketing24h: 1, marketing7d: 3 },
+        globalPause: false,
+        outageGraceMinutes: 120,
+        leapDayPolicy: 'FEB_28',
+        holidays: [],
+        blackouts: [],
+        storeName: 'Royal Weaves',
+        notice: 'NOTICE'
+      });
+
+      // Exhaust contact cap for customer's phone
+      const phone = '+919876543210';
+      await checkAndReserveContactCapacity(
+        tenantId,
+        phone,
+        'cmp_prior',
+        'exe_prior',
+        new Date(Date.now() + 86400000),
+        100
+      );
+
+      // Prior step execution marked terminal failure
+      await CampaignExecutionModel.updateOne(
+        { id: exec.id },
+        { $set: { state: 'SKIPPED', outcomeReason: 'SKIPPED_CHANNEL_SUPPRESSED' } }
+      );
+
+      // Step requires PREVIOUS_ACCEPTED
+      version.steps.push({
+        stepId: 'followup',
+        offsetDays: 1,
+        localTime: '11:00',
+        templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+        bindings: new Map([['name', 'customer.firstName'], ['shop', 'literal:Royal Weaves']]),
+        stopOnReply: true,
+        stopOnGoal: true,
+        prerequisite: 'PREVIOUS_ACCEPTED'
+      });
+      await version.save();
+
+      const followupExec = await CampaignExecutionModel.create({
+        id: generateId('exe'),
+        tenantId,
+        enrollmentId: exec.enrollmentId,
+        campaignId: exec.campaignId,
+        stepId: 'followup',
+        dueAt: new Date(Date.now() - 1000),
+        expiresAt: new Date(Date.now() + 3600000),
+        localDate: '2026-10-15',
+        localTime: '11:00',
+        timezone: 'Asia/Kolkata',
+        planRevision: 1,
+        claimVersion: 1,
+        state: 'SCHEDULED',
+        prerequisite: 'PREVIOUS_ACCEPTED'
+      });
+
+      const mockAdapter = new MockWhatsAppDeliveryAdapter();
+      const claimed = await claimNextDueExecution(tenantId, new Date());
+      expect(claimed).not.toBeNull();
+      expect(claimed!.id).toBe(followupExec.id);
+      const outcome = await processClaimedExecution(claimed!, mockAdapter, new Date());
+
+      // Prerequisite fails before contact cap transaction is reached
+      expect(outcome).toBe('SKIPPED');
+      const dbExec = await CampaignExecutionModel.findOne({ tenantId, id: followupExec.id });
+      expect(dbExec?.state).toBe('SKIPPED');
+      expect(dbExec?.outcomeReason).toBe('SKIPPED_PREREQUISITE_NOT_MET');
+      expect(mockAdapter.getCallCount()).toBe(0);
+    });
   });
 });

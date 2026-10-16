@@ -1,0 +1,1736 @@
+openapi: 3.0.3
+info:
+  title: GroVastra Auto Campaigns & Boutique Social Engine API
+  version: 1.0.0
+  description: |
+    Comprehensive API contract for GroVastra modular monolith backend:
+    Automated customer lifecycle campaigns, Meta WhatsApp Cloud API integration,
+    and boutique owner reporting.
+servers:
+  - url: /api/v1
+    description: Current API v1 Base
+
+paths:
+  /health:
+    get:
+      summary: Health check
+      description: Returns health status, service metadata, and WhatsApp connection mode
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status, timestamp, service, tenant, whatsappMode]
+                properties:
+                  status:
+                    type: string
+                    example: healthy
+                  timestamp:
+                    type: string
+                    format: date-time
+                  service:
+                    type: string
+                    example: grovastra-backend
+                  tenant:
+                    type: string
+                  whatsappMode:
+                    type: string
+                    enum: [mock, cloud_api]
+
+  /auth/login:
+    post:
+      summary: User login
+      description: Authenticates user credentials and returns JWT scoped to tenant
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [username, password]
+              properties:
+                username:
+                  type: string
+                  example: owner
+                password:
+                  type: string
+                  example: secret123
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, token, user]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  token:
+                    type: string
+                  user:
+                    $ref: '#/components/schemas/UserProfile'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '429':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /auth/me:
+    get:
+      summary: Current user profile
+      description: Retrieves profile and tenant metadata for current authenticated session
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Profile retrieved successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, user]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  user:
+                    $ref: '#/components/schemas/UserProfile'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /webhooks/whatsapp:
+    get:
+      summary: Meta WhatsApp webhook challenge verification
+      description: Responds to Meta Cloud API subscription verification challenge
+      parameters:
+        - name: hub.mode
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: hub.verify_token
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: hub.challenge
+          in: query
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Verification challenge passed
+          content:
+            text/plain:
+              schema:
+                type: string
+        '403':
+          description: Verification failed
+    post:
+      summary: Meta WhatsApp webhook notification
+      description: Ingests delivery receipts, read statuses, and patron inbound replies
+      parameters:
+        - name: x-hub-signature-256
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        '200':
+          description: Webhook processed or acknowledged
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  processed:
+                    type: boolean
+                  received:
+                    type: boolean
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /internal/campaign-events:
+    post:
+      summary: Internal domain event ingestion
+      description: Durably stores external and domain events (orders, inventory, CRM) with quarantine isolation
+      security:
+        - InternalServiceAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DomainEventPayload'
+      responses:
+        '200':
+          description: Idempotent duplicate event
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message, eventId, status]
+                properties:
+                  success:
+                    type: boolean
+                  message:
+                    type: string
+                  eventId:
+                    type: string
+                  status:
+                    type: string
+        '201':
+          description: Event successfully ingested
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, eventId, status]
+                properties:
+                  success:
+                    type: boolean
+                  eventId:
+                    type: string
+                  status:
+                    type: string
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /webhooks/orders:
+    post:
+      summary: Authenticated order webhook
+      description: Triggers single-attribution goal evaluation and stops matching campaign follow-up sequences
+      security:
+        - InternalServiceAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [orderId, customerId]
+              properties:
+                orderId:
+                  type: string
+                customerId:
+                  type: string
+                occasionRef:
+                  type: string
+                netPaise:
+                  type: integer
+      responses:
+        '200':
+          description: Order processed and goal evaluated
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, updatedEnrollments, enrollmentIds]
+                properties:
+                  success:
+                    type: boolean
+                  updatedEnrollments:
+                    type: integer
+                  enrollmentIds:
+                    type: array
+                    items:
+                      type: string
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaign-presets:
+    get:
+      summary: List campaign presets
+      description: Returns pre-designed boutique campaign templates with implementation capability flags
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Presets list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, presets]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  presets:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CampaignPreset'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /approved-template-catalogue:
+    get:
+      summary: Approved WhatsApp template catalogue
+      description: Returns pre-approved Meta WhatsApp templates with parameters, categories, and languages
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Template catalogue
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, templates]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  templates:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ApprovedTemplate'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaign-reason-codes:
+    get:
+      summary: List campaign reason codes
+      description: Returns dictionary of execution and safeguard reason codes, category, owner explanation, and resolution owner
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Campaign reason codes
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, reasonCodes]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  reasonCodes:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ReasonCodeDefinition'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /integration-readiness:
+    get:
+      summary: Check WhatsApp & integration readiness
+      description: Read-only inspection of active WhatsApp connection, template catalogue statuses, and missing boutique configuration
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Integration readiness status
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/IntegrationReadiness'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaign-settings:
+    get:
+      summary: Get tenant campaign settings
+      description: Retrieves canonical campaign settings including sending hours, contact caps, holidays, blackouts, store name, and notice
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Settings retrieved
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, settings]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  settings:
+                    $ref: '#/components/schemas/TenantSettings'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    patch:
+      summary: Update tenant campaign settings
+      description: Updates campaign settings with mandatory optimistic concurrency control via expectedVersion
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedVersion]
+              properties:
+                expectedVersion:
+                  type: integer
+                  description: Mandatory optimistic concurrency counter
+                storeName:
+                  type: string
+                  nullable: true
+                timezone:
+                  type: string
+                allowedHours:
+                  type: object
+                  properties:
+                    start:
+                      type: string
+                    end:
+                      type: string
+                caps:
+                  type: object
+                  properties:
+                    marketing24h:
+                      type: integer
+                    marketing7d:
+                      type: integer
+                globalPause:
+                  type: boolean
+                outageGraceMinutes:
+                  type: integer
+                leapDayPolicy:
+                  type: string
+                  enum: [FEB_28, MAR_01, LEAP_ONLY]
+                holidays:
+                  type: array
+                  items:
+                    type: string
+                blackouts:
+                  type: array
+                  items:
+                    type: string
+      responses:
+        '200':
+          description: Settings updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, settings]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  settings:
+                    $ref: '#/components/schemas/TenantSettings'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns:
+    get:
+      summary: List campaigns
+      description: Returns all campaigns for the authenticated boutique tenant
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: List of campaigns
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaigns]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaigns:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/CampaignSummary'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+    post:
+      summary: Create new campaign
+      description: Creates a new draft campaign initialized from a preset or blank specification
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                presetId:
+                  type: string
+                name:
+                  type: string
+      responses:
+        '201':
+          description: Campaign created successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    $ref: '#/components/schemas/CampaignSummary'
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}:
+    get:
+      summary: Get campaign details
+      description: Returns complete campaign record, active immutable version, and editable draft version
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Campaign details
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    type: object
+                  activeVersion:
+                    type: object
+                    nullable: true
+                  draftVersion:
+                    type: object
+                    nullable: true
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/draft:
+    patch:
+      summary: Update draft version
+      description: Modifies draft campaign version (trigger, audience, steps, rules) with optimistic concurrency
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedVersion:
+                  type: integer
+                name:
+                  type: string
+                trigger:
+                  type: object
+                audience:
+                  type: object
+                steps:
+                  type: array
+                  items:
+                    type: object
+                rules:
+                  type: object
+      responses:
+        '200':
+          description: Draft updated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign, draftVersion]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    type: object
+                  draftVersion:
+                    type: object
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/dry-runs:
+    post:
+      summary: Execute pre-flight dry-run evaluation
+      description: Simulates audience qualification, template parameter binding, and generates required reviewFingerprint
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Dry run evaluation complete
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, dryRun]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  dryRun:
+                    type: object
+                    required: [draftFingerprint, summary]
+                    properties:
+                      draftFingerprint:
+                        type: string
+                      summary:
+                        type: object
+                        required: [totalEvaluated, eligibleCount, excludedCount]
+                        properties:
+                          totalEvaluated:
+                            type: integer
+                          eligibleCount:
+                            type: integer
+                          excludedCount:
+                            type: integer
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/activate:
+    post:
+      summary: Activate campaign
+      description: Publishes immutable version and runs planner; requires reviewFingerprint generated from dry run
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [reviewFingerprint, expectedVersion]
+              properties:
+                reviewFingerprint:
+                  type: string
+                expectedVersion:
+                  type: integer
+      responses:
+        '200':
+          description: Campaign activated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    type: object
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/pause:
+    post:
+      summary: Pause campaign
+      description: Pauses an active campaign, invalidates in-flight evaluation leases, and bumps pause generation
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Campaign paused
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    type: object
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/resume:
+    post:
+      summary: Resume campaign
+      description: Resumes a paused campaign, advances pause generation, and re-enables due dispatch evaluation
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Campaign resumed
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    type: object
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/archive:
+    post:
+      summary: Archive campaign
+      description: Archives a campaign, cancels pending executions, and marks enrollments cancelled
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Campaign archived
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, campaign]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  campaign:
+                    type: object
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/publish-revision:
+    post:
+      summary: Publish revision
+      description: Publishes an updated version for an active campaign with optimistic concurrency
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [expectedVersion, reviewFingerprint]
+              properties:
+                expectedVersion:
+                  type: integer
+                reviewFingerprint:
+                  type: string
+                steps:
+                  type: array
+                  items:
+                    type: object
+      responses:
+        '200':
+          description: Revision published
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '422':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/validate:
+    post:
+      summary: Validate campaign configuration
+      description: Validates approved templates, parameter bindings, and channel readiness
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                expectedVersion:
+                  type: integer
+      responses:
+        '200':
+          description: Validation result
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, valid, errors, warnings]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  valid:
+                    type: boolean
+                  errors:
+                    type: array
+                    items:
+                      type: object
+                  warnings:
+                    type: array
+                    items:
+                      type: object
+        '400':
+          $ref: '#/components/responses/ErrorResponse'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '409':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/enrollments:
+    get:
+      summary: Get campaign enrollments
+      description: Returns paginated enrollments for a campaign with customer IDs and occasion dates
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated enrollments
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, enrollments, total, page, limit]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  enrollments:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/{id}/history:
+    get:
+      summary: Get campaign execution history
+      description: Returns paginated execution history records for a campaign
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: page
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 1
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+      responses:
+        '200':
+          description: Paginated execution history
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, history, total, page, limit]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  history:
+                    type: array
+                    items:
+                      type: object
+                  total:
+                    type: integer
+                  page:
+                    type: integer
+                  limit:
+                    type: integer
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /enrollments/{id}/resolve-hold:
+    post:
+      summary: Release conversation reply hold
+      description: Staff action to release a customer reply hold and resume automated sequences
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Hold released
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  message:
+                    type: string
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /enrollments/{id}/mark-goal:
+    post:
+      summary: Mark occasion purchase or goal reached
+      description: Staff action to record occasion purchase, stopping further automated promotional messages
+      security:
+        - BearerAuth: []
+        - IdempotencyKey: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: Idempotency-Key
+          in: header
+          required: false
+          schema:
+            type: string
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                orderRef:
+                  type: string
+      responses:
+        '200':
+          description: Goal marked
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, message]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  message:
+                    type: string
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '403':
+          $ref: '#/components/responses/ErrorResponse'
+        '404':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaign-activity:
+    get:
+      summary: Activity stream
+      description: Returns recent campaign execution activity with plain-English explanation reasons
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Activity stream
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, activity]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  activity:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/ActivityItem'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /customers:
+    get:
+      summary: List patrons
+      description: Returns patron profiles for the authenticated boutique tenant
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Patrons list
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, customers]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  customers:
+                    type: array
+                    items:
+                      type: object
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /templates:
+    get:
+      summary: List template dictionary
+      description: Returns dictionary of pre-approved WhatsApp templates
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Template dictionary
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, templates]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  templates:
+                    type: object
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/reports/owner-overview:
+    get:
+      summary: Owner reporting overview
+      description: Returns single-attribution sales, campaign attribution breakdown, and operational metrics
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Owner overview report
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, report]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  report:
+                    $ref: '#/components/schemas/OwnerOverviewReport'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/reports/customer-timeline/{customerId}:
+    get:
+      summary: Customer execution timeline
+      description: Returns customer occasion history and execution timeline with masked phone number
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: customerId
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Customer timeline report
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, customerId, timeline]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  customerId:
+                    type: string
+                  timeline:
+                    $ref: '#/components/schemas/CustomerTimeline'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+  /campaigns/monitoring/alerts:
+    get:
+      summary: Operational alerts and monitoring
+      description: Real-time operational alerts (planner lag, due step age, backlog, unknown outcomes)
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Monitoring alerts
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [success, monitoring]
+                properties:
+                  success:
+                    type: boolean
+                    enum: [true]
+                  monitoring:
+                    $ref: '#/components/schemas/MonitoringAlerts'
+        '401':
+          $ref: '#/components/responses/ErrorResponse'
+        '500':
+          $ref: '#/components/responses/ErrorResponse'
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+    InternalServiceAuth:
+      type: apiKey
+      in: header
+      name: x-internal-api-key
+    IdempotencyKey:
+      type: apiKey
+      in: header
+      name: Idempotency-Key
+
+  responses:
+    ErrorResponse:
+      description: Canonical error shape returned on failure
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/StandardError'
+
+  schemas:
+    StandardError:
+      type: object
+      required: [success, error, code]
+      properties:
+        success:
+          type: boolean
+          enum: [false]
+        error:
+          type: string
+          description: Human-readable error explanation
+        code:
+          type: string
+          description: Machine-readable error code
+        fieldPath:
+          type: string
+          description: Optional field path responsible for validation error
+
+    UserProfile:
+      type: object
+      required: [id, username, name, role, tenantId, shopName]
+      properties:
+        id:
+          type: string
+        username:
+          type: string
+        name:
+          type: string
+        role:
+          type: string
+          enum: [BOUTIQUE_OWNER, STORE_MANAGER, STAFF, SYSTEM]
+        tenantId:
+          type: string
+        shopName:
+          type: string
+
+    TenantSettings:
+      type: object
+      required:
+        - id
+        - version
+        - storeName
+        - timezone
+        - allowedHours
+        - caps
+        - globalPause
+        - outageGraceMinutes
+        - leapDayPolicy
+        - holidays
+        - blackouts
+        - notice
+      properties:
+        id:
+          type: string
+        version:
+          type: integer
+        storeName:
+          type: string
+          nullable: true
+        timezone:
+          type: string
+          example: Asia/Kolkata
+        allowedHours:
+          type: object
+          required: [start, end]
+          properties:
+            start:
+              type: string
+              example: '10:00'
+            end:
+              type: string
+              example: '19:00'
+        caps:
+          type: object
+          required: [marketing24h, marketing7d]
+          properties:
+            marketing24h:
+              type: integer
+              example: 1
+            marketing7d:
+              type: integer
+              example: 3
+        globalPause:
+          type: boolean
+        outageGraceMinutes:
+          type: integer
+          example: 120
+        leapDayPolicy:
+          type: string
+          enum: [FEB_28, MAR_01, LEAP_ONLY]
+        holidays:
+          type: array
+          items:
+            type: string
+        blackouts:
+          type: array
+          items:
+            type: string
+        notice:
+          type: string
+
+    ReasonCodeDefinition:
+      type: object
+      required: [code, category, ownerMessage, resolutionOwner]
+      properties:
+        code:
+          type: string
+          example: SKIPPED_GOAL_REACHED
+        category:
+          type: string
+          enum: [SKIP, DEFER, BLOCK, FAIL]
+        ownerMessage:
+          type: string
+          example: Qualifying occasion purchase or goal was completed, halting further automated messages.
+        resolutionOwner:
+          type: string
+          enum: [BOUTIQUE_OWNER, STORE_MANAGER, STAFF, SYSTEM, EXTERNAL_PROVIDER]
+
+    IntegrationReadiness:
+      type: object
+      required: [success, ready, connection, templates, missingConfiguration]
+      properties:
+        success:
+          type: boolean
+          enum: [true]
+        ready:
+          type: boolean
+        connection:
+          type: object
+          required: [status]
+          properties:
+            status:
+              type: string
+              enum: [ACTIVE, DISCONNECTED, NOT_PROVISIONED, PENDING]
+            connectionId:
+              type: string
+              nullable: true
+            phoneNumberId:
+              type: string
+              nullable: true
+            verifiedName:
+              type: string
+              nullable: true
+        templates:
+          type: array
+          items:
+            type: object
+            required: [templateId, name, category, status, languages]
+            properties:
+              templateId:
+                type: string
+              name:
+                type: string
+              category:
+                type: string
+              status:
+                type: string
+              languages:
+                type: array
+                items:
+                  type: string
+        missingConfiguration:
+          type: array
+          items:
+            type: string
+
+    CampaignSummary:
+      type: object
+      required: [id, name, industry, purpose, status, draftVersion, pauseGeneration]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        industry:
+          type: string
+        purpose:
+          type: string
+        status:
+          type: string
+          enum: [DRAFT, ACTIVE, PAUSED, ARCHIVED]
+        activeVersionId:
+          type: string
+          nullable: true
+        draftVersion:
+          type: integer
+        pauseGeneration:
+          type: integer
+        enrolledCount:
+          type: integer
+        activeVersion:
+          type: object
+
+    CampaignPreset:
+      type: object
+      required: [id, name, description, purpose, implemented, requiredEvents, requiredData]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        description:
+          type: string
+        purpose:
+          type: string
+        implemented:
+          type: boolean
+        requiredEvents:
+          type: array
+          items:
+            type: string
+        requiredData:
+          type: array
+          items:
+            type: string
+
+    ApprovedTemplate:
+      type: object
+      required: [id, name, language, category, status, variableKeys]
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        language:
+          type: string
+        category:
+          type: string
+        status:
+          type: string
+        variableKeys:
+          type: array
+          items:
+            type: string
+
+    ActivityItem:
+      type: object
+      required: [id, campaignName, stepId, customerId, occurrenceId, state, explanation, enrollmentId]
+      properties:
+        id:
+          type: string
+        campaignName:
+          type: string
+        stepId:
+          type: string
+        customerId:
+          type: string
+        occurrenceId:
+          type: string
+        state:
+          type: string
+        outcomeReason:
+          type: string
+        explanation:
+          type: string
+        dueAt:
+          type: string
+          format: date-time
+        updatedAt:
+          type: string
+          format: date-time
+        enrollmentId:
+          type: string
+        replyHoldAt:
+          type: string
+          format: date-time
+          nullable: true
+        goalReachedAt:
+          type: string
+          format: date-time
+          nullable: true
+
+    DomainEventPayload:
+      type: object
+      required: [schemaVersion, type, producer, entityId, occurredAt]
+      properties:
+        schemaVersion:
+          type: integer
+        eventId:
+          type: string
+        type:
+          type: string
+        producer:
+          type: string
+        entityId:
+          type: string
+        entityVersion:
+          type: integer
+        occurredAt:
+          type: string
+          format: date-time
+        customerId:
+          type: string
+        data:
+          type: object
+
+    OwnerOverviewReport:
+      type: object
+      required: [period, netSalesAttributedPaise, campaignBreakdown, operationalStatus]
+      properties:
+        period:
+          type: object
+        netSalesAttributedPaise:
+          type: integer
+        campaignBreakdown:
+          type: array
+          items:
+            type: object
+        operationalStatus:
+          type: object
+
+    CustomerTimeline:
+      type: object
+      required: [maskedPhone, activeEnrollments, pastExecutions]
+      properties:
+        customerName:
+          type: string
+        maskedPhone:
+          type: string
+        activeEnrollments:
+          type: array
+          items:
+            type: object
+        pastExecutions:
+          type: array
+          items:
+            type: object
+
+    MonitoringAlerts:
+      type: object
+      required: [alertCount, alerts]
+      properties:
+        alertCount:
+          type: integer
+        alerts:
+          type: array
+          items:
+            type: object

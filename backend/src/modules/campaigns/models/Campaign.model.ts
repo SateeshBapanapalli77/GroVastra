@@ -5,6 +5,7 @@ export type CampaignStatus = 'DRAFT' | 'VALIDATED' | 'ACTIVE' | 'PAUSED' | 'ARCH
 export interface ICampaign extends Document {
   id: string;
   tenantId: string;
+  presetId?: string | null;
   name: string;
   industry: 'BOUTIQUE' | 'HANDLOOM' | 'APPAREL';
   purpose: 'MARKETING' | 'ORDER_SERVICE';
@@ -22,6 +23,7 @@ const CampaignSchema = new Schema<ICampaign>(
   {
     id: { type: String, required: true, unique: true },
     tenantId: { type: String, required: true, index: true },
+    presetId: { type: String, default: null },
     name: { type: String, required: true, minlength: 3, maxlength: 100 },
     industry: { type: String, required: true, enum: ['BOUTIQUE', 'HANDLOOM', 'APPAREL'], default: 'BOUTIQUE' },
     purpose: { type: String, required: true, enum: ['MARKETING', 'ORDER_SERVICE'], default: 'MARKETING' },

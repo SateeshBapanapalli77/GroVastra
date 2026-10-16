@@ -12,6 +12,8 @@ import { getApprovedTemplate, resolveApprovedTemplate } from '../../adapters/tem
 import { decryptText, sha256 } from '../../../../shared/utils/crypto';
 import { normalizeE164 } from '../../../../shared/utils/phone';
 import { adjustForAllowedHoursAndBlackouts } from '../../../../shared/utils/clock';
+import { resolveShopDisplayName } from '../../services/shopResolver';
+export { resolveShopDisplayName } from '../../services/shopResolver';
 import { logger } from '../../../../config/logger';
 
 export type PipelineOutcome =
@@ -22,14 +24,15 @@ export type PipelineOutcome =
 
 /**
  * Preflight Safeguard Pipeline (Chain of Responsibility Pattern)
- * Evaluates gates in strict Reason Precedence Order (Handoff Page 33):
- * 1. Channel Suppression / Customer Deletion
- * 2. Campaign / Global Pause & Pause Generation
- * 3. Step Expiry / Lateness Cutoff
- * 4. Stop Rules (stopOnGoal purchase, stopOnReply staff hold)
- * 5. Content / Readiness / Template Blocked
- * 6. Prerequisite Check (PREVIOUS_ACCEPTED)
- * (Contact Frequency Caps are reserved inside the atomic submission transaction)
+ * Evaluates gates in strict Reason Precedence Order (Handoff Page 33, DECISIONS.md):
+ * 1. Customer Deleted / Channel Suppressed
+ * 2. Campaign / Global Pause
+ * 3. Invalid Source
+ * 4. Expiry
+ * 5. Goal / Reply Stop
+ * 6. Content / Template Readiness
+ * 7. Prerequisite
+ * 8. Contact Cap (reserved during atomic submission transaction)
  */
 export async function executePreflightSafeguards(
   execution: ICampaignExecution,
@@ -37,27 +40,53 @@ export async function executePreflightSafeguards(
 ): Promise<PipelineOutcome> {
   const { tenantId, campaignId, enrollmentId, stepId, expiresAt } = execution;
 
-  // 1. Global Pause Gate (Tenant Control Gate)
-  const tenantGate = await TenantControlGateModel.findOne({ tenantId });
+  // Load prerequisites for evaluation
+  const [tenantGate, campaign, campaignGate, enrollment] = await Promise.all([
+    TenantControlGateModel.findOne({ tenantId }),
+    CampaignModel.findOne({ id: campaignId, tenantId }),
+    CampaignControlGateModel.findOne({ tenantId, campaignId }),
+    CampaignEnrollmentModel.findOne({ id: enrollmentId, tenantId })
+  ]);
+
+  const version = enrollment
+    ? await CampaignVersionModel.findOne({ id: enrollment.campaignVersionId, tenantId })
+    : null;
+  const customer = enrollment
+    ? await CustomerModel.findOne({ id: enrollment.customerId, tenantId })
+    : null;
+  const stepDef = version?.steps.find((s) => s.stepId === stepId);
+
+  // 1. Customer Deleted / Channel Suppressed / Marketing Opt-Out Gate (Handoff Page 33, DECISIONS.md)
+  if (customer) {
+    if (customer.status === 'DELETED' || (customer as any).deleted) {
+      return { status: 'SKIP', reason: 'SKIPPED_CUSTOMER_DELETED' };
+    }
+
+    if (customer.channelSuppressed) {
+      return { status: 'SKIP', reason: 'SKIPPED_CHANNEL_SUPPRESSED' };
+    }
+
+    if (version?.purpose === 'MARKETING' && !customer.optedInMarketing) {
+      return { status: 'SKIP', reason: 'SKIPPED_MARKETING_OPT_OUT' };
+    }
+  } else if (enrollment) {
+    // Enrollment exists but customer record was deleted from database
+    return { status: 'SKIP', reason: 'SKIPPED_CUSTOMER_DELETED' };
+  }
+
+  // 2. Campaign / Global Pause Gate
   if (tenantGate?.globalPause) {
     return { status: 'SKIP', reason: 'CAMPAIGN_OR_GLOBAL_PAUSED' };
   }
 
-  // 2. Load Campaign & Version
-  const campaign = await CampaignModel.findOne({ id: campaignId, tenantId });
-  if (!campaign) {
-    return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_NOT_FOUND' };
-  }
-
-  // Campaign Pause Gate (Campaign Control Gate & Campaign Model status)
-  const campaignGate = await CampaignControlGateModel.findOne({ tenantId, campaignId });
-  if (campaign.status === 'PAUSED' || campaign.status === 'ARCHIVED' || campaignGate?.paused) {
+  if (campaign && (campaign.status === 'PAUSED' || campaign.status === 'ARCHIVED' || campaignGate?.paused)) {
     return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_PAUSED' };
   }
 
-  const expectedPauseGen = campaignGate?.pauseGeneration ?? campaign.pauseGeneration;
+  const expectedPauseGen = campaignGate?.pauseGeneration ?? campaign?.pauseGeneration;
   if (
     typeof execution.pauseGeneration === 'number' &&
+    expectedPauseGen !== undefined &&
     execution.pauseGeneration !== expectedPauseGen
   ) {
     return {
@@ -67,33 +96,34 @@ export async function executePreflightSafeguards(
     };
   }
 
-  const enrollment = await CampaignEnrollmentModel.findOne({ id: enrollmentId, tenantId });
+  // 3. Invalid Source Gate
+  if (!campaign) {
+    return { status: 'SKIP', reason: 'SKIPPED_CAMPAIGN_NOT_FOUND' };
+  }
+
   if (!enrollment || enrollment.status !== 'ACTIVE') {
     return { status: 'SKIP', reason: 'SKIPPED_ENROLLMENT_INACTIVE' };
   }
 
-  const version = await CampaignVersionModel.findOne({ id: enrollment.campaignVersionId, tenantId });
   if (!version) {
     return { status: 'SKIP', reason: 'SKIPPED_VERSION_NOT_FOUND' };
   }
 
-  const stepDef = version.steps.find((s) => s.stepId === stepId);
   if (!stepDef) {
     return { status: 'SKIP', reason: 'SKIPPED_STEP_NOT_FOUND' };
   }
 
-  // 3. Load Customer & Permission Gates
-  const customer = await CustomerModel.findOne({ id: enrollment.customerId, tenantId });
-  if (!customer || customer.status === 'DELETED') {
+  if (!customer) {
     return { status: 'SKIP', reason: 'SKIPPED_CUSTOMER_DELETED' };
   }
 
-  if (customer.channelSuppressed) {
-    return { status: 'SKIP', reason: 'SKIPPED_CHANNEL_SUPPRESSED' };
-  }
-
-  if (version.purpose === 'MARKETING' && !customer.optedInMarketing) {
-    return { status: 'SKIP', reason: 'SKIPPED_MARKETING_OPT_OUT' };
+  // Live Stock Re-check Gate (Spec p.13, tests A15, A16)
+  if (enrollment.sourceRef?.type === 'STOCK_EVENT') {
+    const sku = enrollment.sourceRef.id;
+    const product = await ProductModel.findOne({ tenantId, sku });
+    if (!product || product.stockCount <= 0 || !product.isSellable) {
+      return { status: 'SKIP', reason: 'SKIPPED_STOCK_DEPLETED' };
+    }
   }
 
   // 4. Expiry Check (Page 17 & 33)
@@ -101,8 +131,8 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_STEP_EXPIRED' };
   }
 
-  // 5. Stop Rules (Handoff Page 8 & 11)
-  // Stop on Goal Purchase: takes precedence over reply hold (Spec p.33)
+  // 5. Goal / Reply Stop Rules (Handoff Page 8 & 11, Spec p.33)
+  // Stop on Goal Purchase: takes precedence over reply hold
   if (stepDef.stopOnGoal !== false && enrollment.goalReachedAt !== null) {
     return { status: 'SKIP', reason: 'SKIPPED_GOAL_REACHED' };
   }
@@ -112,7 +142,7 @@ export async function executePreflightSafeguards(
     return { status: 'SKIP', reason: 'SKIPPED_REPLY_HOLD' };
   }
 
-  // 6. Template Readiness Gate (Spec p.8, p.19, p.27, p.32 test C02, C19)
+  // 6. Content / Template Readiness Gate (Spec p.8, p.19, p.27, p.32 test C02, C19)
   let template;
   try {
     template = await resolveApprovedTemplate(
@@ -129,41 +159,13 @@ export async function executePreflightSafeguards(
     return { status: 'BLOCKED', reason: 'CONTENT_OR_TEMPLATE_BLOCKED' };
   }
 
-  // 7. Template Purpose Gate (Spec p.27, test C14)
-  // Marketing template must never pass itself off as service
+  // Template Purpose Gate (Spec p.27, test C14)
   if (version.purpose === 'ORDER_SERVICE' && template.category === 'MARKETING') {
     return { status: 'BLOCKED', reason: 'BLOCKED_TEMPLATE_PURPOSE_MISMATCH' };
   }
 
-  // 8. Live Stock Re-check Gate (Spec p.13, tests A15, A16)
-  if (enrollment.sourceRef?.type === 'STOCK_EVENT') {
-    const sku = enrollment.sourceRef.id;
-    const product = await ProductModel.findOne({ tenantId, sku });
-    if (!product || product.stockCount <= 0 || !product.isSellable) {
-      return { status: 'SKIP', reason: 'SKIPPED_STOCK_DEPLETED' };
-    }
-  }
-
-  // 9. Resolve Parameter Bindings (Spec p.8, p.19, C05)
-  // Authoritative shop name resolution (Finding 3): Never campaign name!
-  let storeDisplayName = (version as any).brandName || '';
-  if (!storeDisplayName) {
-    const { TenantSettingsModel } = await import('../../models/TenantSettings.model');
-    const tSettings = await TenantSettingsModel.findOne({ tenantId }).lean();
-    if (tSettings && (tSettings as any).storeName) {
-      storeDisplayName = (tSettings as any).storeName;
-    }
-  }
-  if (!storeDisplayName) {
-    const { TenantConnectionModel } = await import('../../models/TenantConnection.model');
-    const tConn = await TenantConnectionModel.findOne({ tenantId, status: 'ACTIVE' }).lean();
-    if (tConn?.metadata?.wabaAccountName || tConn?.metadata?.storeName) {
-      storeDisplayName = tConn.metadata.wabaAccountName || tConn.metadata.storeName;
-    }
-  }
-  if (!storeDisplayName) {
-    storeDisplayName = 'Padmavati Silks'; // Default boutique brand identity fallback
-  }
+  // Resolve Parameter Bindings (Spec p.8, p.19, C05)
+  const storeDisplayName = await resolveShopDisplayName(tenantId, version);
 
   const { OrderModel } = await import('../../../orders/models/Order.model');
   let orderDoc: any = null;
@@ -186,30 +188,44 @@ export async function executePreflightSafeguards(
   for (const varKey of template.variableKeys) {
     const rawExpr = rawBindings[varKey];
     let resolvedValue = '';
+    let isCustomerOrInstanceVar = false;
 
     if (rawExpr) {
       const expr = typeof rawExpr === 'string' ? rawExpr : String(rawExpr || '');
       // Strict allowlist: ONLY customer name, shop, validated offer, event date, product, order
       if (expr === 'customer.firstName') {
         resolvedValue = customer.firstName || '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'customer.lastName') {
         resolvedValue = customer.lastName || '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'customer.fullName') {
-        resolvedValue = `${customer.firstName} ${customer.lastName}`.trim();
+        resolvedValue = `${customer.firstName || ''} ${customer.lastName || ''}`.trim();
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'shop.displayName' || expr === 'shop.name' || expr === 'store.displayName' || expr === 'shop' || expr === 'store') {
+        if (!storeDisplayName) {
+          logger.warn({ tenantId, executionId: execution.id }, 'Blocked step: shop display name is not configured');
+          return { status: 'BLOCKED', reason: 'BLOCKED_SHOP_NAME_NOT_CONFIGURED' };
+        }
         resolvedValue = storeDisplayName;
       } else if (expr === 'order.itemTitle' || expr === 'order.title' || expr === 'order.item' || expr === 'product.title' || expr === 'item' || expr === 'outfit') {
-        resolvedValue = boutiqueJobDoc?.itemTitle || productDoc?.title || (orderDoc ? (orderDoc.items?.[0]?.title || `Boutique Order #${orderDoc.id.slice(-6)}`) : '');
+        resolvedValue = boutiqueJobDoc?.itemTitle || productDoc?.title || orderDoc?.items?.[0]?.title || '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'product.sku') {
         resolvedValue = productDoc?.sku || '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'product.price') {
         resolvedValue = productDoc ? `₹${(productDoc.pricePaise / 100).toLocaleString('en-IN')}` : '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'order.id') {
         resolvedValue = orderDoc?.id || boutiqueJobDoc?.id || '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'order.amount' || expr === 'order.netPaise') {
         resolvedValue = orderDoc ? `₹${(orderDoc.netPaise / 100).toLocaleString('en-IN')}` : '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'event.date' || expr === 'event.localDate' || expr === 'occasion.date') {
         resolvedValue = enrollment.occasionLocalDate || '';
+        isCustomerOrInstanceVar = true;
       } else if (expr === 'offer.code' || expr === 'offer') {
         resolvedValue = (version as any).offerCode || '';
       } else if (expr.startsWith('literal:')) {
@@ -223,16 +239,28 @@ export async function executePreflightSafeguards(
       // Default mappings by key name if not explicitly bound
       if (varKey === 'name') {
         resolvedValue = customer.firstName || '';
+        isCustomerOrInstanceVar = true;
       } else if (varKey === 'shop' || varKey === 'store') {
+        if (!storeDisplayName) {
+          logger.warn({ tenantId, executionId: execution.id }, 'Blocked step: shop display name is not configured');
+          return { status: 'BLOCKED', reason: 'BLOCKED_SHOP_NAME_NOT_CONFIGURED' };
+        }
         resolvedValue = storeDisplayName;
       } else if (varKey === 'item' || varKey === 'outfit') {
-        resolvedValue = boutiqueJobDoc?.itemTitle || productDoc?.title || (orderDoc ? `Boutique Order #${orderDoc.id.slice(-6)}` : '');
+        resolvedValue = boutiqueJobDoc?.itemTitle || productDoc?.title || orderDoc?.items?.[0]?.title || '';
+        isCustomerOrInstanceVar = true;
       } else if (varKey === 'offer') {
         resolvedValue = (version as any).offerCode || '';
+      } else {
+        logger.warn({ varKey }, 'Blocked missing variable binding for required template variable');
+        return { status: 'BLOCKED', reason: 'BLOCKED_MISSING_VARIABLE_BINDING' };
       }
     }
 
     if (!resolvedValue || resolvedValue.trim() === '') {
+      if (isCustomerOrInstanceVar) {
+        return { status: 'SKIP', reason: 'SKIPPED_MISSING_VARIABLE' };
+      }
       return { status: 'BLOCKED', reason: 'BLOCKED_MISSING_VARIABLE_BINDING' };
     }
 

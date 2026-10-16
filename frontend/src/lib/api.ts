@@ -1,3 +1,5 @@
+import type { components } from './types.generated';
+
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1';
 
 let cachedToken: string | null = null;
@@ -253,5 +255,24 @@ export const api = {
 
   getCampaignHistory: async (campaignId: string, page: number = 1, limit: number = 50): Promise<{ success: boolean; history: any[]; total: number }> => {
     return request(`/campaigns/${campaignId}/history?page=${page}&limit=${limit}`);
+  },
+
+  // Reason Codes (Step 12)
+  getReasonCodes: async (): Promise<{ success: boolean; reasonCodes: components['schemas']['ReasonCodeDefinition'][] }> => {
+    return request('/campaign-reason-codes');
+  },
+
+  // Integration Readiness (Step 12)
+  getIntegrationReadiness: async (): Promise<components['schemas']['IntegrationReadiness']> => {
+    return request('/integration-readiness');
+  },
+
+  // Presets & Capability (Step 10)
+  getPresets: async (): Promise<{ success: boolean; presets: components['schemas']['CampaignPreset'][] }> => {
+    return request('/campaign-presets');
+  },
+
+  getTenantPresets: async (): Promise<{ success: boolean; presets: components['schemas']['CampaignPreset'][] }> => {
+    return request('/campaign-tenant-presets');
   }
 };

@@ -21,8 +21,10 @@ export interface ICampaignVersion extends Document {
   id: string;
   tenantId: string;
   campaignId: string;
+  presetId?: string | null;
   version: number;
   name: string;
+  brandName?: string;
   industry: 'BOUTIQUE' | 'HANDLOOM' | 'APPAREL';
   purpose: 'MARKETING' | 'ORDER_SERVICE';
   trigger: {
@@ -81,8 +83,10 @@ const CampaignVersionSchema = new Schema<ICampaignVersion>(
     id: { type: String, required: true, unique: true },
     tenantId: { type: String, required: true },
     campaignId: { type: String, required: true },
+    presetId: { type: String, default: null },
     version: { type: Number, required: true },
     name: { type: String, required: true },
+    brandName: { type: String, default: null },
     industry: { type: String, required: true, default: 'BOUTIQUE' },
     purpose: { type: String, required: true, default: 'MARKETING' },
     trigger: {

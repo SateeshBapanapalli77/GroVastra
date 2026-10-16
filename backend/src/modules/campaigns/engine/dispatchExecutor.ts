@@ -6,7 +6,12 @@ import { TenantControlGateModel } from '../models/TenantControlGate.model';
 import { CampaignControlGateModel } from '../models/CampaignControlGate.model';
 import { TenantConnectionModel } from '../models/TenantConnection.model';
 import { executePreflightSafeguards, PipelineOutcome } from './safeguards/safeguardPipeline';
-import { checkAndReserveContactCapacity, updateContactReservationStatus } from './safeguards/contactCapResolver';
+import {
+  checkAndReserveContactCapacity,
+  updateContactReservationStatus,
+  ContactCapExceededError
+} from './safeguards/contactCapResolver';
+export { ContactCapExceededError } from './safeguards/contactCapResolver';
 import { ProductModel } from '../../inventory/models/Product.model';
 import { IWhatsAppDeliveryAdapter } from '../adapters/deliveryAdapter.interface';
 import { getWhatsAppDeliveryAdapter } from '../adapters/adapterFactory';
@@ -242,7 +247,7 @@ export async function processClaimedExecution(
     // 2. Preflight passed -> PROCEED to ONE MongoDB Transaction (Handoff p.25, P1.b, P1.c)
     // Validate control generations + reserve contact capacity + freeze one delivery intent + mark DISPATCHING
     const { customer, version, enrollment, campaign, parameters, payloadHash } = outcome;
-    const stepDef = version.steps.find((s) => s.stepId === execution.stepId)!;
+    const stepDef = version.steps.find((s: any) => s.stepId === execution.stepId)!;
     const attemptId = `attempt_${ulid().toLowerCase()}`;
     const deliveryIntentId = execution.deliveryIntentId || generateId('di');
 
@@ -317,7 +322,10 @@ export async function processClaimedExecution(
           );
 
           if (!capResult.allowed) {
-            throw new Error(capResult.reason || 'SKIPPED_CONTACT_CAP');
+            throw new ContactCapExceededError(
+              capResult.reason || 'SKIPPED_CONTACT_CAP',
+              capResult.nextAvailableAt
+            );
           }
         }
 
@@ -449,24 +457,35 @@ export async function processClaimedExecution(
         return 'SKIPPED';
       }
 
-      if (errMsg === 'DEFERRED_CONTACT_CAP' || errMsg === 'SKIPPED_CONTACT_CAP') {
+      if (txErr instanceof ContactCapExceededError || errMsg === 'DEFERRED_CONTACT_CAP' || errMsg === 'SKIPPED_CONTACT_CAP') {
+        const capErr = txErr instanceof ContactCapExceededError ? txErr : null;
+        const nextAvailableAt = capErr?.nextAvailableAt;
+        const isExpired = Boolean(
+          nextAvailableAt && execution.expiresAt && nextAvailableAt.getTime() >= execution.expiresAt.getTime()
+        );
+        const shouldSkip = isExpired || capErr?.reason === 'SKIPPED_CONTACT_CAP' || errMsg === 'SKIPPED_CONTACT_CAP' || !nextAvailableAt;
+
+        const updateSet: Record<string, any> = {
+          state: shouldSkip ? 'SKIPPED' : 'DEFERRED',
+          outcomeReason: shouldSkip ? 'SKIPPED_CONTACT_CAP' : 'DEFERRED_CONTACT_CAP',
+          'lease.token': null,
+          'lease.until': null,
+          'lease.claimedBy': null
+        };
+
+        if (!shouldSkip && nextAvailableAt) {
+          updateSet.dueAt = nextAvailableAt;
+        }
+
         const updateRes = await CampaignExecutionModel.updateOne(
           recoveryFence,
-          {
-            $set: {
-              state: errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED',
-              outcomeReason: errMsg,
-              'lease.token': null,
-              'lease.until': null,
-              'lease.claimedBy': null
-            }
-          }
+          { $set: updateSet }
         );
         if (updateRes.matchedCount === 0) {
           logger.warn({ executionId, claimVersion: execution.claimVersion }, 'Recovery CAS failed; stale worker aborted without mutating execution');
           return 'FAILED';
         }
-        return errMsg === 'DEFERRED_CONTACT_CAP' ? 'DEFERRED' : 'SKIPPED';
+        return shouldSkip ? 'SKIPPED' : 'DEFERRED';
       }
 
       if (errMsg === 'SKIPPED_STOCK_DEPLETED') {

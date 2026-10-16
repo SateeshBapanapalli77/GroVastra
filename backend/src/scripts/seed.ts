@@ -5,6 +5,11 @@ import { env } from '../config/env';
 import { logger } from '../config/logger';
 
 async function seed() {
+  if (process.env.NODE_ENV === 'production' || env.NODE_ENV === 'production') {
+    logger.error('Refusing to seed database in production environment');
+    throw new Error('SEED_REFUSED_IN_PRODUCTION');
+  }
+
   logger.info('Starting GroVastra database seed...');
   await connectDatabase();
 
@@ -155,7 +160,7 @@ async function seed() {
       id: 'usr_owner_01',
       tenantId,
       username: 'owner@padmavati.com',
-      passwordHash: hashPassword(ownerPassword),
+      passwordHash: await hashPassword(ownerPassword),
       name: 'Padmavati Sundar',
       role: 'BOUTIQUE_OWNER' as const,
       shopName: 'Padmavati Handlooms'
@@ -164,7 +169,7 @@ async function seed() {
       id: 'usr_staff_01',
       tenantId,
       username: 'staff@padmavati.com',
-      passwordHash: hashPassword(staffPassword),
+      passwordHash: await hashPassword(staffPassword),
       name: 'Anjali Sharma',
       role: 'STAFF' as const,
       shopName: 'Padmavati Handlooms'

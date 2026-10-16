@@ -13,7 +13,6 @@ const envSchema = z
     MONGODB_URI: z.string().default('mongodb://127.0.0.1:27017/grovastra?replicaSet=rs0'),
     ENCRYPTION_KEY: z.string().min(32).optional(),
     JWT_SECRET: z.string().min(32).optional(),
-    INTERNAL_API_KEY: z.string().min(24).optional(),
     DEFAULT_TENANT_ID: z.string().default('shop_demo'),
     LOG_LEVEL: z.enum(['fatal', 'error', 'warn', 'info', 'debug', 'trace']).default('info'),
     WHATSAPP_MODE: z.enum(['mock', 'sandbox', 'live']).default('mock'),
@@ -27,7 +26,7 @@ const envSchema = z
   .superRefine((data, ctx) => {
     if (data.NODE_ENV !== 'production') return;
     const required: Array<keyof typeof data> = [
-      'ENCRYPTION_KEY', 'JWT_SECRET', 'INTERNAL_API_KEY',
+      'ENCRYPTION_KEY', 'JWT_SECRET',
       'WHATSAPP_APP_SECRET', 'WHATSAPP_WEBHOOK_VERIFY_TOKEN'
     ];
     for (const key of required) {

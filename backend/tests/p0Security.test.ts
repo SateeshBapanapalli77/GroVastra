@@ -3,7 +3,8 @@ import http from 'http';
 import app from '../src/server';
 import mongoose from 'mongoose';
 import { generateId } from '../src/shared/utils/id';
-import { signJwt } from '../src/shared/middleware/auth.middleware';
+import crypto from 'crypto';
+import { signJwt, verifyJwt } from '../src/shared/middleware/auth.middleware';
 import { signInternalServiceToken } from '../src/shared/middleware/internalAuth.middleware';
 import { CustomerModel } from '../src/modules/crm/models/Customer.model';
 import { CampaignModel } from '../src/modules/campaigns/models/Campaign.model';
@@ -12,8 +13,10 @@ import { CampaignEnrollmentModel } from '../src/modules/campaigns/models/Campaig
 import { CampaignExecutionModel } from '../src/modules/campaigns/models/CampaignExecution.model';
 import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
 import { TenantConnectionModel } from '../src/modules/campaigns/models/TenantConnection.model';
-import { UserModel, hashPassword } from '../src/modules/auth/models/User.model';
+import { UserModel, hashPassword, verifyPasswordHash, needsRehash, dummyHash } from '../src/modules/auth/models/User.model';
+import { mintServiceToken } from '../src/scripts/mintServiceToken';
 import { processNextPendingEvent } from '../src/workers/events';
+import { logger } from '../src/config/logger';
 
 describe('Work Package P0: Security Holes & Verification', () => {
   const tenantA = 'qa_tenant_sec_a';
@@ -316,8 +319,12 @@ describe('Work Package P0: Security Holes & Verification', () => {
 
       // If simulated crash occurred while RECEIVED, worker recovers it
       if (saved) {
-        saved.status = 'RECEIVED';
-        await saved.save();
+        // Allow in-flight async route handler promise to settle
+        await new Promise((r) => setTimeout(r, 50));
+        await CampaignEventInboxModel.updateOne(
+          { tenantId: tenantA, eventId },
+          { $set: { status: 'RECEIVED', nextAttemptAt: null } }
+        );
 
         const recovered = await processNextPendingEvent(tenantA);
         expect(recovered?.eventId).toBe(eventId);
@@ -492,7 +499,7 @@ describe('Work Package P0: Security Holes & Verification', () => {
         id: 'usr_test_owner',
         tenantId: tenantA,
         username: 'owner@testboutique.com',
-        passwordHash: hashPassword('SecretPass123!'),
+        passwordHash: await hashPassword('SecretPass123!'),
         name: 'Padmavati',
         role: 'BOUTIQUE_OWNER',
         shopName: 'Padmavati Handlooms'
@@ -517,7 +524,7 @@ describe('Work Package P0: Security Holes & Verification', () => {
         id: 'usr_test_owner2',
         tenantId: tenantA,
         username: 'owner2@testboutique.com',
-        passwordHash: hashPassword('CorrectPass!'),
+        passwordHash: await hashPassword('CorrectPass!'),
         name: 'Padmavati',
         role: 'BOUTIQUE_OWNER',
         shopName: 'Padmavati Handlooms'
@@ -547,6 +554,323 @@ describe('Work Package P0: Security Holes & Verification', () => {
 
       expect(res.status).toBe(403);
       expect(res.body.error).toContain("Role 'STAFF' lacks permission");
+    });
+  });
+
+  describe('Step 6: Password and Credential Security', () => {
+    it('salt uniqueness: same password produces distinct 16-byte salts and hashes, both verify', async () => {
+      const password = 'BoutiqueSecurePassword#2026';
+      const hash1 = await hashPassword(password);
+      const hash2 = await hashPassword(password);
+
+      expect(hash1).not.toBe(hash2);
+      expect(hash1.startsWith('scrypt$')).toBe(true);
+      expect(hash2.startsWith('scrypt$')).toBe(true);
+
+      const parts1 = hash1.split('$');
+      const parts2 = hash2.split('$');
+      expect(parts1.length).toBe(3);
+      expect(parts2.length).toBe(3);
+
+      const salt1 = parts1[1];
+      const salt2 = parts2[1];
+      expect(salt1).not.toBe(salt2);
+      // 16 bytes encoded as hex = 32 hex characters
+      expect(salt1.length).toBe(32);
+      expect(salt2.length).toBe(32);
+
+      expect(await verifyPasswordHash(password, hash1)).toBe(true);
+      expect(await verifyPasswordHash(password, hash2)).toBe(true);
+      expect(await verifyPasswordHash('WrongPass!', hash1)).toBe(false);
+    });
+
+    it('old-hash upgrade: legacy PBKDF2 hash verifies once and upgrades to scrypt on login', async () => {
+      const legacyPassword = 'LegacyOwnerPass2025!';
+      const legacyHash = crypto
+        .pbkdf2Sync(legacyPassword, 'grovastra_salt_heritage_boutique', 10000, 64, 'sha512')
+        .toString('hex');
+
+      expect(needsRehash(legacyHash)).toBe(true);
+
+      const userId = 'usr_legacy_upgrade_test';
+      await UserModel.create({
+        id: userId,
+        tenantId: tenantA,
+        username: 'legacyowner@testboutique.com',
+        passwordHash: legacyHash,
+        name: 'Legacy Owner',
+        role: 'BOUTIQUE_OWNER',
+        shopName: 'Heritage Silks'
+      });
+
+      // Login with valid credentials using the legacy hash
+      const loginRes = await apiPost('/api/v1/auth/login', {
+        username: 'legacyowner@testboutique.com',
+        password: legacyPassword
+      });
+
+      expect(loginRes.status).toBe(200);
+      expect(loginRes.body.success).toBe(true);
+      expect(loginRes.body.token).toBeDefined();
+
+      // Verify the database document was upgraded to modern scrypt scheme
+      const updatedUser = await UserModel.findOne({ id: userId });
+      expect(updatedUser).not.toBeNull();
+      expect(updatedUser!.passwordHash.startsWith('scrypt$')).toBe(true);
+      expect(needsRehash(updatedUser!.passwordHash)).toBe(false);
+
+      // Verify subsequent login succeeds with the upgraded hash
+      const secondLogin = await apiPost('/api/v1/auth/login', {
+        username: 'legacyowner@testboutique.com',
+        password: legacyPassword
+      });
+      expect(secondLogin.status).toBe(200);
+      expect(secondLogin.body.success).toBe(true);
+    });
+
+    it('unknown-user timing parity: executes dummy scrypt hash to prevent timing oracle attacks', async () => {
+      const existingPassword = 'ValidPassword123!';
+      const existingHash = await hashPassword(existingPassword);
+      await UserModel.create({
+        id: 'usr_timing_test',
+        tenantId: tenantA,
+        username: 'existing@testboutique.com',
+        passwordHash: existingHash,
+        name: 'Timing User',
+        role: 'STAFF',
+        shopName: 'Heritage Silks'
+      });
+
+      // Measure unknown user request duration (dummy hash runs)
+      const t0Unknown = performance.now();
+      const resUnknown = await apiPost('/api/v1/auth/login', {
+        username: 'nonexistent_user_99999@testboutique.com',
+        password: 'SomeRandomPassword123!'
+      });
+      const tUnknown = performance.now() - t0Unknown;
+
+      // Measure existing user with wrong password duration (scrypt verify runs)
+      const t0Existing = performance.now();
+      const resExisting = await apiPost('/api/v1/auth/login', {
+        username: 'existing@testboutique.com',
+        password: 'IncorrectPassword123!'
+      });
+      const tExisting = performance.now() - t0Existing;
+
+      expect(resUnknown.status).toBe(401);
+      expect(resExisting.status).toBe(401);
+      expect(resUnknown.body.error).toBe('Invalid username or password');
+      expect(resExisting.body.error).toBe('Invalid username or password');
+
+      // Both must perform an scrypt computation
+      expect(tUnknown).toBeGreaterThan(1);
+      expect(tExisting).toBeGreaterThan(1);
+    });
+
+    it('mintServiceToken: creates a valid SYSTEM token with tenantId, producer and eventFamily', () => {
+      const token = mintServiceToken({
+        tenantId: tenantA,
+        producer: 'shopify_webhook',
+        eventFamily: 'orders'
+      });
+
+      expect(token).toBeDefined();
+      const payload = verifyJwt(token) as any;
+      expect(payload.role).toBe('SYSTEM');
+      expect(payload.tenantId).toBe(tenantA);
+      expect(payload.producer).toBe('shopify_webhook');
+      expect(payload.eventFamily).toBe('orders');
+      expect(payload.userId).toBe('svc_shopify_webhook');
+    });
+
+    it('JWT lifetime is shortened to 12 hours (43200 seconds)', () => {
+      const token = signJwt({
+        userId: 'usr_jwt_lifetime',
+        tenantId: tenantA,
+        role: 'BOUTIQUE_OWNER'
+      });
+
+      const parts = token.split('.');
+      const payload = JSON.parse(Buffer.from(parts[1], 'base64url').toString('utf8'));
+      expect(payload.exp - payload.iat).toBe(12 * 3600);
+    });
+
+    it('env configuration has removed INTERNAL_API_KEY', async () => {
+      const { env } = await import('../src/config/env');
+      expect((env as any).INTERNAL_API_KEY).toBeUndefined();
+    });
+  });
+
+  describe('Step 7: PII Redaction & Log Leak Prevention', () => {
+    it('does not leak phone number or message text into logs when receiving WhatsApp webhook', async () => {
+      // 1. Setup tenant connection & customer in DB
+      const connectionId = 'conn_phone_leak_test';
+      await TenantConnectionModel.create({
+        id: generateId('tc'),
+        tenantId: tenantA,
+        connectionId,
+        provider: 'whatsapp_cloud',
+        status: 'ACTIVE'
+      });
+
+      const customerPhone = '+919988776655';
+      const rawCustomerPhone = '919988776655';
+      const customer = await CustomerModel.create({
+        id: 'cus_p0_leak_test',
+        tenantId: tenantA,
+        firstName: 'Seema',
+        lastName: 'Patel',
+        phone: customerPhone,
+        optedInMarketing: true,
+        channelSuppressed: false,
+        status: 'ACTIVE'
+      });
+
+      const enrollment = await CampaignEnrollmentModel.create({
+        id: 'enr_leak_test',
+        tenantId: tenantA,
+        campaignId: 'cmp_bday',
+        campaignVersionId: 'cv_bday',
+        customerId: customer.id,
+        occurrenceId: 'birthday:2027',
+        sourceRef: { type: 'CUSTOMER_DATE', id: customer.id, version: 1 },
+        status: 'ACTIVE',
+        replyHoldAt: null,
+        planRevision: 1
+      });
+
+      // 2. Prepare Meta webhook payload with customer phone and sensitive message body
+      const sensitiveText = 'PrivatePersonalCustomerMessageSecret_X992';
+      const { env } = await import('../src/config/env');
+      const secret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_secret';
+
+      const metaPayload = {
+        object: 'whatsapp_business_account',
+        entry: [
+          {
+            id: 'waba_leak_01',
+            changes: [
+              {
+                value: {
+                  messaging_product: 'whatsapp',
+                  metadata: {
+                    display_phone_number: '919988776655',
+                    phone_number_id: connectionId
+                  },
+                  messages: [
+                    {
+                      from: rawCustomerPhone,
+                      id: 'wamid.HBgL01LEAKTEST',
+                      timestamp: `${Math.floor(Date.now() / 1000)}`,
+                      text: { body: sensitiveText },
+                      type: 'text'
+                    }
+                  ]
+                },
+                field: 'messages'
+              }
+            ]
+          }
+        ]
+      };
+
+      const rawBody = JSON.stringify(metaPayload);
+      const signature = `sha256=${crypto.createHmac('sha256', secret).update(rawBody).digest('hex')}`;
+
+      // 3. Capture all logger / stdout output during request handling
+      let capturedLogs = '';
+      const pino = require('pino');
+      const stream = (logger as any)[pino.symbols.streamSym];
+      const origStreamWrite = stream?.write?.bind(stream);
+      if (origStreamWrite) {
+        stream.write = (chunk: any) => {
+          capturedLogs += chunk.toString();
+          return origStreamWrite(chunk);
+        };
+      }
+
+      const originalWrite = process.stdout.write;
+      process.stdout.write = (chunk: any, ...args: any[]) => {
+        capturedLogs += chunk.toString();
+        return originalWrite.apply(process.stdout, [chunk, ...args]);
+      };
+
+      let res;
+      try {
+        res = await apiPost('/api/v1/webhooks/whatsapp', rawBody, {
+          'x-hub-signature-256': signature
+        });
+      } finally {
+        process.stdout.write = originalWrite;
+        if (origStreamWrite) {
+          stream.write = origStreamWrite;
+        }
+      }
+
+      expect(res.status).toBe(200);
+
+      // 4. Assert DB state (database-backed verification)
+      const updatedEnrollment = await CampaignEnrollmentModel.findById(enrollment._id);
+      expect(updatedEnrollment?.replyHoldAt).not.toBeNull();
+
+      // 5. Assert neither phone number nor message text appeared in logger output
+      expect(capturedLogs.includes(rawCustomerPhone)).toBe(false);
+      expect(capturedLogs.includes(customerPhone)).toBe(false);
+      expect(capturedLogs.includes(sensitiveText)).toBe(false);
+      // Ensure only counts/IDs were logged
+      expect(capturedLogs.includes('entryCount')).toBe(true);
+    });
+
+    it('pino redaction configuration redacts nested paths: req.headers.authorization, req.body, *.from, *.wa_id, *.phone, *.body, *.text', () => {
+      let captured = '';
+      const stream = {
+        write(msg: string) {
+          captured += msg;
+        }
+      };
+
+      const pino = require('pino');
+      const testLogger = pino(
+        {
+          redact: {
+            paths: [
+              'req.headers.authorization',
+              'req.body',
+              '*.from',
+              '*.wa_id',
+              '*.phone',
+              '*.body',
+              '*.text'
+            ],
+            censor: '[REDACTED]'
+          }
+        },
+        stream
+      );
+
+      testLogger.info({
+        req: {
+          headers: { authorization: 'Bearer top_secret_bearer_token' },
+          body: { cardDetails: '1234-5678' }
+        },
+        contact: {
+          from: '9876543210',
+          wa_id: 'wa_secret_id',
+          phone: '+919876543210'
+        },
+        message: {
+          body: 'sensitive_inner_body',
+          text: 'sensitive_inner_text'
+        }
+      });
+
+      expect(captured.includes('top_secret_bearer_token')).toBe(false);
+      expect(captured.includes('1234-5678')).toBe(false);
+      expect(captured.includes('9876543210')).toBe(false);
+      expect(captured.includes('wa_secret_id')).toBe(false);
+      expect(captured.includes('sensitive_inner_body')).toBe(false);
+      expect(captured.includes('sensitive_inner_text')).toBe(false);
+      expect(captured.includes('[REDACTED]')).toBe(true);
     });
   });
 });

@@ -65,6 +65,7 @@ describe('Work Package P4: Load and Latency Test against Provider Limits', () =>
       campaignId: campaign.id,
       version: 1,
       name: campaign.name,
+      brandName: 'Festival Boutique',
       industry: 'BOUTIQUE',
       purpose: 'MARKETING',
       trigger: { type: 'EVENT_DRIVEN', eventType: 'festival.launch' },

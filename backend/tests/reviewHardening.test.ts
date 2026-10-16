@@ -75,6 +75,7 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
+        'Idempotency-Key': generateId('idemp'),
         ...extraHeaders
       },
       body: JSON.stringify(body)
@@ -89,6 +90,7 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       headers: {
         'Content-Type': 'application/json',
         Authorization: `Bearer ${token}`,
+        'Idempotency-Key': generateId('idemp'),
         ...extraHeaders
       },
       body: JSON.stringify(body)
@@ -949,6 +951,7 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       tenantId: tenantA,
       version: 1,
       name: 'Review 4 E2E Version',
+      brandName: 'Audit Silks',
       industry: 'BOUTIQUE',
       purpose: 'MARKETING',
       priority: 80,

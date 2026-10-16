@@ -12,7 +12,14 @@ export const logger = pino({
       'messageBody',
       'parameters.phone',
       'headers.authorization',
-      'headers.cookie'
+      'headers.cookie',
+      'req.headers.authorization',
+      'req.body',
+      '*.from',
+      '*.wa_id',
+      '*.phone',
+      '*.body',
+      '*.text'
     ],
     censor: '[REDACTED]'
   },

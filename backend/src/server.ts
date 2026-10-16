@@ -60,6 +60,27 @@ app.use('/api/v1', webhookRouter);
 app.use('/api/v1', authRouter);
 app.use('/api/v1', campaignRouter);
 
+// 404 Handler for undefined /api/v1 routes
+app.use('/api/v1', (req: express.Request, res: express.Response) => {
+  res.status(404).json({
+    success: false,
+    error: `Route not found: ${req.method} ${req.originalUrl}`,
+    code: 'NOT_FOUND'
+  });
+});
+
+// Central error handler enforcing universal error shape: { success: false, error, code, fieldPath? }
+app.use((err: any, _req: express.Request, res: express.Response, _next: express.NextFunction) => {
+  const statusCode = err.status || err.statusCode || 500;
+  const code = err.code || (statusCode === 404 ? 'NOT_FOUND' : statusCode === 401 ? 'UNAUTHORIZED' : statusCode === 403 ? 'FORBIDDEN' : statusCode === 422 ? 'UNPROCESSABLE_ENTITY' : 'INTERNAL_SERVER_ERROR');
+  res.status(statusCode).json({
+    success: false,
+    error: err.message || 'An unexpected error occurred',
+    code,
+    ...(err.fieldPath ? { fieldPath: err.fieldPath } : {})
+  });
+});
+
 async function startServer() {
   try {
     await connectDatabase();

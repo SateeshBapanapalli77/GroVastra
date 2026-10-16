@@ -13,6 +13,7 @@ import {
 import { sha256 } from '../../../shared/utils/crypto';
 import { generateId } from '../../../shared/utils/id';
 import { DateTime } from 'luxon';
+import { resolveShopDisplayName } from '../services/shopResolver';
 
 export interface DryRunEvaluationResult {
   dryRunId: string;
@@ -87,6 +88,7 @@ export async function evaluateCampaignDryRun(
   const samplePlans: DryRunEvaluationResult['samplePlans'] = [];
   const currentNow = clock.now().setZone(timezone);
   const horizonEnd = currentNow.plus({ days: 30 });
+  const storeDisplayName = (await resolveShopDisplayName(tenantId, version)) || '';
 
   for (const customer of customers) {
     // 1. Channel suppression check
@@ -131,7 +133,6 @@ export async function evaluateCampaignDryRun(
 
     // Build sample plan preview
     if (samplePlans.length < 5) {
-      const storeDisplayName = (version as any).brandName || 'Boutique';
       const stepPreviews = version.steps.map((step) => {
         const timing = calculateDueInstant(occurrence.localDate, step.offsetDays, step.localTime, timezone);
         const template = getApprovedTemplate(step.templateRef.id);
@@ -144,13 +145,13 @@ export async function evaluateCampaignDryRun(
           if (v === 'customer.firstName') vars[k] = customer.firstName || '';
           else if (v === 'customer.lastName') vars[k] = customer.lastName || '';
           else if (v === 'customer.fullName') vars[k] = `${customer.firstName} ${customer.lastName}`.trim();
-          else if (v === 'shop.displayName' || v === 'shop.name') vars[k] = storeDisplayName;
+          else if (v === 'shop.displayName' || v === 'shop.name' || v === 'shop' || v === 'store') vars[k] = storeDisplayName;
           else if (typeof v === 'string' && v.startsWith('literal:')) vars[k] = v.slice(8);
           else if (typeof v === 'string' && v in customer) vars[k] = String((customer as any)[v] || '');
           else vars[k] = String(v || '');
         }
         if (!vars.name && customer.firstName) vars.name = customer.firstName;
-        if (!vars.shop) vars.shop = storeDisplayName;
+        if (!vars.shop && storeDisplayName) vars.shop = storeDisplayName;
 
         const rendered = template ? template.render(vars) : 'Template not found';
 

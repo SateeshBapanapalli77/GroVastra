@@ -443,7 +443,7 @@ export async function evaluateSelectedStockOfferEvent(
     });
 
     if (!existing) {
-      await CampaignEnrollmentModel.create({
+      const enr = await CampaignEnrollmentModel.create({
         id: generateId('enr'),
         tenantId,
         campaignId,
@@ -455,6 +455,43 @@ export async function evaluateSelectedStockOfferEvent(
         status: 'ACTIVE',
         replyHoldAt: null,
         goalReachedAt: null
+      });
+
+      const stepDef = version.steps[0] || {
+        stepId: 'stockoffer_preview',
+        templateRef: { id: 'tpl_collection_launch', revision: 1, language: 'en' },
+        maxLatenessMinutes: 240
+      };
+
+      const timezone = version.timezone || 'Asia/Kolkata';
+      const localDt = DateTime.now().setZone(timezone);
+      const localDate = localDt.toFormat('yyyy-MM-dd');
+      const localTime = localDt.toFormat('HH:mm');
+      const dueAt = new Date();
+      const expiresAt = new Date(dueAt.getTime() + (stepDef.maxLatenessMinutes || 240) * 60 * 1000);
+      const adjustment = adjustForAllowedHoursAndBlackouts(dueAt, expiresAt, timezone);
+      const finalDueAt = adjustment.valid ? adjustment.adjustedDueAt : dueAt;
+      const state = adjustment.valid ? 'SCHEDULED' : 'SKIPPED';
+      const outcomeReason = adjustment.valid ? undefined : (adjustment.reason || 'SKIPPED_BLACKOUT_EXPIRED');
+
+      await CampaignExecutionModel.create({
+        id: generateId('exe'),
+        tenantId,
+        enrollmentId: enr.id,
+        campaignId,
+        stepId: stepDef.stepId,
+        dueAt: finalDueAt,
+        expiresAt,
+        localDate,
+        localTime,
+        timezone,
+        priority: version.priority || 50,
+        planRevision: 1,
+        state,
+        outcomeReason,
+        prerequisite: 'NONE',
+        deliveryIntentId: null,
+        lease: { token: null, until: null, claimedBy: null }
       });
       enrolledCount++;
     }

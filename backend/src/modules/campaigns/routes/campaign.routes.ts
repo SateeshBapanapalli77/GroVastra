@@ -1,6 +1,12 @@
 import { Router, Request, Response } from 'express';
 import mongoose from 'mongoose';
-import { BOUTIQUE_CAMPAIGN_PRESETS, getCampaignPreset } from '../presets/boutiquePresets';
+import {
+  BOUTIQUE_CAMPAIGN_PRESETS,
+  getCampaignPreset,
+  isScannerImplemented,
+  isAnnualPlannerImplemented
+} from '../presets/boutiquePresets';
+import { isKnownEventType } from '../../../shared/events/registry';
 import { APPROVED_TEMPLATES, getApprovedTemplate, resolveApprovedTemplate } from '../adapters/templateCatalogue';
 import { CampaignModel } from '../models/Campaign.model';
 import { CampaignVersionModel } from '../models/CampaignVersion.model';
@@ -26,6 +32,8 @@ import {
   getCustomerTimeline,
   getMonitoringAlerts
 } from '../engine/ownerReporting';
+import { resolveShopDisplayName } from '../services/shopResolver';
+import { CAMPAIGN_REASON_CODES } from '../../../shared/reasonCodes';
 
 export const campaignRouter = Router();
 
@@ -53,6 +61,92 @@ campaignRouter.get('/approved-template-catalogue', (req: Request, res: Response)
 });
 
 /**
+ * GET /api/v1/campaign-reason-codes
+ * Returns reason codes with category SKIP|DEFER|BLOCK|FAIL, ownerMessage, and resolutionOwner
+ */
+campaignRouter.get('/campaign-reason-codes', (req: Request, res: Response) => {
+  res.json({
+    success: true,
+    reasonCodes: CAMPAIGN_REASON_CODES
+  });
+});
+
+/**
+ * GET /api/v1/integration-readiness
+ * Read-only readiness status: connection status, template statuses, missing configuration
+ */
+campaignRouter.get('/integration-readiness', async (req: Request, res: Response) => {
+  try {
+    const tenantId = req.tenantId!;
+    const connection = await TenantConnectionModel.findOne({ tenantId });
+    const settings = await TenantSettingsModel.findOne({ tenantId });
+
+    const phoneNumberId =
+      connection?.metadata?.phoneNumberId ||
+      connection?.metadata?.phone_number_id ||
+      connection?.connectionId ||
+      null;
+    const verifiedName =
+      connection?.metadata?.verifiedName ||
+      connection?.metadata?.verified_name ||
+      null;
+
+    const connectionStatus = connection?.status === 'ACTIVE'
+      ? {
+          status: 'ACTIVE' as const,
+          connectionId: connection.connectionId,
+          phoneNumberId,
+          verifiedName
+        }
+      : {
+          status: (connection?.status as any) || 'NOT_PROVISIONED',
+          connectionId: connection?.connectionId || null,
+          phoneNumberId: null,
+          verifiedName: null
+        };
+
+    const templateStatuses = Object.values(APPROVED_TEMPLATES).map((tmpl) => ({
+      templateId: tmpl.id,
+      name: tmpl.name,
+      category: tmpl.category,
+      status: tmpl.status || 'APPROVED',
+      languages: [tmpl.language]
+    }));
+
+    const missingConfiguration: string[] = [];
+    if (!connection || connection.status !== 'ACTIVE') {
+      missingConfiguration.push('WHATSAPP_CONNECTION_NOT_PROVISIONED');
+    }
+    if (!settings?.storeName) {
+      missingConfiguration.push('STORE_NAME_NOT_CONFIGURED');
+    }
+    if (!settings?.allowedHours?.start || !settings?.allowedHours?.end) {
+      missingConfiguration.push('ALLOWED_HOURS_NOT_CONFIGURED');
+    }
+    const unapprovedTemplates = templateStatuses.filter((t) => t.status !== 'APPROVED');
+    if (unapprovedTemplates.length > 0) {
+      missingConfiguration.push('TEMPLATES_NOT_APPROVED');
+    }
+
+    const ready = missingConfiguration.length === 0;
+
+    res.json({
+      success: true,
+      ready,
+      connection: connectionStatus,
+      templates: templateStatuses,
+      missingConfiguration
+    });
+  } catch (err: any) {
+    res.status(500).json({
+      success: false,
+      error: err.message || 'Internal server error',
+      code: 'INTERNAL_ERROR'
+    });
+  }
+});
+
+/**
  * GET /api/v1/campaign-settings
  * Backed by real tenant settings document with exact required notice text (Spec p.8, P2.j)
  */
@@ -65,6 +159,7 @@ campaignRouter.get('/campaign-settings', async (req: Request, res: Response) => 
         id: generateId('set'),
         tenantId,
         version: 1,
+        storeName: null,
         timezone: 'Asia/Kolkata',
         allowedHours: { start: '10:00', end: '19:00' },
         caps: {
@@ -85,6 +180,7 @@ campaignRouter.get('/campaign-settings', async (req: Request, res: Response) => 
       settings: {
         id: settings.id,
         version: settings.version,
+        storeName: settings.storeName ?? null,
         timezone: settings.timezone,
         allowedHours: settings.allowedHours,
         caps: settings.caps,
@@ -97,7 +193,11 @@ campaignRouter.get('/campaign-settings', async (req: Request, res: Response) => 
       }
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json({
+      success: false,
+      error: err.message || 'Internal server error',
+      code: 'INTERNAL_ERROR'
+    });
   }
 });
 
@@ -121,14 +221,17 @@ campaignRouter.patch(
         outageGraceMinutes,
         leapDayPolicy,
         holidays,
-        blackouts
+        blackouts,
+        storeName
       } = req.body;
 
       // Mandatory optimistic concurrency control (Review 2, Spec C16)
       if (typeof expectedVersion !== 'number') {
         return res.status(400).json({
           success: false,
-          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
+          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.',
+          code: 'EXPECTED_VERSION_REQUIRED',
+          fieldPath: 'expectedVersion'
         });
       }
 
@@ -153,6 +256,7 @@ campaignRouter.patch(
                   leapDayPolicy: 'FEB_28',
                   holidays: [],
                   blackouts: [],
+                  storeName: typeof storeName === 'string' ? storeName.trim() : null,
                   notice: REQUIRED_SETTINGS_NOTICE
                 }
               ],
@@ -177,6 +281,11 @@ campaignRouter.patch(
           if (Array.isArray(holidays)) updateFields.$set.holidays = holidays;
           if (Array.isArray(blackouts)) updateFields.$set.blackouts = blackouts;
           if (typeof globalPause === 'boolean') updateFields.$set.globalPause = globalPause;
+          if (typeof storeName === 'string') {
+            updateFields.$set.storeName = storeName.trim();
+          } else if (storeName === null) {
+            updateFields.$set.storeName = null;
+          }
 
           updatedSettings = await TenantSettingsModel.findOneAndUpdate(
             { tenantId, version: expectedVersion },
@@ -239,6 +348,7 @@ campaignRouter.patch(
           settings: {
             id: updatedSettings.id,
             version: updatedSettings.version,
+            storeName: updatedSettings.storeName ?? null,
             timezone: updatedSettings.timezone,
             allowedHours: updatedSettings.allowedHours,
             caps: updatedSettings.caps,
@@ -254,7 +364,9 @@ campaignRouter.patch(
         if (txErr.message === 'VERSION_CONFLICT') {
           return res.status(409).json({
             success: false,
-            error: `Settings version conflict: expected version ${expectedVersion} does not match current version.`
+            error: `Settings version conflict: expected version ${expectedVersion} does not match current version.`,
+            code: 'VERSION_CONFLICT',
+            fieldPath: 'expectedVersion'
           });
         }
         throw txErr;
@@ -262,7 +374,11 @@ campaignRouter.patch(
         await session.endSession();
       }
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json({
+        success: false,
+        error: err.message || 'Internal server error',
+        code: 'INTERNAL_ERROR'
+      });
     }
   }
 );
@@ -313,6 +429,17 @@ campaignRouter.post(
       const tenantId = (req as any).tenantId;
       const { presetId, name } = req.body;
 
+      if (presetId) {
+        const preset = getCampaignPreset(presetId);
+        if (!preset || !preset.implemented) {
+          return res.status(422).json({
+            success: false,
+            error: 'PRESET_NOT_IMPLEMENTED',
+            message: `Preset '${presetId}' cannot be used because it is not implemented.`
+          });
+        }
+      }
+
       const preset = presetId ? getCampaignPreset(presetId) : null;
       const campaignId = generateId('cmp');
       const versionId = generateId('cv');
@@ -320,6 +447,7 @@ campaignRouter.post(
       const newCampaign = await CampaignModel.create({
         id: campaignId,
         tenantId,
+        presetId: preset?.id || null,
         name: name || (preset ? preset.name : 'Birthday Boutique Shopping'),
         industry: 'BOUTIQUE',
         purpose: preset?.purpose || 'MARKETING',
@@ -347,6 +475,7 @@ campaignRouter.post(
         id: versionId,
         tenantId,
         campaignId,
+        presetId: preset?.id || null,
         version: 1,
         name: newCampaign.name,
         industry: 'BOUTIQUE',
@@ -634,6 +763,48 @@ campaignRouter.post(
         return res.status(404).json({ success: false, error: 'Draft version not found' });
       }
 
+      // Preset capability and activation guard (Step 10)
+      const campaignPresetId = (campaign as any).presetId || (draft as any).presetId;
+      if (campaignPresetId) {
+        const preset = getCampaignPreset(campaignPresetId);
+        if (!preset || !preset.implemented) {
+          return res.status(422).json({
+            success: false,
+            error: 'PRESET_NOT_IMPLEMENTED',
+            message: `Activation blocked: Preset '${campaignPresetId}' is not implemented.`
+          });
+        }
+      }
+
+      if (draft.trigger) {
+        if (draft.trigger.type === 'EVENT_DRIVEN') {
+          const eventType = draft.trigger.eventType;
+          if (!eventType || !isKnownEventType(eventType)) {
+            return res.status(422).json({
+              success: false,
+              error: 'PRESET_NOT_IMPLEMENTED',
+              message: `Activation blocked: Trigger event type '${eventType}' has no registered evaluator.`
+            });
+          }
+        } else if (draft.trigger.type === 'INACTIVITY_SCAN') {
+          if (!isScannerImplemented()) {
+            return res.status(422).json({
+              success: false,
+              error: 'PRESET_NOT_IMPLEMENTED',
+              message: 'Activation blocked: Inactivity scanner worker is not implemented.'
+            });
+          }
+        } else if (draft.trigger.type === 'ANNUAL_DATE') {
+          if (!isAnnualPlannerImplemented(draft.trigger.field)) {
+            return res.status(422).json({
+              success: false,
+              error: 'PRESET_NOT_IMPLEMENTED',
+              message: `Activation blocked: Annual date field '${draft.trigger.field}' is not implemented.`
+            });
+          }
+        }
+      }
+
       // Mandatory review fingerprint check (Spec p.21, A03)
       if (!reviewFingerprint) {
         return res.status(400).json({
@@ -811,79 +982,88 @@ campaignRouter.post(
  * POST /api/v1/campaigns/:id/pause | resume
  * Serialized via CampaignControlGate transaction matching dispatch submission protocol (Review 2 B)
  */
-campaignRouter.post('/campaigns/:id/pause', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
-  try {
-    const tenantId = req.tenantId!;
-    const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
-
-    const session = await mongoose.startSession();
-    let updatedCampaign: any = null;
+campaignRouter.post(
+  '/campaigns/:id/pause',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
+  async (req: Request, res: Response) => {
     try {
-      await session.withTransaction(async () => {
-        const nextPauseGen = campaign.pauseGeneration + 1;
+      const tenantId = req.tenantId!;
+      const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
+      if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
 
-        // 1. Lock & Conditionally Update CampaignControlGate (Consistent Lock Order: 2, Spec p.25)
-        await CampaignControlGateModel.findOneAndUpdate(
-          { tenantId, campaignId: campaign.id },
-          {
-            $set: { paused: true, pauseGeneration: nextPauseGen },
-            $inc: { gateVersion: 1 }
-          },
-          { session, upsert: true, new: true }
-        );
+      const session = await mongoose.startSession();
+      let updatedCampaign: any = null;
+      try {
+        await session.withTransaction(async () => {
+          const nextPauseGen = campaign.pauseGeneration + 1;
 
-        // 2. Update campaign state inside same transaction
-        updatedCampaign = await CampaignModel.findOneAndUpdate(
-          { id: campaign.id, tenantId },
-          {
-            $set: { status: 'PAUSED', pauseGeneration: nextPauseGen }
-          },
-          { session, new: true }
-        );
-
-        // 3. Invalidate in-flight evaluation leases inside same transaction
-        await CampaignExecutionModel.updateMany(
-          { campaignId: campaign.id, tenantId, state: 'EVALUATING' },
-          {
-            $set: {
-              state: 'DEFERRED',
-              'lease.token': null,
-              'lease.until': null,
-              'lease.claimedBy': null,
-              outcomeReason: 'DEFERRED_CAMPAIGN_PAUSED'
-            }
-          },
-          { session }
-        );
-
-        // 4. Audit log entry inside same transaction
-        await AuditLogModel.create(
-          [
+          // 1. Lock & Conditionally Update CampaignControlGate (Consistent Lock Order: 2, Spec p.25)
+          await CampaignControlGateModel.findOneAndUpdate(
+            { tenantId, campaignId: campaign.id },
             {
-              id: generateId('aud'),
-              tenantId,
-              userId: (req as any).user?.userId || 'owner',
-              action: 'PAUSE_CAMPAIGN',
-              targetType: 'CAMPAIGN',
-              targetId: campaign.id,
-              details: { pauseGeneration: nextPauseGen }
-            }
-          ],
-          { session }
-        );
-      });
-    } finally {
-      await session.endSession();
+              $set: { paused: true, pauseGeneration: nextPauseGen },
+              $inc: { gateVersion: 1 }
+            },
+            { session, upsert: true, new: true }
+          );
+
+          // 2. Update campaign state inside same transaction
+          updatedCampaign = await CampaignModel.findOneAndUpdate(
+            { id: campaign.id, tenantId },
+            {
+              $set: { status: 'PAUSED', pauseGeneration: nextPauseGen }
+            },
+            { session, new: true }
+          );
+
+          // 3. Invalidate in-flight evaluation leases inside same transaction
+          await CampaignExecutionModel.updateMany(
+            { campaignId: campaign.id, tenantId, state: 'EVALUATING' },
+            {
+              $set: {
+                state: 'DEFERRED',
+                'lease.token': null,
+                'lease.until': null,
+                'lease.claimedBy': null,
+                outcomeReason: 'DEFERRED_CAMPAIGN_PAUSED'
+              }
+            },
+            { session }
+          );
+
+          // 4. Audit log entry inside same transaction
+          await AuditLogModel.create(
+            [
+              {
+                id: generateId('aud'),
+                tenantId,
+                userId: (req as any).user?.userId || 'owner',
+                action: 'PAUSE_CAMPAIGN',
+                targetType: 'CAMPAIGN',
+                targetId: campaign.id,
+                details: { pauseGeneration: nextPauseGen }
+              }
+            ],
+            { session }
+          );
+        });
+      } finally {
+        await session.endSession();
+      }
+
+      res.json({ success: true, campaign: updatedCampaign });
+    } catch (err: any) {
+      res.status(500).json({ success: false, error: err.message });
     }
-
-    res.json({ success: true, campaign: updatedCampaign });
-  } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
   }
-});
+);
 
-campaignRouter.post('/campaigns/:id/resume', requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']), async (req: Request, res: Response) => {
+campaignRouter.post(
+  '/campaigns/:id/resume',
+  requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
+  async (req: Request, res: Response) => {
   try {
     const tenantId = req.tenantId!;
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
@@ -1013,6 +1193,8 @@ export async function validateCampaignVersionDefinition(version: any, tenantId: 
       resolutionOwner: 'BOUTIQUE_OWNER'
     });
   } else {
+    const shopDisplayName = await resolveShopDisplayName(tenantId, version);
+
     for (const step of version.steps) {
       let template;
       try {
@@ -1047,8 +1229,14 @@ export async function validateCampaignVersionDefinition(version: any, tenantId: 
           ? Object.fromEntries(step.bindings.entries())
           : (step.bindings || {});
 
+        let stepRequiresShop = false;
         for (const varKey of template.variableKeys) {
           const bound = rawBindings[varKey];
+          if (varKey === 'shop' || bound === 'shop.displayName' || bound === 'shop.name' || bound === 'shop' || bound === 'store') {
+            if (!bound || bound === 'shop.displayName' || bound === 'shop.name' || bound === 'shop' || bound === 'store') {
+              stepRequiresShop = true;
+            }
+          }
           if (!bound && varKey !== 'name' && varKey !== 'shop') {
             errors.push({
               fieldPath: `steps.${step.stepId}.bindings.${varKey}`,
@@ -1056,6 +1244,14 @@ export async function validateCampaignVersionDefinition(version: any, tenantId: 
               resolutionOwner: 'BOUTIQUE_OWNER'
             });
           }
+        }
+
+        if (stepRequiresShop && !shopDisplayName && !errors.some((e) => e.fieldPath === 'settings.storeName')) {
+          errors.push({
+            fieldPath: 'settings.storeName',
+            message: 'Shop display name is not configured. Please configure storeName in settings or brandName on the campaign version.',
+            resolutionOwner: 'BOUTIQUE_OWNER'
+          });
         }
       }
 
@@ -1330,6 +1526,7 @@ campaignRouter.post(
 campaignRouter.post(
   '/campaigns/:id/archive',
   requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER']),
+  requireIdempotency,
   async (req: Request, res: Response) => {
     try {
       const tenantId = req.tenantId!;
@@ -1504,6 +1701,7 @@ campaignRouter.get('/campaigns/:id/history', async (req: Request, res: Response)
 campaignRouter.post(
   '/enrollments/:id/resolve-hold',
   requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER', 'STAFF']),
+  requireIdempotency,
   async (req: Request, res: Response) => {
     try {
       const tenantId = (req as any).tenantId;
@@ -1541,6 +1739,7 @@ campaignRouter.post(
 campaignRouter.post(
   '/enrollments/:id/mark-goal',
   requireRole(['BOUTIQUE_OWNER', 'STORE_MANAGER', 'STAFF']),
+  requireIdempotency,
   async (req: Request, res: Response) => {
     try {
       const tenantId = (req as any).tenantId;
