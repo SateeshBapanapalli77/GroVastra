@@ -1,5 +1,7 @@
 import { connectDatabase } from '../config/database';
 import { CampaignEventInboxModel, ICampaignEventInbox } from '../modules/campaigns/models/CampaignEventInbox.model';
+import { CampaignDeliveryIntentModel } from '../modules/campaigns/models/CampaignDeliveryIntent.model';
+import { reconcileDeliveryStatus } from '../modules/campaigns/services/deliveryStatusReconciliation';
 import { evaluateRestockEvent } from '../modules/campaigns/engine/restockStrategy';
 import { evaluateEnquiryEvent } from '../modules/campaigns/engine/enquiryStrategy';
 import { evaluateAlterationReadyEvent } from '../modules/campaigns/engine/boutiqueServiceStrategy';
@@ -24,6 +26,19 @@ export async function processNextPendingEvent(
       tenantId,
       status: 'PROCESSING',
       updatedAt: { $lte: new Date(Date.now() - 5 * 60 * 1000) }
+    },
+    {
+      $set: { status: 'RECEIVED' }
+    }
+  );
+
+  // Recover FAILED events with bounded retries (< 5 attempts, > 2 minutes old)
+  await CampaignEventInboxModel.updateMany(
+    {
+      tenantId,
+      status: 'FAILED',
+      retryCount: { $lt: 5 },
+      updatedAt: { $lte: new Date(Date.now() - 2 * 60 * 1000) }
     },
     {
       $set: { status: 'RECEIVED' }
@@ -63,6 +78,38 @@ export async function processNextPendingEvent(
         occasionRef: event.data?.occasionRef,
         netPaise: event.data?.netPaise
       });
+    } else if (event.type.startsWith('whatsapp.status.')) {
+      const { providerMessageId, status, errorCode, errorReason } = event.data || {};
+      if (providerMessageId && status) {
+        const intent = await CampaignDeliveryIntentModel.findOne({
+          providerMessageId,
+          tenantId: event.tenantId
+        });
+        if (intent) {
+          const reconResult = await reconcileDeliveryStatus({
+            tenantId: event.tenantId,
+            providerMessageId,
+            status,
+            providerTimestamp: event.occurredAt || new Date(),
+            errorCode: errorCode || 'PROVIDER_DELIVERY_FAILED',
+            errorReason: errorReason || 'PROVIDER_DELIVERY_FAILED',
+            inboxEventId: event.id
+          });
+          if (!reconResult.reconciled) {
+            event.status = 'FAILED';
+            event.errorMessage = reconResult.details;
+            event.retryCount = (event.retryCount || 0) + 1;
+            await event.save();
+            return event;
+          }
+          event.entityId = intent.executionId;
+        } else {
+          // Intent not yet available (out-of-order delivery); return to RECEIVED for next cycle
+          event.status = 'RECEIVED';
+          await event.save();
+          return event;
+        }
+      }
     }
 
     event.status = 'PROCESSED';
@@ -74,6 +121,7 @@ export async function processNextPendingEvent(
     logger.error({ err, eventId: event.eventId }, 'Error processing domain event');
     event.status = 'FAILED';
     event.errorMessage = err.message || 'Unknown processing error';
+    event.retryCount = (event.retryCount || 0) + 1;
     await event.save();
   }
 

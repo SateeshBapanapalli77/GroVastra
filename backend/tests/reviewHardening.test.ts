@@ -24,6 +24,8 @@ import { MockWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/m
 import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
 import { IWhatsAppDeliveryAdapter } from '../src/modules/campaigns/adapters/deliveryAdapter.interface';
 import { reconcileDeliveryStatus } from '../src/modules/campaigns/services/deliveryStatusReconciliation';
+import * as deliveryRecon from '../src/modules/campaigns/services/deliveryStatusReconciliation';
+import { resolveTenantForConnection } from '../src/modules/campaigns/services/connectionRegistry';
 
 describe('Senior Technical Manager Review Hardening Verification', () => {
   const tenantA = 'audit_tenant_a';
@@ -1753,5 +1755,206 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     expect(finalExe?.state).toBe('BLOCKED');
     expect(finalIntent?.state).toBe('REJECTED');
     expect(finalIntent?.errorCode).toBe('EXECUTION_BLOCKED');
+  });
+
+  it('Review 6 — P1: Webhook reconciliation transient failure leaves inbox event retryable; retry successfully reconciles records and marks event PROCESSED', async () => {
+    const now = new Date();
+    const providerMessageId = 'wam_r6_retry_' + Date.now();
+    const phoneNumberId = 'phone_num_meta_r6_' + Date.now();
+
+    // 1. Provision active connection mapped to Meta phone number ID in metadata
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantA,
+      connectionId: 'conn_r6_tenant_a_' + Date.now(),
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE',
+      metadata: { phoneNumberId }
+    });
+
+    // 2. Seed CampaignExecution and paired CampaignDeliveryIntent
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_r6_retry_test_' + Date.now(),
+      tenantId: tenantA,
+      enrollmentId: 'enr_r6_1',
+      campaignId: 'cmp_r6_1',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'DISPATCHING',
+      outcomeReason: null,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_r6_retry_test_' + Date.now(),
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_r6_tenant_a',
+      customerId: 'cus_r6_1',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_r6',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_r6',
+      providerMessageId,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // 3. Construct Meta Cloud API webhook delivery payload
+    const webhookSecret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
+    const timestampStr = Math.floor(now.getTime() / 1000).toString();
+    const payload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'waba_r6_test',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: { phone_number_id: phoneNumberId },
+                statuses: [{ id: providerMessageId, status: 'delivered', timestamp: timestampStr }]
+              }
+            }
+          ]
+        }
+      ]
+    };
+    const rawBody = JSON.stringify(payload);
+    const signature = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+
+    // 4. Force reconciliation to throw on the first attempt (simulating transient MongoDB transaction abort)
+    let failedOnce = false;
+    const originalRecon = deliveryRecon.reconcileDeliveryStatus;
+    const reconSpy = vi.spyOn(deliveryRecon, 'reconcileDeliveryStatus').mockImplementation(async (params) => {
+      if (!failedOnce) {
+        failedOnce = true;
+        throw new Error('Simulated transient MongoDB transaction abort during delivery reconciliation');
+      }
+      return originalRecon(params);
+    });
+
+    try {
+      // 5. First Webhook Ingestion: must fail with HTTP 500
+      const res1 = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-hub-signature-256': signature
+        },
+        body: rawBody
+      });
+      expect(res1.status).toBe(500);
+
+      // Verify inbox event was inserted and marked FAILED (never permanently PROCESSED)
+      const statusEventKey = `${providerMessageId}_delivered_${timestampStr}`;
+      const inboxAfterFail = await CampaignEventInboxModel.findOne({
+        tenantId: tenantA,
+        eventId: statusEventKey
+      });
+      expect(inboxAfterFail).not.toBeNull();
+      expect(inboxAfterFail?.status).toBe('FAILED');
+      expect(inboxAfterFail?.errorMessage).toContain('Simulated transient MongoDB transaction abort');
+      expect(inboxAfterFail?.processedAt).toBeNull();
+
+      // Verify domain records were NOT updated prematurely
+      const exeAfterFail = await CampaignExecutionModel.findOne({ id: exe.id, tenantId: tenantA });
+      const intentAfterFail = await CampaignDeliveryIntentModel.findOne({ id: intent.id, tenantId: tenantA });
+      expect(exeAfterFail?.state).toBe('DISPATCHING');
+      expect(exeAfterFail?.deliveredAt).toBeNull();
+      expect(intentAfterFail?.state).toBe('ACCEPTED');
+      expect(intentAfterFail?.deliveredAt).toBeNull();
+
+      // 6. Provider Retry: send the EXACT SAME webhook payload again
+      const res2 = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-hub-signature-256': signature
+        },
+        body: rawBody
+      });
+      expect(res2.status).toBe(200);
+
+      // Verify inbox event is now PROCESSED and retry metadata cleared
+      const inboxAfterRetry = await CampaignEventInboxModel.findOne({
+        tenantId: tenantA,
+        eventId: statusEventKey
+      });
+      expect(inboxAfterRetry?.status).toBe('PROCESSED');
+      expect(inboxAfterRetry?.processedAt).not.toBeNull();
+      expect(inboxAfterRetry?.errorMessage).toBeNull();
+
+      // Verify domain records are now properly reconciled to DELIVERED
+      const exeAfterRetry = await CampaignExecutionModel.findOne({ id: exe.id, tenantId: tenantA });
+      const intentAfterRetry = await CampaignDeliveryIntentModel.findOne({ id: intent.id, tenantId: tenantA });
+      expect(exeAfterRetry?.state).toBe('DELIVERED');
+      expect(exeAfterRetry?.deliveredAt).not.toBeNull();
+      expect(intentAfterRetry?.state).toBe('DELIVERED');
+      expect(intentAfterRetry?.deliveredAt).not.toBeNull();
+
+      // 7. Duplicate Replay (third delivery after successful processing): idempotent skip
+      const callsBefore = reconSpy.mock.calls.length;
+      const res3 = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-hub-signature-256': signature
+        },
+        body: rawBody
+      });
+      expect(res3.status).toBe(200);
+      expect(reconSpy.mock.calls.length).toBe(callsBefore); // Did not re-invoke reconciliation
+    } finally {
+      reconSpy.mockRestore();
+    }
+  });
+
+  it('Review 6 — Connection Identity Mapping: verifies Meta phone_number_id resolution via metadata and environment', async () => {
+    const phoneNumberIdA = '919998887771_' + Date.now();
+    const phoneNumberIdB = '919998887772_' + Date.now();
+
+    // 1. Connection with metadata.phoneNumberId
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantA,
+      connectionId: 'conn_tenant_a_named_' + Date.now(),
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE',
+      metadata: { phoneNumberId: phoneNumberIdA }
+    });
+
+    // 2. Connection with metadata.phone_number_id (snake_case Meta payload standard)
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId: tenantB,
+      connectionId: 'conn_tenant_b_named_' + Date.now(),
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE',
+      metadata: { phone_number_id: phoneNumberIdB }
+    });
+
+    // Verify tenant resolution matches connection owner
+    const resolvedA = await resolveTenantForConnection(phoneNumberIdA);
+    expect(resolvedA).toBe(tenantA);
+
+    const resolvedB = await resolveTenantForConnection(phoneNumberIdB);
+    expect(resolvedB).toBe(tenantB);
+
+    // Unknown connection fails closed
+    const resolvedUnknown = await resolveTenantForConnection('unknown_phone_number_id_999');
+    expect(resolvedUnknown).toBeNull();
   });
 });

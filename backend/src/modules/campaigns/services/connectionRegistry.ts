@@ -7,19 +7,31 @@ import { logger } from '../../../config/logger';
  * Multi-tenant isolation: ensures inbound customer messages only query customers belonging to the
  * tenant owning the connection.
  */
-export async function resolveTenantForConnection(connectionId: string): Promise<string | null> {
-  if (!connectionId) return null;
+export async function resolveTenantForConnection(connectionIdOrPhoneId: string): Promise<string | null> {
+  if (!connectionIdOrPhoneId) return null;
 
-  const conn = await TenantConnectionModel.findOne({ connectionId, status: 'ACTIVE' });
+  // Search by primary connectionId or phone number ID in metadata (Meta Cloud API standard)
+  const conn = await TenantConnectionModel.findOne({
+    $or: [
+      { connectionId: connectionIdOrPhoneId },
+      { 'metadata.phoneNumberId': connectionIdOrPhoneId },
+      { 'metadata.phone_number_id': connectionIdOrPhoneId }
+    ],
+    status: 'ACTIVE'
+  });
   if (conn) {
     return conn.tenantId;
   }
 
-  // Match against configured environment connection ID if provisioned
-  if (env.WHATSAPP_CONNECTION_ID && connectionId === env.WHATSAPP_CONNECTION_ID && env.DEFAULT_TENANT_ID) {
+  // Match against configured environment connection ID or phone number ID if provisioned
+  if (
+    ((env.WHATSAPP_CONNECTION_ID && connectionIdOrPhoneId === env.WHATSAPP_CONNECTION_ID) ||
+     (env.WHATSAPP_PHONE_NUMBER_ID && connectionIdOrPhoneId === env.WHATSAPP_PHONE_NUMBER_ID)) &&
+    env.DEFAULT_TENANT_ID
+  ) {
     return env.DEFAULT_TENANT_ID;
   }
 
-  logger.warn({ connectionId }, 'No active tenant connection found for provider connection ID (fail closed)');
+  logger.warn({ connectionId: connectionIdOrPhoneId }, 'No active tenant connection found for provider connection ID / phone number ID (fail closed)');
   return null;
 }

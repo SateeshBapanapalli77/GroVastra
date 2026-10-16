@@ -1,6 +1,7 @@
 import mongoose, { ClientSession } from 'mongoose';
 import { CampaignDeliveryIntentModel, ICampaignDeliveryIntent } from '../models/CampaignDeliveryIntent.model';
 import { CampaignExecutionModel, ICampaignExecution } from '../models/CampaignExecution.model';
+import { CampaignEventInboxModel } from '../models/CampaignEventInbox.model';
 import { logger } from '../../../config/logger';
 
 export type DeliveryWebhookStatus = 'delivered' | 'read' | 'failed';
@@ -13,6 +14,7 @@ export interface ReconcileDeliveryStatusParams {
   errorCode?: string;
   errorReason?: string;
   existingSession?: ClientSession;
+  inboxEventId?: string;
 }
 
 export interface ReconcileDeliveryStatusResult {
@@ -38,6 +40,8 @@ export interface ReconcileDeliveryStatusResult {
  * 4. Terminal delivery protection: DELIVERED / READ records cannot regress to FAILED / REJECTED.
  * 5. Monotonic ordering: READ cannot regress to DELIVERED.
  * 6. Atomicity: Both execution and intent are updated in lockstep inside a MongoDB transaction.
+ * 7. Durable Webhook Inbox Lifecycle: If an inboxEventId is provided, the inbox event is atomically
+ *    marked PROCESSED inside the exact same transaction committing the delivery state transition.
  */
 export async function reconcileDeliveryStatus(
   params: ReconcileDeliveryStatusParams
@@ -49,7 +53,8 @@ export async function reconcileDeliveryStatus(
     providerTimestamp = new Date(),
     errorCode,
     errorReason,
-    existingSession
+    existingSession,
+    inboxEventId
   } = params;
 
   const session = existingSession || (await mongoose.startSession());
@@ -97,6 +102,31 @@ export async function reconcileDeliveryStatus(
     const currentIntentState = intent.state;
     const currentExecState = execution.state;
 
+    const markInboxProcessed = async () => {
+      if (!inboxEventId) return;
+      await CampaignEventInboxModel.updateOne(
+        { id: inboxEventId },
+        {
+          $set: {
+            status: 'PROCESSED',
+            entityId: execution.id,
+            processedAt: new Date(),
+            errorMessage: null
+          }
+        }
+      ).session(session);
+    };
+
+    const commitAndReturn = async (result: ReconcileDeliveryStatusResult): Promise<ReconcileDeliveryStatusResult> => {
+      if (result.reconciled) {
+        await markInboxProcessed();
+      }
+      if (isSelfManaged) {
+        await session.commitTransaction();
+      }
+      return result;
+    };
+
     // -------------------------------------------------------------
     // POLICY RULE 1: Terminal Non-Delivery States (FAILED, REJECTED, SKIPPED, EXPIRED, BLOCKED)
     // -------------------------------------------------------------
@@ -123,14 +153,13 @@ export async function reconcileDeliveryStatus(
         await intent.save({ session });
         await execution.save({ session });
       }
-      if (isSelfManaged) await session.commitTransaction();
-      return {
+      return await commitAndReturn({
         reconciled: true,
         intent,
         execution,
         policyResult: 'TERMINAL_PRESERVED',
         details: 'Preserved terminal FAILED/REJECTED state; rejected resurrection to DELIVERED/READ'
-      };
+      });
     }
 
     if (isTerminalSkippedOrExpired) {
@@ -147,14 +176,13 @@ export async function reconcileDeliveryStatus(
         await intent.save({ session });
         await execution.save({ session });
       }
-      if (isSelfManaged) await session.commitTransaction();
-      return {
+      return await commitAndReturn({
         reconciled: true,
         intent,
         execution,
         policyResult: 'TERMINAL_PRESERVED',
         details: 'Preserved terminal SKIPPED/EXPIRED state; rejected resurrection to DELIVERED/READ'
-      };
+      });
     }
 
     if (isTerminalBlocked) {
@@ -174,14 +202,13 @@ export async function reconcileDeliveryStatus(
         await intent.save({ session });
         await execution.save({ session });
       }
-      if (isSelfManaged) await session.commitTransaction();
-      return {
+      return await commitAndReturn({
         reconciled: true,
         intent,
         execution,
         policyResult: 'TERMINAL_PRESERVED',
         details: 'Preserved terminal BLOCKED execution and synchronized delivery intent to REJECTED'
-      };
+      });
     }
 
     // -------------------------------------------------------------
@@ -196,14 +223,13 @@ export async function reconcileDeliveryStatus(
         currentIntentState === 'DELIVERED' ||
         currentIntentState === 'READ'
       ) {
-        if (isSelfManaged) await session.commitTransaction();
-        return {
+        return await commitAndReturn({
           reconciled: true,
           intent,
           execution,
           policyResult: 'MONOTONIC_PRESERVED',
           details: 'Protected delivered/read state against late provider failure event'
-        };
+        });
       }
 
       // In-flight execution transitioning to failure
@@ -216,14 +242,13 @@ export async function reconcileDeliveryStatus(
       execution.lease = { token: null, until: null, claimedBy: null };
       await execution.save({ session });
 
-      if (isSelfManaged) await session.commitTransaction();
-      return {
+      return await commitAndReturn({
         reconciled: true,
         intent,
         execution,
         policyResult: 'TRANSITIONED',
         details: 'Transitioned in-flight execution and delivery intent to FAILED/REJECTED'
-      };
+      });
     }
 
     // -------------------------------------------------------------
@@ -247,8 +272,7 @@ export async function reconcileDeliveryStatus(
       execution.lease = { token: null, until: null, claimedBy: null };
       await execution.save({ session });
 
-      if (isSelfManaged) await session.commitTransaction();
-      return {
+      return await commitAndReturn({
         reconciled: true,
         intent,
         execution,
@@ -256,7 +280,7 @@ export async function reconcileDeliveryStatus(
         details: wasAlreadyRead
           ? 'Preserved READ state; updated timestamps'
           : 'Monotonically transitioned execution and delivery intent to READ'
-      };
+      });
     }
 
     // -------------------------------------------------------------
@@ -286,14 +310,13 @@ export async function reconcileDeliveryStatus(
           await intent.save({ session });
           await execution.save({ session });
         }
-        if (isSelfManaged) await session.commitTransaction();
-        return {
+        return await commitAndReturn({
           reconciled: true,
           intent,
           execution,
           policyResult: 'MONOTONIC_PRESERVED',
           details: 'Preserved terminal READ state; updated deliveredAt timestamp without regressing state'
-        };
+        });
       }
 
       // If already DELIVERED on both, maintain DELIVERED and update deliveredAt
@@ -307,8 +330,7 @@ export async function reconcileDeliveryStatus(
       execution.lease = { token: null, until: null, claimedBy: null };
       await execution.save({ session });
 
-      if (isSelfManaged) await session.commitTransaction();
-      return {
+      return await commitAndReturn({
         reconciled: true,
         intent,
         execution,
@@ -316,17 +338,16 @@ export async function reconcileDeliveryStatus(
         details: wasAlreadyDelivered
           ? 'Preserved DELIVERED state; updated timestamp'
           : 'Monotonically transitioned execution and delivery intent to DELIVERED'
-      };
+      });
     }
 
-    if (isSelfManaged) await session.commitTransaction();
-    return {
+    return await commitAndReturn({
       reconciled: true,
       intent,
       execution,
       policyResult: 'MONOTONIC_PRESERVED',
       details: `No state change for status: ${status}`
-    };
+    });
   } catch (err: any) {
     if (isSelfManaged) {
       try {

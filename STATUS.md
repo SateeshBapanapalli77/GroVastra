@@ -221,3 +221,21 @@ Following Review 5 feedback from the Senior Technical Manager / Higher Authority
 - **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
 - **Frontend Production Build:** Next.js 16.4.0 `next build` clean (0 errors)
 
+---
+
+## 14. Higher Authority Review 6 Resolution (16 October 2026)
+
+Following Review 6 feedback from the Senior Technical Manager / Higher Authority on commit `c6ad418`, the P1 finding on webhook inbox lifecycle durability and the Meta connection mapping check have been strictly resolved and verified through live database-backed regression tests:
+
+| # | Review 6 Action | Implementation Details | Verification Evidence |
+| :--- | :--- | :--- | :--- |
+| **Finding P1** | **Durable Webhook Ingestion & Recoverable Retry Lifecycle** | 1. **Initial Persistence as RECEIVED**: In [`webhook.routes.ts`](backend/src/modules/campaigns/routes/webhook.routes.ts), incoming status webhooks now always insert into `CampaignEventInboxModel` with `status: 'RECEIVED'`, `processedAt: null`, and `errorMessage: null`. The event is never prematurely marked `PROCESSED`.<br>2. **Atomic In-Transaction State Transition**: Passed `inboxEventId` into [`reconcileDeliveryStatus`](backend/src/modules/campaigns/services/deliveryStatusReconciliation.ts). Inside the MongoDB multi-document transaction, `CampaignEventInboxModel` is updated to `status: 'PROCESSED'` and committed in the exact same ACID transaction as `CampaignExecutionModel` and `CampaignDeliveryIntentModel`.<br>3. **Transient Failure & Error Capture**: If reconciliation throws (e.g. transient transaction abort, database lock timeout), the transaction rolls back cleanly. Outside the rolled-back transaction, the inbox document is updated to `status: 'FAILED'`, with `errorMessage` and incremented `retryCount`, and HTTP 500 is returned to trigger provider retry.<br>4. **Resumable Duplicate Webhook Ingestion**: On duplicate webhook receipt (E11000 duplicate key error):<br>&nbsp;&nbsp;• If the existing event is already `PROCESSED`, it skips cleanly and idempotently (`continue`).<br>&nbsp;&nbsp;• If the existing event is NOT `PROCESSED` (e.g. `FAILED` or `RECEIVED`), the handler **resumes processing** rather than skipping it, updating state to `PROCESSING` and executing reconciliation.<br>5. **Durable Background Inbox Worker**: In [`backend/src/workers/events.ts`](backend/src/workers/events.ts), added routing for `whatsapp.status.` domain events and automatic recovery for stalled `PROCESSING` (> 5 min) and bounded `FAILED` events (< 5 retries, > 2 min backoff). | `backend/tests/reviewHardening.test.ts` ("Review 6 — P1: Webhook reconciliation transient failure leaves inbox event retryable; retry successfully reconciles records and marks event PROCESSED") |
+| **Check 3** | **Meta Connection Identity & Phone Number ID Mapping** | In [`connectionRegistry.ts`](backend/src/modules/campaigns/services/connectionRegistry.ts), updated `resolveTenantForConnection` to query: <br>1. Primary `connectionId` (direct provider or custom boutique connection ID)<br>2. Nested `metadata.phoneNumberId` and `metadata.phone_number_id` (Meta Cloud API standard payloads where `entry[].changes[].value.metadata.phone_number_id` is supplied)<br>3. Environment variables `env.WHATSAPP_PHONE_NUMBER_ID` and `env.WHATSAPP_CONNECTION_ID` mapping to `env.DEFAULT_TENANT_ID`.<br>Added sparse indexes on `metadata.phoneNumberId` and `metadata.phone_number_id` in [`TenantConnection.model.ts`](backend/src/modules/campaigns/models/TenantConnection.model.ts). | `backend/tests/reviewHardening.test.ts` ("Review 6 — Connection Identity Mapping: verifies Meta phone_number_id resolution via metadata and environment") |
+
+### Test Suite Execution Summary (16 October 2026 - Review 6 Verification)
+- **Backend Test Suites:** 14 passed (14/14)
+- **Individual Tests:** 182 passed (182/182, 0 failures, 0 skips)
+- **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
+- **Frontend Production Build:** Next.js 16.4.0 Turbopack `next build` clean (0 errors)
+
+

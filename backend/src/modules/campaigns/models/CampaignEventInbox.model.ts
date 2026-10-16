@@ -17,6 +17,7 @@ export interface ICampaignEventInbox extends Document {
   status: EventProcessingStatus;
   processedAt?: Date | null;
   errorMessage?: string | null;
+  retryCount?: number;
   createdAt: Date;
   updatedAt: Date;
 }
@@ -41,7 +42,8 @@ const CampaignEventInboxSchema = new Schema<ICampaignEventInbox>(
       default: 'RECEIVED'
     },
     processedAt: { type: Date, default: null },
-    errorMessage: { type: String, default: null }
+    errorMessage: { type: String, default: null },
+    retryCount: { type: Number, default: 0 }
   },
   {
     timestamps: true,

@@ -27,6 +27,8 @@ const TenantConnectionSchema = new Schema<ITenantConnection>(
 );
 
 TenantConnectionSchema.index({ tenantId: 1, status: 1 });
+TenantConnectionSchema.index({ 'metadata.phoneNumberId': 1 }, { sparse: true });
+TenantConnectionSchema.index({ 'metadata.phone_number_id': 1 }, { sparse: true });
 
 export const TenantConnectionModel = mongoose.model<ITenantConnection>(
   'TenantConnection',
