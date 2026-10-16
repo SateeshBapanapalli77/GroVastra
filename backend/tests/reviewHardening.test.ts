@@ -1577,4 +1577,181 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
       spy.mockRestore();
     }
   });
+
+  it('Review 5 — P1: Tenant isolation strictly enforced during delivery-status reconciliation (no cross-tenant leakage)', async () => {
+    const providerMessageIdB = 'wamid_secret_tenant_b_review5';
+    const now = new Date();
+
+    // 1. Connection for Tenant A
+    await TenantConnectionModel.create({
+      id: 'conn_tenant_a_r5',
+      tenantId: tenantA,
+      connectionId: 'phone_num_tenant_a_r5',
+      status: 'ACTIVE'
+    });
+
+    // 2. Connection for Tenant B
+    await TenantConnectionModel.create({
+      id: 'conn_tenant_b_r5',
+      tenantId: tenantB,
+      connectionId: 'phone_num_tenant_b_r5',
+      status: 'ACTIVE'
+    });
+
+    // 3. Execution & Delivery Intent belonging strictly to Tenant B
+    const exeB = await CampaignExecutionModel.create({
+      id: 'exe_tenant_b_r5',
+      tenantId: tenantB,
+      enrollmentId: 'enr_tenant_b_r5',
+      campaignId: 'cmp_tenant_b_r5',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'PROVIDER_ACCEPTED',
+      deliveredAt: null,
+      readAt: null
+    });
+
+    const intentB = await CampaignDeliveryIntentModel.create({
+      id: 'intent_tenant_b_r5',
+      tenantId: tenantB,
+      executionId: exeB.id,
+      deliveryKey: exeB.id,
+      connectionId: 'conn_tenant_b_r5',
+      customerId: 'cus_tenant_b_r5',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc_b',
+      payloadHash: 'hash_tenant_b',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_tenant_b_r5',
+      providerMessageId: providerMessageIdB,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // 4. Attack/Mismatch scenario: Webhook arrives via Tenant A's connection presenting Tenant B's message ID
+    const webhookSecret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET || 'test_webhook_app_secret_audit';
+    const readTimestamp = Math.floor(now.getTime() / 1000).toString();
+    const payload = {
+      object: 'whatsapp_business_account',
+      entry: [
+        {
+          id: 'waba_test_cross_tenant',
+          changes: [
+            {
+              field: 'messages',
+              value: {
+                messaging_product: 'whatsapp',
+                metadata: { phone_number_id: 'phone_num_tenant_a_r5' }, // Connection belongs to Tenant A!
+                statuses: [{ id: providerMessageIdB, status: 'read', timestamp: readTimestamp }] // Message belongs to Tenant B!
+              }
+            }
+          ]
+        }
+      ]
+    };
+    const rawBody = JSON.stringify(payload);
+    const signature = 'sha256=' + crypto.createHmac('sha256', webhookSecret).update(rawBody).digest('hex');
+
+    const resWebhook = await fetch(`${baseUrl}/api/v1/webhooks/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub-signature-256': signature
+      },
+      body: rawBody
+    });
+    expect(resWebhook.status).toBe(200);
+
+    // 5. Directly invoke reconcileDeliveryStatus with Tenant A's context and Tenant B's message ID
+    const directRecon = await reconcileDeliveryStatus({
+      tenantId: tenantA, // Wrong tenant context!
+      providerMessageId: providerMessageIdB,
+      status: 'read',
+      providerTimestamp: now
+    });
+    // Strict tenant isolation must fail closed with INTENT_NOT_FOUND
+    expect(directRecon.reconciled).toBe(false);
+    expect(directRecon.policyResult).toBe('INTENT_NOT_FOUND');
+
+    // 6. Assert that Tenant B's records are completely UNTOUCHED
+    const finalExeB = await CampaignExecutionModel.findOne({ id: exeB.id, tenantId: tenantB });
+    expect(finalExeB?.state).toBe('PROVIDER_ACCEPTED'); // NOT changed to READ!
+    expect(finalExeB?.readAt).toBeNull();
+
+    const finalIntentB = await CampaignDeliveryIntentModel.findOne({ id: intentB.id, tenantId: tenantB });
+    expect(finalIntentB?.state).toBe('ACCEPTED'); // NOT changed to READ!
+    expect(finalIntentB?.readAt).toBeNull();
+  });
+
+  it('Review 5 — P2: BLOCKED terminal execution synchronizes delivery intent to REJECTED lockstep', async () => {
+    const providerMessageId = 'wamid_blocked_sync_test_r5';
+    const now = new Date();
+
+    const exe = await CampaignExecutionModel.create({
+      id: 'exe_blocked_r5',
+      tenantId: tenantA,
+      enrollmentId: 'enr_blocked_r5',
+      campaignId: 'cmp_blocked_r5',
+      stepId: 'step_1',
+      dueAt: now,
+      expiresAt: new Date(now.getTime() + 3600000),
+      localDate: '2026-10-16',
+      localTime: '10:00',
+      timezone: 'Asia/Kolkata',
+      priority: 80,
+      planRevision: 1,
+      claimVersion: 1,
+      state: 'BLOCKED',
+      outcomeReason: 'CONTENT_OR_TEMPLATE_BLOCKED',
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // Non-terminal intent (e.g. ACCEPTED or SUBMITTING) paired with BLOCKED execution
+    const intent = await CampaignDeliveryIntentModel.create({
+      id: 'intent_blocked_r5',
+      tenantId: tenantA,
+      executionId: exe.id,
+      deliveryKey: exe.id,
+      connectionId: 'conn_test',
+      customerId: 'cus_blocked_r5',
+      recipientVersion: 1,
+      encryptedRecipient: 'dummy_enc',
+      payloadHash: 'hash_blocked_r5',
+      templateRef: { id: 'tpl_birthday_invite', revision: 3, language: 'en' },
+      state: 'ACCEPTED',
+      attemptId: 'att_blocked_r5',
+      providerMessageId,
+      deliveredAt: null,
+      readAt: null
+    });
+
+    // Late webhook arrives
+    const recon = await reconcileDeliveryStatus({
+      tenantId: tenantA,
+      providerMessageId,
+      status: 'delivered',
+      providerTimestamp: now
+    });
+
+    expect(recon.policyResult).toBe('TERMINAL_PRESERVED');
+
+    // Both records must now be consistently aligned in their terminal non-delivery paired states:
+    // Execution: BLOCKED
+    // DeliveryIntent: REJECTED
+    const finalExe = await CampaignExecutionModel.findOne({ id: exe.id, tenantId: tenantA });
+    const finalIntent = await CampaignDeliveryIntentModel.findOne({ id: intent.id, tenantId: tenantA });
+
+    expect(finalExe?.state).toBe('BLOCKED');
+    expect(finalIntent?.state).toBe('REJECTED');
+    expect(finalIntent?.errorCode).toBe('EXECUTION_BLOCKED');
+  });
 });

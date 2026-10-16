@@ -30,6 +30,7 @@ import { CampaignControlGateModel } from '../src/modules/campaigns/models/Campai
 import { TenantControlGateModel } from '../src/modules/campaigns/models/TenantControlGate.model';
 import { CampaignTombstoneModel } from '../src/modules/campaigns/models/CampaignTombstone.model';
 import { CampaignEventInboxModel } from '../src/modules/campaigns/models/CampaignEventInbox.model';
+import { TenantConnectionModel } from '../src/modules/campaigns/models/TenantConnection.model';
 import { webhookRouter } from '../src/modules/campaigns/routes/webhook.routes';
 import express from 'express';
 import http from 'http';
@@ -67,11 +68,23 @@ describe('Work Package P1: Execution Correctness & Concurrency', () => {
       CampaignControlGateModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
       TenantControlGateModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
       CampaignTombstoneModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
-      CampaignEventInboxModel.deleteMany({ tenantId: { $regex: /^p1_/ } })
+      CampaignEventInboxModel.deleteMany({ tenantId: { $regex: /^p1_/ } }),
+      TenantConnectionModel.deleteMany({ tenantId: { $regex: /^p1_/ } })
     ]);
   });
 
   const createTestFixture = async (tenantId: string, overrides: { phone?: string; priority?: number } = {}) => {
+    const existingConn = await TenantConnectionModel.findOne({ connectionId: `conn_${tenantId}` });
+    if (!existingConn) {
+      await TenantConnectionModel.create({
+        id: generateId('conn'),
+        tenantId,
+        connectionId: `conn_${tenantId}`,
+        provider: 'whatsapp_cloud',
+        status: 'ACTIVE'
+      });
+    }
+
     const phone = overrides.phone || '+919876543210';
     const customer = await CustomerModel.create({
       id: generateId('cus'),
@@ -596,7 +609,7 @@ describe('Work Package P1: Execution Correctness & Concurrency', () => {
                 field: 'messages',
                 value: {
                   messaging_product: 'whatsapp',
-                  metadata: { phone_number_id: 'conn_padmavati' },
+                  metadata: { phone_number_id: `conn_${tenantId}` },
                   statuses: [{ id: providerMessageId, status, timestamp }]
                 }
               }

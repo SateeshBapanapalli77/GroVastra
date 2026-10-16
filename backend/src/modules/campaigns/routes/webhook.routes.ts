@@ -119,13 +119,18 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 ? new Date(Number(statusObj.timestamp) * 1000)
                 : new Date();
 
-              const intent = await CampaignDeliveryIntentModel.findOne({ providerMessageId });
               const phoneNumberId = value.metadata?.phone_number_id;
-              const tenantId = intent ? intent.tenantId : await resolveTenantForConnection(phoneNumberId);
+              const tenantId = await resolveTenantForConnection(phoneNumberId);
               if (!tenantId) {
-                logger.warn({ providerMessageId, phoneNumberId }, 'Status event dropped: unable to resolve tenant');
+                logger.warn({ providerMessageId, phoneNumberId }, 'Status event dropped: unable to resolve tenant from connection phone_number_id (fail-closed)');
                 continue;
               }
+
+              // Strictly tenant-scoped delivery intent lookup (no unscoped queries)
+              const intent = await CampaignDeliveryIntentModel.findOne({
+                providerMessageId,
+                tenantId
+              });
 
               // Per-event deduplication via CampaignEventInboxModel compound unique index
               const statusEventKey = `${providerMessageId}_${status}_${statusObj.timestamp || ''}`;
@@ -241,17 +246,30 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     const { providerMessageId, status, customerPhone, messageText } = body;
 
     if (providerMessageId && status && ['delivered', 'read', 'failed'].includes(status)) {
-      const intent = await CampaignDeliveryIntentModel.findOne({ providerMessageId });
-      const tenantId = (req as any).tenantId || intent?.tenantId || (body.connectionId ? await resolveTenantForConnection(body.connectionId) : null) || 'default';
-      await reconcileDeliveryStatus({
-        tenantId,
-        providerMessageId,
-        status: status as 'delivered' | 'read' | 'failed',
-        providerTimestamp: new Date(),
-        errorCode: body.errorCode,
-        errorReason: body.errorReason
-      });
-      logger.info({ providerMessageId, status }, 'Reconciled flat delivery intent & execution status via unified policy');
+      const connectionTenantId = body.connectionId ? await resolveTenantForConnection(body.connectionId) : null;
+      const resolvedTenantId = (req as any).tenantId || connectionTenantId;
+      if (!resolvedTenantId) {
+        logger.warn({ providerMessageId }, 'Flat status webhook rejected: missing or unresolvable tenant context (fail-closed)');
+      } else {
+        const intent = await CampaignDeliveryIntentModel.findOne({
+          providerMessageId,
+          tenantId: resolvedTenantId
+        });
+
+        if (intent) {
+          await reconcileDeliveryStatus({
+            tenantId: resolvedTenantId,
+            providerMessageId,
+            status: status as 'delivered' | 'read' | 'failed',
+            providerTimestamp: new Date(),
+            errorCode: body.errorCode,
+            errorReason: body.errorReason
+          });
+          logger.info({ providerMessageId, status, tenantId: resolvedTenantId }, 'Reconciled flat delivery intent & execution status via unified policy');
+        } else {
+          logger.warn({ providerMessageId, tenantId: resolvedTenantId }, 'Flat webhook dropped: no delivery intent matching providerMessageId for tenant');
+        }
+      }
     }
 
     if (customerPhone && messageText) {

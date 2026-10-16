@@ -203,3 +203,21 @@ Following Review 4 feedback from the Senior Technical Manager / Higher Authority
 - **Individual Tests:** 178 passed (178/178, 0 failures, 0 skips)
 - **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
 - **Frontend Production Build:** Next.js 16.4.0 `next build` clean (0 errors)
+
+---
+
+## 13. Higher Authority Review 5 Resolution (16 October 2026)
+
+Following Review 5 feedback from the Senior Technical Manager / Higher Authority on commit `ee61d0a`, the two findings (P1 and P2) have been strictly resolved and verified through live database-backed regression tests:
+
+| # | Review 5 Action | Implementation Details | Verification Evidence |
+| :--- | :--- | :--- | :--- |
+| **Finding P1** | **Strict Multi-Tenant Isolation in Reconciliation & Webhook Ingestion** | 1. **Removed Unscoped Fallback**: In [`deliveryStatusReconciliation.ts`](backend/src/modules/campaigns/services/deliveryStatusReconciliation.ts), eliminated the secondary unscoped `findOne({ providerMessageId })` fallback. The delivery intent query is strictly and exclusively scoped by `{ providerMessageId, tenantId }`. If an intent belongs to another tenant, it returns `reconciled: false` (`INTENT_NOT_FOUND`) without mutating other tenant records.<br>2. **Connection-to-Tenant Scoping in Webhook Ingestion**: In [`webhook.routes.ts`](backend/src/modules/campaigns/routes/webhook.routes.ts), resolved `tenantId` strictly from the authenticated WhatsApp connection (`resolveTenantForConnection(phoneNumberId)`). If unmapped, the webhook fails closed. Intent queries and subsequent reconciliation calls are strictly restricted to the connection's authenticated tenant.<br>3. **Flat Payload Tenant Scoping**: Resolved tenant strictly from authenticated credentials or `resolveTenantForConnection(body.connectionId)` with fail-closed rejection when unresolvable.<br>4. **Cross-Tenant Regression Test**: Injected a forged status webhook presenting Tenant A's connection with Tenant B's `providerMessageId`. Asserted zero cross-tenant leakage: Tenant B's execution and intent remain completely untouched in their original state. | `backend/tests/reviewHardening.test.ts` ("Review 5 — P1: Tenant isolation strictly enforced during delivery-status reconciliation (no cross-tenant leakage)") |
+| **Finding P2** | **Synchronized Paired States for BLOCKED Executions** | In [`deliveryStatusReconciliation.ts`](backend/src/modules/campaigns/services/deliveryStatusReconciliation.ts), defined and enforced the paired state for blocked campaign attempts. A blocked execution cannot deliver; upon late webhook processing, the reconciliation service atomically transitions any non-terminal delivery intent (e.g. `SUBMITTING`, `ACCEPTED`, `OUTCOME_UNKNOWN`) to `REJECTED` with `errorCode: 'EXECUTION_BLOCKED'` inside the replica set transaction. Both records are guaranteed to remain in consistent, paired non-delivery states (`BLOCKED` + `REJECTED`) without ever resurrecting to `DELIVERED` or `READ`. | `backend/tests/reviewHardening.test.ts` ("Review 5 — P2: BLOCKED terminal execution synchronizes delivery intent to REJECTED lockstep") |
+
+### Test Suite Execution Summary (16 October 2026 - Review 5 Verification)
+- **Backend Test Suites:** 14 passed (14/14)
+- **Individual Tests:** 180 passed (180/180, 0 failures, 0 skips)
+- **Backend Typecheck:** `tsc --noEmit` clean (0 errors)
+- **Frontend Production Build:** Next.js 16.4.0 `next build` clean (0 errors)
+

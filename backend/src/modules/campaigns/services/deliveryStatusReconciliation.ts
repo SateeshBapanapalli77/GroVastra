@@ -60,17 +60,11 @@ export async function reconcileDeliveryStatus(
   }
 
   try {
-    // 1. Locate the delivery intent by providerMessageId
-    let intent = await CampaignDeliveryIntentModel.findOne({
+    // 1. Locate the delivery intent strictly scoped by providerMessageId and tenantId (no unscoped fallback)
+    const intent = await CampaignDeliveryIntentModel.findOne({
       providerMessageId,
       tenantId
     }).session(session);
-
-    if (!intent) {
-      intent = await CampaignDeliveryIntentModel.findOne({
-        providerMessageId
-      }).session(session);
-    }
 
     if (!intent) {
       if (isSelfManaged) await session.abortTransaction();
@@ -79,7 +73,7 @@ export async function reconcileDeliveryStatus(
         intent: null,
         execution: null,
         policyResult: 'INTENT_NOT_FOUND',
-        details: `No delivery intent found for providerMessageId: ${providerMessageId}`
+        details: `No delivery intent found for providerMessageId: ${providerMessageId} in tenant: ${tenantId}`
       };
     }
 
@@ -164,13 +158,29 @@ export async function reconcileDeliveryStatus(
     }
 
     if (isTerminalBlocked) {
+      let modified = false;
+      if (execution.state !== 'BLOCKED') {
+        execution.state = 'BLOCKED';
+        execution.outcomeReason = execution.outcomeReason || 'BLOCKED_BY_POLICY';
+        modified = true;
+      }
+      // An execution that is blocked cannot be delivered; its delivery intent must be paired to REJECTED
+      if (intent.state !== 'REJECTED') {
+        intent.state = 'REJECTED';
+        intent.errorCode = errorCode || intent.errorCode || 'EXECUTION_BLOCKED';
+        modified = true;
+      }
+      if (modified) {
+        await intent.save({ session });
+        await execution.save({ session });
+      }
       if (isSelfManaged) await session.commitTransaction();
       return {
         reconciled: true,
         intent,
         execution,
         policyResult: 'TERMINAL_PRESERVED',
-        details: 'Preserved terminal BLOCKED state; rejected resurrection to DELIVERED/READ'
+        details: 'Preserved terminal BLOCKED execution and synchronized delivery intent to REJECTED'
       };
     }
 
