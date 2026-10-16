@@ -1,28 +1,61 @@
 'use client';
 
 import React from 'react';
+import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 import {
-  Calendar,
   Sparkles,
-  FileText,
+  Activity,
   Users,
   Settings,
+  BarChart3,
   ChevronDown,
-  CheckCircle2,
-  ShieldCheck,
-  Zap,
-  Activity
+  ShieldAlert
 } from 'lucide-react';
-
-import { UserProfile } from '../lib/api';
+import { UserProfile } from '../lib/auth';
+import { getRoleBadgeLabel, canManageSettings, canManageCampaigns } from '../lib/roles';
 
 interface SidebarProps {
-  currentTab: 'campaigns' | 'activity' | 'templates' | 'customers' | 'settings';
-  onSelectTab: (tab: 'campaigns' | 'activity' | 'templates' | 'customers' | 'settings') => void;
   user?: UserProfile | null;
 }
 
-export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, user }) => {
+export const Sidebar: React.FC<SidebarProps> = ({ user }) => {
+  const pathname = usePathname();
+
+  const navItems = [
+    {
+      name: 'Overview',
+      href: '/campaigns',
+      icon: Sparkles,
+      active: pathname.startsWith('/campaigns')
+    },
+    {
+      name: 'Activity',
+      href: '/activity',
+      icon: Activity,
+      active: pathname.startsWith('/activity')
+    },
+    {
+      name: 'Customers',
+      href: '/customers',
+      icon: Users,
+      active: pathname.startsWith('/customers')
+    },
+    {
+      name: 'Reports',
+      href: '/reports',
+      icon: BarChart3,
+      active: pathname.startsWith('/reports')
+    },
+    {
+      name: 'Settings',
+      href: '/settings',
+      icon: Settings,
+      active: pathname.startsWith('/settings'),
+      restricted: !canManageSettings(user?.role)
+    }
+  ];
+
   return (
     <aside className="w-64 border-r border-[#EAE4DC] bg-[#FAF8F5] flex flex-col justify-between shrink-0 select-none min-h-screen">
       <div>
@@ -36,21 +69,21 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, user 
               GroVastra
             </div>
             <div className="text-[10px] tracking-widest text-[#C99726] font-semibold uppercase">
-              Handloom Boutique OS
+              Handloom Auto Campaigns
             </div>
           </div>
         </div>
 
-        {/* Store Selector */}
-        <div className="p-3 mx-3 my-3 bg-[#FFFFFF] border border-[#EAE4DC] rounded-xl shadow-xs flex items-center justify-between cursor-pointer hover:border-[#D4AF37] transition-colors">
+        {/* Store Context Box */}
+        <div className="p-3 mx-3 my-3 bg-[#FFFFFF] border border-[#EAE4DC] rounded-xl shadow-xs flex items-center justify-between">
           <div className="flex items-center gap-2 overflow-hidden">
-            <div className="w-2 h-2 rounded-full bg-emerald-500 shrink-0" />
+            <div className="w-2 h-2 rounded-full bg-[#1B7A43] shrink-0" />
             <div className="truncate">
               <div className="text-xs font-semibold text-[#271E1B] truncate">
-                {user?.shopName || 'Heritage Boutique'}
+                {user?.shopName || 'Boutique Store'}
               </div>
-              <div className="text-[10px] text-[#6B5E59] truncate">
-                {user?.role ? user.role.replace('_', ' ') : 'Verified Tenant'}
+              <div className="text-[10px] text-[#8F6910] font-medium truncate">
+                {getRoleBadgeLabel(user?.role)}
               </div>
             </div>
           </div>
@@ -63,92 +96,48 @@ export const Sidebar: React.FC<SidebarProps> = ({ currentTab, onSelectTab, user 
             Auto Campaigns
           </div>
 
-          <button
-            onClick={() => onSelectTab('campaigns')}
-            className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-              currentTab === 'campaigns'
-                ? 'bg-[#5C1D24] text-white shadow-xs font-semibold'
-                : 'text-[#271E1B] hover:bg-[#F3EFE8]'
-            }`}
-          >
-            <div className="flex items-center gap-2.5">
-              <Sparkles className="w-4 h-4" />
-              <span>Campaigns</span>
-            </div>
-            <span
-              className={`text-[10px] px-1.5 py-0.5 rounded-md font-bold ${
-                currentTab === 'campaigns'
-                  ? 'bg-[#431217] text-[#F3E0B5]'
-                  : 'bg-[#EAE4DC] text-[#6B5E59]'
-              }`}
-            >
-              WA
-            </span>
-          </button>
-
-          <button
-            onClick={() => onSelectTab('activity')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-              currentTab === 'activity'
-                ? 'bg-[#5C1D24] text-white shadow-xs font-semibold'
-                : 'text-[#271E1B] hover:bg-[#F3EFE8]'
-            }`}
-          >
-            <Activity className="w-4 h-4" />
-            <span>Activity Stream</span>
-          </button>
-
-          <button
-            onClick={() => onSelectTab('templates')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-              currentTab === 'templates'
-                ? 'bg-[#5C1D24] text-white shadow-xs font-semibold'
-                : 'text-[#271E1B] hover:bg-[#F3EFE8]'
-            }`}
-          >
-            <FileText className="w-4 h-4" />
-            <span>Approved Templates</span>
-          </button>
-
-          <button
-            onClick={() => onSelectTab('customers')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-              currentTab === 'customers'
-                ? 'bg-[#5C1D24] text-white shadow-xs font-semibold'
-                : 'text-[#271E1B] hover:bg-[#F3EFE8]'
-            }`}
-          >
-            <Users className="w-4 h-4" />
-            <span>Patrons &amp; CRM</span>
-          </button>
-
-          <button
-            onClick={() => onSelectTab('settings')}
-            className={`w-full flex items-center gap-2.5 px-3 py-2 rounded-lg text-xs font-medium transition-all ${
-              currentTab === 'settings'
-                ? 'bg-[#5C1D24] text-white shadow-xs font-semibold'
-                : 'text-[#271E1B] hover:bg-[#F3EFE8]'
-            }`}
-          >
-            <Settings className="w-4 h-4" />
-            <span>Campaign Settings</span>
-          </button>
+          {navItems.map((item) => {
+            const Icon = item.icon;
+            return (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={`w-full flex items-center justify-between px-3 py-2 rounded-lg text-xs font-medium transition-all ${
+                  item.active
+                    ? 'bg-[#5C1D24] text-white shadow-xs font-semibold'
+                    : 'text-[#271E1B] hover:bg-[#F3EFE8]'
+                }`}
+              >
+                <div className="flex items-center gap-2.5">
+                  <Icon className="w-4 h-4" />
+                  <span>{item.name}</span>
+                </div>
+                {item.restricted && (
+                  <span
+                    title="Owner/Manager configuration only"
+                    className="text-[10px] px-1.5 py-0.5 rounded bg-[#FEF9EE] text-[#8F6910] border border-[#F3E0B5]"
+                  >
+                    View
+                  </span>
+                )}
+              </Link>
+            );
+          })}
         </div>
       </div>
 
-      {/* WhatsApp Adapter Status Card */}
-      <div className="p-3 m-3 border border-[#EAE4DC] bg-[#FFFFFF] rounded-xl text-[11px] shadow-xs">
-        <div className="flex items-center justify-between mb-1.5">
-          <span className="text-[#6B5E59] font-medium">Channel Delivery</span>
-          <span className="inline-flex items-center gap-1 bg-[#E8F8EE] text-[#1B7A43] font-semibold px-2 py-0.5 rounded-full text-[10px]">
-            <CheckCircle2 className="w-3 h-3 text-[#25D366]" /> Connected
-          </span>
+      {/* Staff Role Notice if Staff */}
+      {user?.role === 'STAFF' && (
+        <div className="p-3 m-3 border border-[#F3E0B5] bg-[#FEF9EE] rounded-xl text-[11px] text-[#8F6910] shadow-xs">
+          <div className="flex items-center gap-1.5 font-semibold text-[#5C1D24] mb-1">
+            <ShieldAlert className="w-3.5 h-3.5 text-[#C99726]" />
+            <span>Staff Access</span>
+          </div>
+          <p className="text-[10px] leading-relaxed">
+            Authorized for monitoring activity and resolving customer conversation holds.
+          </p>
         </div>
-        <div className="text-[10px] text-[#988B86] pt-1.5 border-t border-[#F3EFE8] flex items-center justify-between">
-          <span>Mode</span>
-          <span className="text-[#C99726] font-semibold">Mock Adapter (Dev)</span>
-        </div>
-      </div>
+      )}
     </aside>
   );
 };

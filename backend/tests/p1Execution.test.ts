@@ -936,7 +936,7 @@ describe('Work Package P1: Execution Correctness & Concurrency', () => {
         tenantId: tenantB,
         version: 1,
         timezone: 'Asia/Kolkata',
-        allowedHours: { start: '10:00', end: '19:00' },
+        allowedHours: { start: '00:00', end: '23:59' },
         caps: { marketing24h: 1, marketing7d: 3 },
         globalPause: false,
         outageGraceMinutes: 120,

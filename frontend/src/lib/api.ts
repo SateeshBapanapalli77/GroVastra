@@ -1,278 +1,491 @@
-import type { components } from './types.generated';
+import { z } from 'zod';
+import { getAuthToken, handleUnauthorized } from './auth';
+import {
+  LoginResponseSchema,
+  MeResponseSchema,
+  IntegrationReadinessSchema,
+  TenantSettingsResponseSchema,
+  CampaignsListResponseSchema,
+  CampaignDetailResponseSchema,
+  CampaignActivityResponseSchema,
+  CampaignActivityItemSchema,
+  OwnerOverviewReportResponseSchema,
+  ApprovedTemplateCatalogueResponseSchema,
+  CampaignPresetsResponseSchema,
+  CustomersResponseSchema,
+  DryRunResponseSchema,
+  MonitoringAlertsResponseSchema,
+  CampaignEnrollmentsResponseSchema,
+  CampaignHistoryResponseSchema,
+  CustomerTimelineResponseSchema,
+  ErrorResponseSchema
+} from './schemas';
+
+export * from './auth';
+export type ActivityItem = z.infer<typeof CampaignActivityItemSchema>;
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:4000/api/v1';
 
-let cachedToken: string | null = null;
-let cachedUser: UserProfile | null = null;
+// Custom Error Classes (Phase 0, Non-negotiable 3 & Item 4)
+export class ApiError extends Error {
+  status: number;
+  code: string;
+  fieldPath?: string;
+  data?: any;
 
-export interface UserProfile {
-  id: string;
-  username: string;
-  name: string;
-  role: 'BOUTIQUE_OWNER' | 'STORE_MANAGER' | 'STAFF' | 'SYSTEM';
-  tenantId: string;
-  shopName: string;
-}
-
-export function setAuthToken(token: string) {
-  cachedToken = token;
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('grovastra_auth_token', token);
+  constructor(message: string, status: number, code: string, fieldPath?: string, data?: any) {
+    super(message);
+    this.name = 'ApiError';
+    this.status = status;
+    this.code = code;
+    this.fieldPath = fieldPath;
+    this.data = data;
   }
 }
 
-export function getAuthToken(): string | null {
-  if (cachedToken) return cachedToken;
-  if (typeof window !== 'undefined') {
-    return localStorage.getItem('grovastra_auth_token');
-  }
-  return null;
-}
-
-export function setStoredUser(user: UserProfile) {
-  cachedUser = user;
-  if (typeof window !== 'undefined') {
-    localStorage.setItem('grovastra_auth_user', JSON.stringify(user));
+export class UnauthorizedError extends ApiError {
+  constructor(message = 'Authentication required', code = 'UNAUTHORIZED', data?: any) {
+    super(message, 401, code, undefined, data);
+    this.name = 'UnauthorizedError';
   }
 }
 
-export function getStoredUser(): UserProfile | null {
-  if (cachedUser) return cachedUser;
-  if (typeof window !== 'undefined') {
-    const raw = localStorage.getItem('grovastra_auth_user');
-    if (raw) {
-      try {
-        cachedUser = JSON.parse(raw);
-        return cachedUser;
-      } catch {
-        return null;
-      }
-    }
-  }
-  return null;
-}
-
-export function clearAuth() {
-  cachedToken = null;
-  cachedUser = null;
-  if (typeof window !== 'undefined') {
-    localStorage.removeItem('grovastra_auth_token');
-    localStorage.removeItem('grovastra_auth_user');
+export class ForbiddenError extends ApiError {
+  constructor(message = 'Forbidden for current role', code = 'FORBIDDEN_ROLE', data?: any) {
+    super(message, 403, code, undefined, data);
+    this.name = 'ForbiddenError';
   }
 }
 
-async function request<T = any>(endpoint: string, options: RequestInit = {}): Promise<T> {
+export class NotFoundError extends ApiError {
+  constructor(message = 'Resource not found', code = 'NOT_FOUND', data?: any) {
+    super(message, 404, code, undefined, data);
+    this.name = 'NotFoundError';
+  }
+}
+
+export class ConflictError extends ApiError {
+  currentVersion?: number;
+
+  constructor(
+    message = 'Concurrent modification conflict detected. Please reload latest.',
+    code = 'CONFLICT_DETECTED',
+    currentVersion?: number,
+    data?: any
+  ) {
+    super(message, 409, code, 'expectedVersion', data);
+    this.name = 'ConflictError';
+    this.currentVersion = currentVersion;
+  }
+}
+
+export class ValidationError extends ApiError {
+  constructor(message = 'Validation failed', code = 'INVALID_REQUEST', fieldPath?: string, data?: any) {
+    super(message, 422, code, fieldPath, data);
+    this.name = 'ValidationError';
+  }
+}
+
+/**
+ * Generates a stable Idempotency-Key for a specific user intent.
+ * Reuse this key on retry so the backend safely deduplicates requests.
+ */
+export function generateIdempotencyKey(intent = 'intent'): string {
+  const timestamp = Date.now();
+  const random = Math.random().toString(36).substring(2, 9);
+  return `idemp_${intent}_${timestamp}_${random}`;
+}
+
+export interface ApiRequestOptions extends RequestInit {
+  idempotencyKey?: string;
+  expectedVersion?: number;
+}
+
+/**
+ * Universal HTTP request wrapper parsing through Zod boundary schemas
+ */
+export async function apiRequest<T>(
+  endpoint: string,
+  options: ApiRequestOptions = {},
+  schema?: z.ZodType<T>
+): Promise<T> {
   const token = getAuthToken();
   const method = (options.method || 'GET').toUpperCase();
   const isMutation = ['POST', 'PATCH', 'PUT', 'DELETE'].includes(method);
 
   const existingHeaders = (options.headers as Record<string, string>) || {};
-  const hasIdempotency = Boolean(
-    existingHeaders['Idempotency-Key'] ||
-    existingHeaders['idempotency-key'] ||
-    existingHeaders['x-idempotency-key']
-  );
 
   const headers: Record<string, string> = {
     'Content-Type': 'application/json',
     ...(token ? { Authorization: `Bearer ${token}` } : {}),
-    ...(isMutation && !hasIdempotency
-      ? { 'Idempotency-Key': `idemp_${Date.now()}_${Math.random().toString(36).slice(2, 10)}` }
-      : {}),
     ...existingHeaders
   };
 
-  const res = await fetch(`${API_BASE}${endpoint}`, {
+  // Attach idempotency key to all mutations if provided or generated
+  if (isMutation) {
+    const key =
+      options.idempotencyKey ||
+      existingHeaders['Idempotency-Key'] ||
+      existingHeaders['idempotency-key'] ||
+      generateIdempotencyKey(endpoint.replace(/[^a-zA-Z0-9]/g, '_'));
+    headers['Idempotency-Key'] = key;
+  }
+
+  // Handle expectedVersion in body or header if requested
+  let body = options.body;
+  if (options.expectedVersion !== undefined && isMutation && typeof body === 'string') {
+    try {
+      const parsedBody = JSON.parse(body);
+      if (typeof parsedBody === 'object' && parsedBody !== null) {
+        parsedBody.expectedVersion = options.expectedVersion;
+        body = JSON.stringify(parsedBody);
+      }
+    } catch {
+      // Body not JSON
+    }
+  }
+
+  const response = await fetch(`${API_BASE}${endpoint}`, {
     ...options,
-    headers
+    headers,
+    body
   });
 
-  const data = await res.json();
-  if (!res.ok) {
-    const error: any = new Error(data.error || `Request failed with status ${res.status}`);
-    error.status = res.status;
-    error.statusCode = res.status;
-    error.data = data;
-    throw error;
+  let rawJson: any;
+  try {
+    rawJson = await response.json();
+  } catch {
+    rawJson = null;
   }
-  return data as T;
+
+  if (!response.ok) {
+    const errorParsed = ErrorResponseSchema.safeParse(rawJson);
+    const errorMessage = errorParsed.success ? errorParsed.data.error : rawJson?.error || `Request failed (${response.status})`;
+    const errorCode = errorParsed.success ? errorParsed.data.code : rawJson?.code || 'API_ERROR';
+    const fieldPath = errorParsed.success ? errorParsed.data.fieldPath : rawJson?.fieldPath;
+
+    if (response.status === 401) {
+      handleUnauthorized();
+      throw new UnauthorizedError(errorMessage, errorCode, rawJson);
+    }
+    if (response.status === 403) {
+      throw new ForbiddenError(errorMessage, errorCode, rawJson);
+    }
+    if (response.status === 404) {
+      throw new NotFoundError(errorMessage, errorCode, rawJson);
+    }
+    if (response.status === 409) {
+      const currentVersion = rawJson?.currentVersion;
+      throw new ConflictError(errorMessage, errorCode, currentVersion, rawJson);
+    }
+    if (response.status === 400 || response.status === 422) {
+      throw new ValidationError(errorMessage, errorCode, fieldPath, rawJson);
+    }
+
+    throw new ApiError(errorMessage, response.status, errorCode, fieldPath, rawJson);
+  }
+
+  if (schema) {
+    const parseResult = schema.safeParse(rawJson);
+    if (!parseResult.success) {
+      console.error(`Boundary validation error for ${endpoint}:`, parseResult.error);
+      throw new ApiError(
+        `Response schema validation failed for ${endpoint}`,
+        500,
+        'RESPONSE_PARSE_ERROR',
+        undefined,
+        parseResult.error
+      );
+    }
+    return parseResult.data;
+  }
+
+  return rawJson as T;
 }
 
-export interface CampaignSummary {
-  id: string;
-  name: string;
-  industry: string;
-  purpose: string;
-  status: 'DRAFT' | 'ACTIVE' | 'PAUSED' | 'ARCHIVED';
-  activeVersionId: string | null;
-  draftVersion: number;
-  pauseGeneration: number;
-  enrolledCount?: number;
-  activeVersion?: any;
-}
-
-export interface ActivityItem {
-  id: string;
-  campaignName: string;
-  stepId: string;
-  customerId: string;
-  occurrenceId: string;
-  state: 'SCHEDULED' | 'PROVIDER_ACCEPTED' | 'SKIPPED' | 'DEFERRED' | 'HELD';
-  outcomeReason?: string;
-  explanation: string;
-  dueAt?: string;
-  updatedAt?: string;
-  timestamp?: string;
-  enrollmentId: string;
-  replyHoldAt?: string | null;
-  goalReachedAt?: string | null;
-}
-
+/**
+ * Concrete Typed API Service Methods
+ */
 export const api = {
-  // Authentication
-  login: async (username: string, password: string): Promise<{ success: boolean; token: string; user: UserProfile }> => {
-    const res = await request('/auth/login', {
-      method: 'POST',
-      body: JSON.stringify({ username, password })
-    });
-    if (res.token) {
-      setAuthToken(res.token);
-      setStoredUser(res.user);
-    }
-    return res;
+  // Auth
+  login: async (username: string, password: string) => {
+    return apiRequest(
+      '/auth/login',
+      {
+        method: 'POST',
+        body: JSON.stringify({ username, password })
+      },
+      LoginResponseSchema
+    );
   },
 
-  getMe: async (): Promise<{ success: boolean; user: UserProfile }> => {
-    const res = await request('/auth/me');
-    if (res.user) {
-      setStoredUser(res.user);
-    }
-    return res;
+  getCurrentUser: async () => {
+    return apiRequest('/auth/me', { method: 'GET' }, MeResponseSchema);
   },
 
-  logout: () => {
-    clearAuth();
+  // Integration Readiness
+  getIntegrationReadiness: async () => {
+    return apiRequest('/integration-readiness', { method: 'GET' }, IntegrationReadinessSchema);
+  },
+
+  // Tenant Campaign Settings
+  getCampaignSettings: async () => {
+    return apiRequest('/campaign-settings', { method: 'GET' }, TenantSettingsResponseSchema);
+  },
+
+  updateCampaignSettings: async (settings: any, expectedVersion: number, idempotencyKey?: string) => {
+    return apiRequest(
+      '/campaign-settings',
+      {
+        method: 'PATCH',
+        idempotencyKey,
+        expectedVersion,
+        body: JSON.stringify({ ...settings, expectedVersion })
+      },
+      TenantSettingsResponseSchema
+    );
   },
 
   // Campaigns
-  getCampaigns: async (): Promise<{ success: boolean; campaigns: CampaignSummary[] }> => {
-    return request('/campaigns');
+  getCampaigns: async () => {
+    return apiRequest('/campaigns', { method: 'GET' }, CampaignsListResponseSchema);
   },
 
-  getCampaign: async (id: string): Promise<any> => {
-    return request(`/campaigns/${id}`);
+  getCampaignDetail: async (id: string) => {
+    return apiRequest(`/campaigns/${id}`, { method: 'GET' }, CampaignDetailResponseSchema);
   },
 
-  createCampaign: async (presetId: string, name?: string): Promise<{ success: boolean; campaign: { id: string; name: string } }> => {
-    return request('/campaigns', {
-      method: 'POST',
-      body: JSON.stringify({ presetId, name })
-    });
+  createCampaign: async (presetId?: string, name?: string, idempotencyKey?: string) => {
+    return apiRequest<{ success: boolean; campaign: any; draftVersion: any }>(
+      '/campaigns',
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({ presetId, name })
+      }
+    );
   },
 
-  updateDraft: async (id: string, draftData: any, expectedVersion?: number): Promise<{ success: boolean; campaign: any; draftVersion: any }> => {
-    return request(`/campaigns/${id}/draft`, {
-      method: 'PATCH',
-      body: JSON.stringify(expectedVersion !== undefined ? { ...draftData, expectedVersion } : draftData)
-    });
+  validateCampaign: async (id: string, expectedVersion?: number, idempotencyKey?: string) => {
+    return apiRequest<{
+      success: boolean;
+      valid: boolean;
+      errors: Array<{ fieldPath: string; message: string; resolutionOwner: string }>;
+      warnings: Array<{ fieldPath: string; message: string; resolutionOwner: string }>;
+      campaign: any;
+      versionId: string;
+      draftVersion: number;
+      reviewFingerprint: string | null;
+      validatedSteps: number;
+    }>(
+      `/campaigns/${id}/validate`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify(expectedVersion !== undefined ? { expectedVersion } : {})
+      }
+    );
   },
 
-  runDryRun: async (id: string): Promise<{ success: boolean; dryRun: { draftFingerprint: string; summary: { totalEvaluated: number; eligibleCount: number; excludedCount: number } } }> => {
-    return request(`/campaigns/${id}/dry-runs`, {
-      method: 'POST'
-    });
+  saveDraftRevision: async (
+    id: string,
+    draftData: any,
+    expectedVersion: number,
+    idempotencyKey?: string
+  ) => {
+    return apiRequest(
+      `/campaigns/${id}/draft`,
+      {
+        method: 'PATCH',
+        idempotencyKey,
+        expectedVersion,
+        body: JSON.stringify({ ...draftData, expectedVersion })
+      }
+    );
   },
 
-  activateCampaign: async (id: string, reviewFingerprint: string, expectedVersion: number = 1): Promise<{ success: boolean; campaign: any }> => {
-    return request(`/campaigns/${id}/activate`, {
-      method: 'POST',
-      body: JSON.stringify({ reviewFingerprint, expectedVersion })
-    });
+  activateCampaign: async (
+    id: string,
+    reviewFingerprint: string,
+    expectedVersion: number,
+    idempotencyKey?: string
+  ) => {
+    return apiRequest<{
+      success: boolean;
+      campaign: any;
+      activeVersion: any;
+      planningResult?: any;
+    }>(
+      `/campaigns/${id}/activate`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        expectedVersion,
+        body: JSON.stringify({ reviewFingerprint, expectedVersion })
+      }
+    );
   },
 
-  publishRevision: async (id: string, expectedVersion: number, reviewFingerprint: string, steps?: any[]): Promise<{ success: boolean }> => {
-    return request(`/campaigns/${id}/publish-revision`, {
-      method: 'POST',
-      body: JSON.stringify({ expectedVersion, reviewFingerprint, steps })
-    });
+  pauseCampaign: async (id: string, idempotencyKey?: string) => {
+    return apiRequest<{ success: boolean; campaign: any }>(
+      `/campaigns/${id}/pause`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({})
+      }
+    );
   },
 
-  pauseCampaign: async (id: string): Promise<{ success: boolean }> => {
-    return request(`/campaigns/${id}/pause`, {
-      method: 'POST'
-    });
+  resumeCampaign: async (id: string, idempotencyKey?: string) => {
+    return apiRequest<{ success: boolean; campaign: any }>(
+      `/campaigns/${id}/resume`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({})
+      }
+    );
   },
 
-  resumeCampaign: async (id: string): Promise<{ success: boolean }> => {
-    return request(`/campaigns/${id}/resume`, {
-      method: 'POST'
-    });
+  archiveCampaign: async (id: string, idempotencyKey?: string) => {
+    return apiRequest<{ success: boolean; message: string; campaign: any; cancelledExecutionsCount: number }>(
+      `/campaigns/${id}/archive`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({})
+      }
+    );
   },
 
-  // Activity & Explainability Log
-  getActivityStream: async (): Promise<{ success: boolean; activity: ActivityItem[] }> => {
-    return request('/campaign-activity');
+  publishRevision: async (
+    id: string,
+    expectedVersion: number,
+    reviewFingerprint: string,
+    revisionData?: { steps?: any[]; trigger?: any; audience?: any; priority?: number; timezone?: string },
+    idempotencyKey?: string
+  ) => {
+    return apiRequest<{
+      success: boolean;
+      message: string;
+      campaign: any;
+      activeVersion: any;
+    }>(
+      `/campaigns/${id}/publish-revision`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        expectedVersion,
+        body: JSON.stringify({ expectedVersion, reviewFingerprint, ...(revisionData || {}) })
+      }
+    );
   },
 
-  resolveHold: async (enrollmentId: string): Promise<{ success: boolean }> => {
-    return request(`/enrollments/${enrollmentId}/resolve-hold`, {
-      method: 'POST'
-    });
+  runDryRun: async (id: string, idempotencyKey?: string) => {
+    return apiRequest(
+      `/campaigns/${id}/dry-runs`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({})
+      },
+      DryRunResponseSchema
+    );
   },
 
-  markGoal: async (enrollmentId: string, orderRef?: string): Promise<{ success: boolean }> => {
-    return request(`/enrollments/${enrollmentId}/mark-goal`, {
-      method: 'POST',
-      body: JSON.stringify({ orderRef })
-    });
+  // Activity Stream & Holds
+  getCampaignActivity: async () => {
+    return apiRequest('/campaign-activity', { method: 'GET' }, CampaignActivityResponseSchema);
   },
 
-  // CRM Patrons & Approved Templates
-  getCustomers: async (): Promise<{ success: boolean; customers: any[] }> => {
-    return request('/customers');
+  resolveHold: async (enrollmentId: string, action: 'RESUME' | 'CANCEL', notes?: string, idempotencyKey?: string) => {
+    return apiRequest(
+      `/enrollments/${enrollmentId}/resolve-hold`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({ action, notes })
+      }
+    );
   },
 
-  getTemplates: async (): Promise<{ success: boolean; templates: any[] }> => {
-    return request('/templates');
+  // Catalogue & CRM
+  getPresets: async () => {
+    return apiRequest('/campaign-presets', { method: 'GET' }, CampaignPresetsResponseSchema);
   },
 
-  // Tenant Settings (P2.j)
-  getSettings: async (): Promise<{ success: boolean; settings: any }> => {
-    return request('/campaign-settings');
+  getApprovedTemplates: async () => {
+    return apiRequest('/approved-template-catalogue', { method: 'GET' }, ApprovedTemplateCatalogueResponseSchema);
   },
 
-  updateSettings: async (settingsData: any): Promise<{ success: boolean; settings: any }> => {
-    return request('/campaign-settings', {
-      method: 'PATCH',
-      body: JSON.stringify(settingsData)
-    });
+  getCustomers: async () => {
+    return apiRequest('/customers', { method: 'GET' }, CustomersResponseSchema);
   },
 
-  // Enrollments and History (P2.j)
-  getCampaignEnrollments: async (campaignId: string, page: number = 1, limit: number = 50): Promise<{ success: boolean; enrollments: any[]; total: number }> => {
-    return request(`/campaigns/${campaignId}/enrollments?page=${page}&limit=${limit}`);
+  // Reporting
+  getOwnerOverviewReport: async () => {
+    return apiRequest('/campaigns/reports/owner-overview', { method: 'GET' }, OwnerOverviewReportResponseSchema);
   },
 
-  getCampaignHistory: async (campaignId: string, page: number = 1, limit: number = 50): Promise<{ success: boolean; history: any[]; total: number }> => {
-    return request(`/campaigns/${campaignId}/history?page=${page}&limit=${limit}`);
+  getEnrollments: async (campaignId: string, page = 1, limit = 20) => {
+    return apiRequest(
+      `/campaigns/${campaignId}/enrollments?page=${page}&limit=${limit}`,
+      { method: 'GET' },
+      CampaignEnrollmentsResponseSchema
+    );
   },
 
-  // Reason Codes (Step 12)
-  getReasonCodes: async (): Promise<{ success: boolean; reasonCodes: components['schemas']['ReasonCodeDefinition'][] }> => {
-    return request('/campaign-reason-codes');
+  getHistory: async (campaignId: string, page = 1, limit = 20) => {
+    return apiRequest(
+      `/campaigns/${campaignId}/history?page=${page}&limit=${limit}`,
+      { method: 'GET' },
+      CampaignHistoryResponseSchema
+    );
   },
 
-  // Integration Readiness (Step 12)
-  getIntegrationReadiness: async (): Promise<components['schemas']['IntegrationReadiness']> => {
-    return request('/integration-readiness');
+  getCustomerTimeline: async (customerId: string) => {
+    return apiRequest(
+      `/campaigns/reports/customer-timeline/${customerId}`,
+      { method: 'GET' },
+      CustomerTimelineResponseSchema
+    );
   },
 
-  // Presets & Capability (Step 10)
-  getPresets: async (): Promise<{ success: boolean; presets: components['schemas']['CampaignPreset'][] }> => {
-    return request('/campaign-presets');
+  markGoal: async (
+    enrollmentId: string,
+    orderRef?: string,
+    notes?: string,
+    idempotencyKey?: string
+  ) => {
+    return apiRequest<{ success: boolean; message: string; enrollment: any }>(
+      `/enrollments/${enrollmentId}/mark-goal`,
+      {
+        method: 'POST',
+        idempotencyKey,
+        body: JSON.stringify({
+          orderRef: orderRef || 'manual_staff_completion',
+          notes: notes || undefined
+        })
+      }
+    );
   },
 
-  getTenantPresets: async (): Promise<{ success: boolean; presets: components['schemas']['CampaignPreset'][] }> => {
-    return request('/campaign-tenant-presets');
+  getMonitoringAlerts: async () => {
+    return apiRequest('/campaigns/monitoring/alerts', { method: 'GET' }, MonitoringAlertsResponseSchema);
+  },
+
+  // Backward compatible helper aliases
+  getCampaign: async (id: string) => api.getCampaignDetail(id),
+  getSettings: async () => api.getCampaignSettings(),
+  updateSettings: async (settings: any) =>
+    api.updateCampaignSettings(settings, settings.expectedVersion || 1),
+  getTemplates: async () => api.getApprovedTemplates(),
+  getActivityStream: async () => api.getCampaignActivity(),
+  logout: () => {
+    handleUnauthorized();
+  },
+  updateDraft: async (id: string, data: any, expectedVersion = 1, idempotencyKey?: string) => {
+    return api.saveDraftRevision(id, data, expectedVersion, idempotencyKey);
   }
 };

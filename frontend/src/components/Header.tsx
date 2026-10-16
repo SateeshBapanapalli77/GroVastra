@@ -1,8 +1,12 @@
 'use client';
 
 import React from 'react';
-import { HelpCircle, ChevronRight, ShieldCheck, User, LogOut } from 'lucide-react';
-import { UserProfile } from '../lib/api';
+import { ChevronRight, ShieldCheck, LogOut, Radio } from 'lucide-react';
+import { useQuery } from '@tanstack/react-query';
+import { queryKeys } from '../lib/queryKeys';
+import { api } from '../lib/api';
+import { UserProfile } from '../lib/auth';
+import { getRoleBadgeLabel } from '../lib/roles';
 
 interface HeaderProps {
   breadcrumbs: string[];
@@ -11,6 +15,12 @@ interface HeaderProps {
 }
 
 export const Header: React.FC<HeaderProps> = ({ breadcrumbs, user, onLogout }) => {
+  const { data: readinessData } = useQuery({
+    queryKey: queryKeys.readiness.all,
+    queryFn: () => api.getIntegrationReadiness(),
+    staleTime: 60 * 1000
+  });
+
   const initials = user?.name
     ? user.name
         .split(' ')
@@ -18,12 +28,13 @@ export const Header: React.FC<HeaderProps> = ({ breadcrumbs, user, onLogout }) =
         .join('')
         .toUpperCase()
         .slice(0, 2)
-    : 'BO';
+    : user?.username?.slice(0, 2).toUpperCase() || 'BO';
 
-  const roleLabel = user?.role ? user.role.replace('_', ' ') : 'Owner';
+  const approvedTemplatesCount = readinessData?.templates?.filter((t) => t.status === 'APPROVED').length ?? 0;
+  const isConnectionActive = readinessData?.connection?.status === 'ACTIVE';
 
   return (
-    <header className="h-16 border-b border-[#EAE4DC] bg-[#FAF8F5]/80 backdrop-blur-xs px-6 flex items-center justify-between sticky top-0 z-30">
+    <header className="h-16 border-b border-[#EAE4DC] bg-[#FAF8F5]/90 backdrop-blur-xs px-6 flex items-center justify-between sticky top-0 z-30">
       {/* Breadcrumbs */}
       <div className="flex items-center gap-2 text-xs text-[#6B5E59]">
         {breadcrumbs.map((crumb, idx) => (
@@ -32,7 +43,7 @@ export const Header: React.FC<HeaderProps> = ({ breadcrumbs, user, onLogout }) =
               className={
                 idx === breadcrumbs.length - 1
                   ? 'font-semibold text-[#271E1B]'
-                  : 'hover:text-[#5C1D24] cursor-pointer'
+                  : 'hover:text-[#5C1D24]'
               }
             >
               {crumb}
@@ -46,25 +57,40 @@ export const Header: React.FC<HeaderProps> = ({ breadcrumbs, user, onLogout }) =
 
       {/* Right Controls */}
       <div className="flex items-center gap-4">
-        {/* Status Pills */}
-        <div className="hidden lg:flex items-center gap-2.5">
-          <div className="flex items-center gap-1.5 px-3 py-1 bg-[#FFFFFF] border border-[#EAE4DC] rounded-full text-[11px] font-medium text-[#271E1B] shadow-xs">
-            <span className="w-2 h-2 rounded-full bg-emerald-500 animate-pulse" />
-            <span>WhatsApp connected: <strong className="text-emerald-700">Ready</strong></span>
-          </div>
+        {/* Dynamic Status Badges from API */}
+        {readinessData && (
+          <div className="hidden lg:flex items-center gap-2.5">
+            <div className="flex items-center gap-1.5 px-3 py-1 bg-[#FFFFFF] border border-[#EAE4DC] rounded-full text-[11px] font-medium text-[#271E1B] shadow-xs">
+              <span
+                className={`w-2 h-2 rounded-full ${
+                  isConnectionActive ? 'bg-[#1B7A43]' : 'bg-[#C99726]'
+                }`}
+              />
+              <span>
+                WhatsApp Channel:{' '}
+                <strong className={isConnectionActive ? 'text-[#1B7A43]' : 'text-[#8F6910]'}>
+                  {readinessData.connection.status}
+                </strong>
+              </span>
+            </div>
 
-          <div className="flex items-center gap-1.5 px-3 py-1 bg-[#FEF9EE] border border-[#F3E0B5] rounded-full text-[11px] font-medium text-[#8F6910] shadow-xs">
-            <ShieldCheck className="w-3.5 h-3.5 text-[#C99726]" />
-            <span>Approved templates: <strong>4 available</strong></span>
+            <div className="flex items-center gap-1.5 px-3 py-1 bg-[#FEF9EE] border border-[#F3E0B5] rounded-full text-[11px] font-medium text-[#8F6910] shadow-xs">
+              <ShieldCheck className="w-3.5 h-3.5 text-[#C99726]" />
+              <span>
+                Approved templates: <strong>{approvedTemplatesCount} available</strong>
+              </span>
+            </div>
           </div>
-        </div>
+        )}
 
         <div className="h-4 w-px bg-[#EAE4DC] hidden lg:block" />
 
-        {/* Support note */}
+        {/* Tenant context */}
         <div className="text-[10px] text-[#988B86] hidden xl:block text-right">
-          Managed by GroVastra for
-          <span className="block font-semibold text-[#6B5E59]">{user?.shopName || 'Heritage Boutique'}</span>
+          Boutique Store
+          <span className="block font-semibold text-[#5C1D24]">
+            {user?.shopName || 'Heritage Boutique'}
+          </span>
         </div>
 
         {/* User Profile & Role */}
@@ -73,8 +99,12 @@ export const Header: React.FC<HeaderProps> = ({ breadcrumbs, user, onLogout }) =
             {initials}
           </div>
           <div className="text-left hidden sm:block">
-            <div className="text-xs font-semibold text-[#271E1B]">{user?.name || 'Boutique Staff'}</div>
-            <div className="text-[10px] text-[#C99726] font-medium uppercase tracking-wider">{roleLabel}</div>
+            <div className="text-xs font-semibold text-[#271E1B]">
+              {user?.name || user?.username || 'Boutique Staff'}
+            </div>
+            <div className="text-[10px] text-[#C99726] font-medium uppercase tracking-wider">
+              {getRoleBadgeLabel(user?.role)}
+            </div>
           </div>
           {onLogout && (
             <button

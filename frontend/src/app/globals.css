@@ -1,33 +1,97 @@
 @import "tailwindcss";
 
+@theme {
+  --color-background: #FAF8F5;
+  --color-foreground: #2A1D1A;
+
+  --color-primary: #5C1D24;
+  --color-primary-hover: #73232C;
+  --color-primary-deep: #431217;
+  --color-primary-subtle: #FDF5F6;
+  --color-primary-border: #F0DADC;
+  --color-primary-foreground: #FFFFFF;
+
+  --color-accent: #C99726;
+  --color-accent-dark: #8F6910;
+  --color-accent-subtle: #FEF9EE;
+  --color-accent-border: #F3E0B5;
+  --color-accent-foreground: #431217;
+
+  --color-canvas: #FAF8F5;
+  --color-card: #FFFFFF;
+  --color-card-foreground: #2A1D1A;
+  --color-popover: #FFFFFF;
+  --color-popover-foreground: #2A1D1A;
+
+  --color-muted: #F4EFE8;
+  --color-muted-foreground: #6B5E59;
+  --color-muted-subtle: #988B86;
+
+  --color-border: #EAE4DC;
+  --color-border-subtle: #F3EFEA;
+  --color-input: #EAE4DC;
+  --color-ring: #5C1D24;
+
+  --color-destructive: #9E2A2B;
+  --color-destructive-foreground: #FFFFFF;
+  --color-destructive-subtle: #FDF2F2;
+  --color-destructive-border: #F8D7DA;
+
+  --color-success: #1B7A43;
+  --color-success-foreground: #FFFFFF;
+  --color-success-subtle: #EBF7EE;
+  --color-success-border: #C3E8CB;
+
+  --color-warning: #B26A00;
+  --color-warning-subtle: #FFF7E6;
+  --color-warning-border: #FFE2B3;
+
+  --font-serif: var(--font-serif), Georgia, Cambria, "Times New Roman", serif;
+  --font-sans: var(--font-sans), system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+
+  --radius-sm: 0.25rem;
+  --radius-md: 0.375rem;
+  --radius-lg: 0.5rem;
+  --radius-xl: 0.75rem;
+}
+
 :root {
   --background: #FAF8F5;
   --foreground: #2A1D1A;
-  
-  --crimson-primary: #5C1D24;
-  --crimson-deep: #431217;
-  --crimson-hover: #73232C;
-  --crimson-subtle: #FDF5F6;
-  --crimson-border: #F0DADC;
 
-  --gold-primary: #C99726;
-  --gold-dark: #8F6910;
-  --gold-subtle: #FEF9EE;
-  --gold-border: #F3E0B5;
+  --card: #FFFFFF;
+  --card-foreground: #2A1D1A;
 
-  --ivory-canvas: #FAF8F5;
-  --ivory-card: #FFFFFF;
-  --ivory-border: #EAE4DC;
-  --ivory-muted: #F4EFE8;
+  --popover: #FFFFFF;
+  --popover-foreground: #2A1D1A;
 
-  --text-main: #271E1B;
-  --text-muted: #6B5E59;
-  --text-subtle: #988B86;
+  --primary: #5C1D24;
+  --primary-foreground: #FFFFFF;
+  --primary-hover: #73232C;
+  --primary-deep: #431217;
+  --primary-subtle: #FDF5F6;
+  --primary-border: #F0DADC;
 
-  --whatsapp-primary: #25D366;
-  --whatsapp-dark: #075E54;
-  --whatsapp-bg: #E8F8EE;
-  --whatsapp-bubble: #DCF8C6;
+  --secondary: #F4EFE8;
+  --secondary-foreground: #2A1D1A;
+
+  --muted: #F4EFE8;
+  --muted-foreground: #6B5E59;
+
+  --accent: #C99726;
+  --accent-foreground: #431217;
+  --accent-dark: #8F6910;
+  --accent-subtle: #FEF9EE;
+  --accent-border: #F3E0B5;
+
+  --destructive: #9E2A2B;
+  --destructive-foreground: #FFFFFF;
+
+  --border: #EAE4DC;
+  --input: #EAE4DC;
+  --ring: #5C1D24;
+
+  --radius: 0.375rem;
 }
 
 body {
@@ -38,10 +102,10 @@ body {
 }
 
 .font-serif {
-  font-family: var(--font-serif), Georgia, serif;
+  font-family: var(--font-serif);
 }
 
-/* Custom scrollbar for clean boutique feel */
+/* Boutique handloom aesthetic scrollbar */
 ::-webkit-scrollbar {
   width: 6px;
   height: 6px;
