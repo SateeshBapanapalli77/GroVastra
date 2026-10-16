@@ -236,7 +236,7 @@ describe('Senior Technical Manager Review Hardening Verification', () => {
     });
 
     // Validating active campaign must target draftVersion 2 and report validation errors
-    const res = await apiPost(`/api/v1/campaigns/${camp.id}/validate`, {}, ownerTokenA);
+    const res = await apiPost(`/api/v1/campaigns/${camp.id}/validate`, { expectedVersion: 2 }, ownerTokenA);
     expect(res.status).toBe(200);
     expect(res.body.draftVersion).toBe(2);
     expect(res.body.versionId).toBe('cv_v2_draft');

@@ -176,6 +176,8 @@ function CampaignEditWizardContent() {
         audience: audienceData,
         steps,
         priority: rulesData.priority,
+        goal: rulesData.goal,
+        resumePolicy: rulesData.resumePolicy,
         expectedVersion: versionToUse
       };
 

@@ -327,7 +327,7 @@ describe('Work Package P2: Milestone 2 Gaps & Matrix Verification', () => {
       // Validate endpoint returns structured errors
       const valRes = await apiPost(
         `/api/v1/campaigns/${cmp.id}/validate`,
-        {},
+        { expectedVersion: 1 },
         { Authorization: `Bearer ${ownerToken}` }
       );
 

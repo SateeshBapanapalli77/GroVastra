@@ -23,6 +23,7 @@ export type IdPrefix =
   | 'inbox'// Event Inbox
   | 'fact' // Customer Fact
   | 'arr'  // Arrival Event
+  | 'claim'// Worker Claim Token
   | 'req'; // Request Record
 
 export function generateId(prefix: IdPrefix): string {

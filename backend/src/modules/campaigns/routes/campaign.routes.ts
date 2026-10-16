@@ -528,13 +528,45 @@ campaignRouter.patch(
   async (req: Request, res: Response) => {
     try {
       const tenantId = (req as any).tenantId;
-      const { expectedVersion, name, trigger, audience, steps, priority, timezone } = req.body;
+      const {
+        expectedVersion,
+        name,
+        trigger,
+        audience,
+        steps,
+        priority,
+        timezone,
+        goal,
+        resumePolicy,
+        importPolicy,
+        enabledBranches,
+        brandName
+      } = req.body;
 
       // Mandatory optimistic concurrency control (Review 2, Spec C16)
       if (typeof expectedVersion !== 'number') {
         return res.status(400).json(
           formatErrorResponse('EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion')
         );
+      }
+
+      if (resumePolicy !== undefined && !['FUTURE_ONLY', 'REPLAY_RECENT'].includes(resumePolicy)) {
+        return res.status(400).json(
+          formatErrorResponse('Invalid resumePolicy: must be FUTURE_ONLY or REPLAY_RECENT.', 'VALIDATION_FAILED', 'resumePolicy')
+        );
+      }
+
+      if (goal !== undefined) {
+        if (typeof goal !== 'object' || goal === null) {
+          return res.status(400).json(
+            formatErrorResponse('Invalid goal: must be an object.', 'VALIDATION_FAILED', 'goal')
+          );
+        }
+        if (goal.type && !['OCCASION_TAGGED_OR_STAFF_COMPLETED', 'ORDER_COMPLETED', 'APPOINTMENT_ATTENDED'].includes(goal.type)) {
+          return res.status(400).json(
+            formatErrorResponse('Invalid goal.type.', 'VALIDATION_FAILED', 'goal.type')
+          );
+        }
       }
 
       const session = await mongoose.startSession();
@@ -575,17 +607,18 @@ campaignRouter.patch(
                   campaignId: campaign.id,
                   version: nextVersionNumber,
                   name: name || draft.name,
+                  brandName: brandName !== undefined ? brandName : draft.brandName,
                   industry: draft.industry,
                   purpose: draft.purpose,
                   trigger: trigger ? { ...draft.trigger, ...trigger } : draft.trigger,
                   timezone: timezone || draft.timezone,
                   audience: audience || draft.audience,
-                  goal: draft.goal,
+                  goal: goal ? { ...(draft.goal && typeof (draft.goal as any).toObject === 'function' ? (draft.goal as any).toObject() : (draft.goal || {})), ...goal } : draft.goal,
                   steps: steps || draft.steps,
-                  priority: priority || draft.priority,
-                  resumePolicy: draft.resumePolicy,
-                  importPolicy: draft.importPolicy,
-                  enabledBranches: draft.enabledBranches,
+                  priority: typeof priority === 'number' ? priority : draft.priority,
+                  resumePolicy: resumePolicy || draft.resumePolicy,
+                  importPolicy: importPolicy || draft.importPolicy,
+                  enabledBranches: enabledBranches || draft.enabledBranches,
                   publishedBy: (req as any).user?.userId || 'owner',
                   reviewFingerprint: `draft_${Date.now()}`
                 }
@@ -619,8 +652,16 @@ campaignRouter.patch(
             if (trigger) draft.trigger = { ...draft.trigger, ...trigger };
             if (audience) draft.audience = audience;
             if (steps) draft.steps = steps;
-            if (priority) draft.priority = priority;
+            if (typeof priority === 'number') draft.priority = priority;
             if (timezone) draft.timezone = timezone;
+            if (goal) {
+              const currentGoal = draft.goal && typeof (draft.goal as any).toObject === 'function' ? (draft.goal as any).toObject() : (draft.goal || {});
+              draft.goal = { ...currentGoal, ...goal };
+            }
+            if (resumePolicy) draft.resumePolicy = resumePolicy;
+            if (importPolicy) draft.importPolicy = importPolicy;
+            if (enabledBranches) draft.enabledBranches = enabledBranches;
+            if (brandName !== undefined) draft.brandName = brandName;
             draft.version = nextVersion;
 
             draft.reviewFingerprint = `draft_${Date.now()}`;
@@ -1276,33 +1317,67 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
     if (!campaign) return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
 
     const { expectedVersion } = req.body || {};
-    if (expectedVersion !== undefined) {
-      if (typeof expectedVersion !== 'number') {
-        return res.status(400).json(formatErrorResponse('expectedVersion must be a number', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion'));
-      }
-      if (campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json(
-          formatErrorResponse(`Version conflict: expected draft version ${expectedVersion}, but current draft is version ${campaign.draftVersion}.`, 'VERSION_CONFLICT', 'expectedVersion')
-        );
-      }
+    if (expectedVersion === undefined || typeof expectedVersion !== 'number') {
+      return res.status(400).json(
+        formatErrorResponse('EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion')
+      );
     }
 
-    // Always validate the draft version being edited/prepared (Spec p.21, Finding 2)
+    if (campaign.draftVersion !== expectedVersion) {
+      return res.status(409).json(
+        formatErrorResponse(
+          `Version conflict: expected draft version ${expectedVersion}, but current draft is version ${campaign.draftVersion}.`,
+          'VERSION_CONFLICT',
+          'expectedVersion'
+        )
+      );
+    }
+
+    // Always validate the exact draft revision requested (Spec p.21, Finding 2)
     const version = await CampaignVersionModel.findOne({
       campaignId: campaign.id,
       tenantId,
-      version: campaign.draftVersion
-    }) || await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
+      version: expectedVersion
+    });
 
     if (!version) {
-      return res.status(400).json(formatErrorResponse('No campaign version found to validate', 'NO_BASE_VERSION_FOUND'));
+      return res.status(404).json(
+        formatErrorResponse(`Draft version ${expectedVersion} not found for campaign ${campaign.id}`, 'DRAFT_NOT_FOUND', 'expectedVersion')
+      );
     }
 
     const { valid: isValid, errors, warnings } = await validateCampaignVersionDefinition(version, tenantId);
 
+    let updatedCampaign = campaign;
     if (isValid && campaign.status === 'DRAFT') {
-      campaign.status = 'VALIDATED';
-      await campaign.save();
+      // Atomic conditional update: ensure draftVersion has not advanced concurrently during validation
+      const updated = await CampaignModel.findOneAndUpdate(
+        {
+          id: campaign.id,
+          tenantId,
+          draftVersion: expectedVersion,
+          status: 'DRAFT'
+        },
+        {
+          $set: { status: 'VALIDATED' }
+        },
+        { new: true }
+      );
+
+      if (!updated) {
+        const currentCampaign = await CampaignModel.findOne({ id: campaign.id, tenantId });
+        if (currentCampaign && currentCampaign.draftVersion !== expectedVersion) {
+          return res.status(409).json(
+            formatErrorResponse(
+              `Version conflict: draft was concurrently modified to version ${currentCampaign.draftVersion} during validation.`,
+              'VERSION_CONFLICT',
+              'expectedVersion'
+            )
+          );
+        }
+      } else {
+        updatedCampaign = updated;
+      }
     }
 
     res.json({
@@ -1310,7 +1385,7 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
       valid: isValid,
       errors,
       warnings,
-      campaign,
+      campaign: updatedCampaign,
       versionId: version.id,
       draftVersion: version.version,
       reviewFingerprint: version.reviewFingerprint || null,

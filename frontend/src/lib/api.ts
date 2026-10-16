@@ -266,7 +266,7 @@ export const api = {
     );
   },
 
-  validateCampaign: async (id: string, expectedVersion?: number, idempotencyKey?: string) => {
+  validateCampaign: async (id: string, expectedVersion: number, idempotencyKey?: string) => {
     return apiRequest<{
       success: boolean;
       valid: boolean;
@@ -282,7 +282,8 @@ export const api = {
       {
         method: 'POST',
         idempotencyKey,
-        body: JSON.stringify(expectedVersion !== undefined ? { expectedVersion } : {})
+        expectedVersion,
+        body: JSON.stringify({ expectedVersion })
       }
     );
   },

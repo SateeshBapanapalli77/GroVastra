@@ -212,10 +212,6 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                       { statusEventKey, inboxId: inboxDoc.id, currentStatus: inboxDoc.status },
                       'Resuming reconciliation for previously unprocessed/failed WhatsApp status webhook event'
                     );
-                    await CampaignEventInboxModel.updateOne(
-                      { id: inboxDoc.id },
-                      { $set: { status: 'PROCESSING', updatedAt: new Date() } }
-                    );
                   } else {
                     continue;
                   }
@@ -228,6 +224,33 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                 continue;
               }
 
+              // Atomically claim the inbox event to coordinate between webhook HTTP retries and background workers (Requirement 5)
+              const claimToken = generateId('claim');
+              const claimedDoc = await CampaignEventInboxModel.findOneAndUpdate(
+                {
+                  id: inboxDoc.id,
+                  tenantId,
+                  status: { $in: ['RECEIVED', 'FAILED'] }
+                },
+                {
+                  $set: {
+                    status: 'PROCESSING',
+                    claimToken,
+                    claimedUntil: new Date(Date.now() + 60000),
+                    updatedAt: new Date()
+                  }
+                },
+                { new: true }
+              );
+
+              if (!claimedDoc) {
+                logger.info(
+                  { statusEventKey, inboxId: inboxDoc.id },
+                  'WhatsApp status event already claimed or processed by concurrent runner; skipping inline processing'
+                );
+                continue;
+              }
+
               if (intent) {
                 try {
                   const reconResult = await deliveryRecon.reconcileDeliveryStatus({
@@ -237,16 +260,19 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                     providerTimestamp,
                     errorCode: statusObj.errors?.[0]?.code?.toString() || 'PROVIDER_DELIVERY_FAILED',
                     errorReason: statusObj.errors?.[0]?.title || statusObj.errors?.[0]?.message || 'PROVIDER_DELIVERY_FAILED',
-                    inboxEventId: inboxDoc.id
+                    inboxEventId: claimedDoc.id
                   });
 
                   if (!reconResult.reconciled) {
+                    // Guard against overwriting an already PROCESSED state (Requirement 6)
                     await CampaignEventInboxModel.updateOne(
-                      { id: inboxDoc.id },
+                      { id: claimedDoc.id, tenantId, status: { $ne: 'PROCESSED' } },
                       {
                         $set: {
                           status: 'FAILED',
                           errorMessage: reconResult.details,
+                          claimToken: null,
+                          claimedUntil: null,
                           updatedAt: new Date()
                         },
                         $inc: { retryCount: 1 }
@@ -259,50 +285,49 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
                       providerMessageId,
                       status,
                       tenantId: intent.tenantId,
-                      inboxId: inboxDoc.id,
+                      inboxId: claimedDoc.id,
                       policyResult: reconResult.policyResult,
                       details: reconResult.details
                     },
                     'Reconciled delivery status via unified policy and marked inbox event PROCESSED'
                   );
                 } catch (reconErr: any) {
+                  // Guard against overwriting an already PROCESSED state on late error (Requirement 6)
                   await CampaignEventInboxModel.updateOne(
-                    { id: inboxDoc.id },
+                    { id: claimedDoc.id, tenantId, status: { $ne: 'PROCESSED' } },
                     {
                       $set: {
                         status: 'FAILED',
                         errorMessage: reconErr?.message || 'Reconciliation failed',
                         nextAttemptAt: null,
+                        claimToken: null,
+                        claimedUntil: null,
                         updatedAt: new Date()
                       },
                       $inc: { retryCount: 1 }
                     }
                   );
                   logger.error(
-                    { err: reconErr, providerMessageId, status, inboxId: inboxDoc.id },
+                    { err: reconErr, providerMessageId, status, inboxId: claimedDoc.id },
                     'Delivery status reconciliation failed; inbox event recorded as FAILED for retry'
                   );
                   throw reconErr;
                 }
               } else {
-                if (inboxDoc.status === 'PROCESSING') {
-                  await CampaignEventInboxModel.updateOne(
-                    { id: inboxDoc.id },
-                    {
-                      $set: {
-                        status: 'RECEIVED',
-                        nextAttemptAt: new Date(Date.now() + 5000),
-                        updatedAt: new Date()
-                      }
+                // Durably reset to RECEIVED with backoff nextAttemptAt; leave recoverable
+                await CampaignEventInboxModel.updateOne(
+                  { id: claimedDoc.id, tenantId, status: { $ne: 'PROCESSED' } },
+                  {
+                    $set: {
+                      status: 'RECEIVED',
+                      nextAttemptAt: new Date(Date.now() + 5000),
+                      claimToken: null,
+                      claimedUntil: null,
+                      updatedAt: new Date()
                     }
-                  );
-                } else if (!inboxDoc.nextAttemptAt) {
-                  await CampaignEventInboxModel.updateOne(
-                    { id: inboxDoc.id },
-                    { $set: { nextAttemptAt: new Date(Date.now() + 5000) } }
-                  );
-                }
-                logger.info({ providerMessageId, status, tenantId, inboxId: inboxDoc.id }, 'Durably retained status receipt before send response persistence (C12)');
+                  }
+                );
+                logger.info({ providerMessageId, status, tenantId, inboxId: claimedDoc.id }, 'Durably retained status receipt before send response persistence (C12)');
               }
             }
           }
