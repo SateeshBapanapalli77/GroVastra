@@ -3,6 +3,7 @@ import crypto from 'crypto';
 import { IdempotencyRecordModel } from '../../modules/campaigns/models/Idempotency.model';
 import { generateId } from '../utils/id';
 import { logger } from '../../config/logger';
+import { formatErrorResponse } from '../utils/errors';
 
 export const IN_PROGRESS_RECOVERY_MS = 2 * 60 * 1000; // 2 minutes
 
@@ -39,20 +40,16 @@ export async function requireIdempotency(req: Request, res: Response, next: Next
 
   // Strict Spec rule (Page 26, lines 1201-1202): "Mutations require idempotency keys"
   if (!key || key.trim() === '') {
-    return res.status(400).json({
-      success: false,
-      error: 'IDEMPOTENCY_KEY_REQUIRED: State-mutating requests require an Idempotency-Key header.',
-      code: 'IDEMPOTENCY_KEY_REQUIRED'
-    });
+    return res.status(400).json(
+      formatErrorResponse('IDEMPOTENCY_KEY_REQUIRED: State-mutating requests require an Idempotency-Key header.', 'IDEMPOTENCY_KEY_REQUIRED')
+    );
   }
 
   const tenantId = (req as any).tenantId;
   if (!tenantId) {
-    return res.status(401).json({
-      success: false,
-      error: 'UNAUTHORIZED: Tenant authentication context required.',
-      code: 'UNAUTHORIZED'
-    });
+    return res.status(401).json(
+      formatErrorResponse('UNAUTHORIZED: Tenant authentication context required.', 'UNAUTHORIZED')
+    );
   }
 
   const method = req.method.toUpperCase();
@@ -70,12 +67,14 @@ export async function requireIdempotency(req: Request, res: Response, next: Next
         (existing.method && existing.method !== method) ||
         (existing.route && existing.route !== route)
       ) {
-        return res.status(422).json({
-          success: false,
-          error: 'IDEMPOTENCY_BODY_MISMATCH',
-          code: 'IDEMPOTENCY_BODY_MISMATCH',
-          message: 'The idempotency key was previously used with a different request payload, method, or route.'
-        });
+        return res.status(422).json(
+          formatErrorResponse(
+            'IDEMPOTENCY_BODY_MISMATCH',
+            'IDEMPOTENCY_BODY_MISMATCH',
+            undefined,
+            { message: 'The idempotency key was previously used with a different request payload, method, or route.' }
+          )
+        );
       }
 
       if (existing.status === 'COMPLETED') {
@@ -85,11 +84,9 @@ export async function requireIdempotency(req: Request, res: Response, next: Next
       // Record is IN_PROGRESS: Check age for crash recovery (> 2 minutes)
       const recordAgeMs = Date.now() - (existing.updatedAt?.getTime() || existing.createdAt?.getTime() || 0);
       if (recordAgeMs <= IN_PROGRESS_RECOVERY_MS) {
-        return res.status(409).json({
-          success: false,
-          error: 'A request with this idempotency key is currently being processed.',
-          code: 'IDEMPOTENCY_IN_PROGRESS'
-        });
+        return res.status(409).json(
+          formatErrorResponse('A request with this idempotency key is currently being processed.', 'IDEMPOTENCY_IN_PROGRESS')
+        );
       }
 
       // Recover stalled/crashed IN_PROGRESS record
@@ -115,11 +112,9 @@ export async function requireIdempotency(req: Request, res: Response, next: Next
       );
 
       if (!reclaimed) {
-        return res.status(409).json({
-          success: false,
-          error: 'Concurrent mutation conflict while recovering idempotency record.',
-          code: 'IDEMPOTENCY_CONCURRENT_CONFLICT'
-        });
+        return res.status(409).json(
+          formatErrorResponse('Concurrent mutation conflict while recovering idempotency record.', 'IDEMPOTENCY_CONCURRENT_CONFLICT')
+        );
       }
 
       targetRecordId = reclaimed.id;
@@ -137,11 +132,9 @@ export async function requireIdempotency(req: Request, res: Response, next: Next
         targetRecordId = record.id;
       } catch (insertErr: any) {
         if (insertErr?.code === 11000) {
-          return res.status(409).json({
-            success: false,
-            error: 'Concurrent mutation conflict with the same idempotency key.',
-            code: 'IDEMPOTENCY_CONCURRENT_CONFLICT'
-          });
+          return res.status(409).json(
+            formatErrorResponse('Concurrent mutation conflict with the same idempotency key.', 'IDEMPOTENCY_CONCURRENT_CONFLICT')
+          );
         }
         throw insertErr;
       }

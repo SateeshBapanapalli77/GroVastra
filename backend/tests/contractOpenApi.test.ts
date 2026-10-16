@@ -1,7 +1,8 @@
-import { describe, it, expect, beforeAll, afterAll, beforeEach } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll, beforeEach, vi } from 'vitest';
 import http from 'http';
 import fs from 'fs';
 import path from 'path';
+import crypto from 'crypto';
 import YAML from 'yaml';
 import mongoose from 'mongoose';
 import app from '../src/server';
@@ -10,6 +11,7 @@ import { signJwt } from '../src/shared/middleware/auth.middleware';
 import { connectDatabase } from '../src/config/database';
 import { TenantSettingsModel, REQUIRED_SETTINGS_NOTICE } from '../src/modules/campaigns/models/TenantSettings.model';
 import { TenantConnectionModel } from '../src/modules/campaigns/models/TenantConnection.model';
+import { IdempotencyRecordModel } from '../src/modules/campaigns/models/Idempotency.model';
 import { CAMPAIGN_REASON_CODES } from '../src/shared/reasonCodes';
 import { webhookRouter, campaignRouter } from '../src/modules/campaigns';
 import { authRouter } from '../src/modules/auth/routes/auth.routes';
@@ -530,5 +532,422 @@ describe('Step 12: OpenAPI API Contract Freeze & Response Drift Tests', () => {
     expect(updatedEnrollment).not.toBeNull();
     expect(updatedEnrollment!.goalReachedAt).not.toBeNull();
     expect(updatedEnrollment!.goalOrderRef).toBe('ord_contract_goal_01');
+  });
+
+  // Helper to strictly assert uniform error shape { success: false, error: string, code: UPPER_SNAKE, fieldPath?: string }
+  function assertUniformErrorShape(body: any, expectedCode?: string) {
+    expect(body).toBeDefined();
+    expect(body.success).toBe(false);
+    expect(typeof body.error).toBe('string');
+    expect(body.error.length).toBeGreaterThan(0);
+    expect(typeof body.code).toBe('string');
+    expect(body.code).toMatch(/^[A-Z0-9_]+$/); // Strict stable UPPER_SNAKE code
+    if (expectedCode) {
+      expect(body.code).toBe(expectedCode);
+    }
+    if (body.fieldPath !== undefined) {
+      expect(typeof body.fieldPath).toBe('string');
+    }
+  }
+
+  it('8. Raw Error Grep: No raw "success: false" exists in backend/src/modules/**/routes/*.ts', () => {
+    const modulesDir = path.resolve(__dirname, '../src/modules');
+    const routeFiles: string[] = [];
+
+    function findRouteFiles(dir: string) {
+      const entries = fs.readdirSync(dir, { withFileTypes: true });
+      for (const entry of entries) {
+        const fullPath = path.join(dir, entry.name);
+        if (entry.isDirectory()) {
+          findRouteFiles(fullPath);
+        } else if (entry.isFile() && entry.name.endsWith('.routes.ts')) {
+          routeFiles.push(fullPath);
+        }
+      }
+    }
+
+    findRouteFiles(modulesDir);
+    expect(routeFiles.length).toBeGreaterThanOrEqual(3);
+
+    const violations: { file: string; line: number; content: string }[] = [];
+    const regex = /success\s*:\s*false/;
+
+    for (const file of routeFiles) {
+      const content = fs.readFileSync(file, 'utf-8');
+      const lines = content.split('\n');
+      lines.forEach((line, index) => {
+        if (regex.test(line)) {
+          violations.push({
+            file: path.relative(path.resolve(__dirname, '..'), file),
+            line: index + 1,
+            content: line.trim()
+          });
+        }
+      });
+    }
+
+    expect(
+      violations,
+      `Found raw "success: false" in route files. All error responses must call formatErrorResponse:\n${JSON.stringify(violations, null, 2)}`
+    ).toHaveLength(0);
+  });
+
+  it('9. Uniform Error Shape: Campaign route family (400, 404, 409, 422, 500)', async () => {
+    // 400: Validation error (PATCH /campaign-settings missing expectedVersion)
+    const valRes = await fetch(`${baseUrl}/campaign-settings`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ownerToken}`,
+        'Idempotency-Key': `idemp_camp_val_${Date.now()}`
+      },
+      body: JSON.stringify({ storeName: 'Invalid No Expected Version' })
+    });
+    expect(valRes.status).toBe(400);
+    const valBody = await valRes.json();
+    assertUniformErrorShape(valBody, 'EXPECTED_VERSION_REQUIRED');
+    expect(valBody.fieldPath).toBe('expectedVersion');
+
+    // 404: Resource not found (GET /campaigns/:id non-existent)
+    const notFoundRes = await fetch(`${baseUrl}/campaigns/cmp_non_existent_${Date.now()}`, {
+      headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    expect(notFoundRes.status).toBe(404);
+    const notFoundBody = await notFoundRes.json();
+    assertUniformErrorShape(notFoundBody, 'CAMPAIGN_NOT_FOUND');
+
+    // 409: Conflict (PATCH /campaign-settings expectedVersion mismatch)
+    const confRes = await fetch(`${baseUrl}/campaign-settings`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ownerToken}`,
+        'Idempotency-Key': `idemp_camp_conf_${Date.now()}`
+      },
+      body: JSON.stringify({ expectedVersion: 99999, storeName: 'Conflict' })
+    });
+    expect(confRes.status).toBe(409);
+    const confBody = await confRes.json();
+    assertUniformErrorShape(confBody, 'VERSION_CONFLICT');
+    expect(confBody.fieldPath).toBe('expectedVersion');
+
+    // 422: Unprocessable entity (POST /campaigns unimplemented preset)
+    const unprocRes = await fetch(`${baseUrl}/campaigns`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ownerToken}`,
+        'Idempotency-Key': `idemp_camp_unproc_${Date.now()}`
+      },
+      body: JSON.stringify({ presetId: 'unimplemented_mock_preset' })
+    });
+    expect(unprocRes.status).toBe(422);
+    const unprocBody = await unprocRes.json();
+    assertUniformErrorShape(unprocBody, 'PRESET_NOT_IMPLEMENTED');
+    expect(unprocBody.fieldPath).toBe('presetId');
+
+    // 500: Server error (GET /campaigns simulated database outage)
+    const { CampaignModel } = await import('../src/modules/campaigns/models/Campaign.model');
+    const spy = vi.spyOn(CampaignModel, 'find').mockImplementationOnce(() => {
+      throw new Error('Simulated database cluster outage');
+    });
+    const errRes = await fetch(`${baseUrl}/campaigns`, {
+      headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    expect(errRes.status).toBe(500);
+    const errBody = await errRes.json();
+    assertUniformErrorShape(errBody, 'INTERNAL_ERROR');
+    expect(errBody.error).toContain('Simulated database cluster outage');
+    spy.mockRestore();
+  });
+
+  it('10. Uniform Error Shape: Webhook & Internal route family (400, 404, 409, 422, 500)', async () => {
+    const { mintServiceToken } = await import('../src/scripts/mintServiceToken');
+    const { env } = await import('../src/config/env');
+    const { CampaignEventInboxModel } = await import('../src/modules/campaigns/models/CampaignEventInbox.model');
+    const webhookSecret = env.WHATSAPP_APP_SECRET || 'test_webhook_secret_key_mock_123';
+
+    const orderCredential = mintServiceToken({
+      producer: 'orders_service',
+      tenantId,
+      eventFamily: 'orders'
+    });
+
+    const eventCredential = mintServiceToken({
+      producer: 'inventory_service',
+      tenantId,
+      eventFamily: 'campaign-events'
+    });
+
+    // 400: Validation error (POST /webhooks/orders missing orderId)
+    const valRes = await fetch(`${baseUrl}/webhooks/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-api-key': orderCredential
+      },
+      body: JSON.stringify({ customerId: 'cus_missing_order' })
+    });
+    expect(valRes.status).toBe(400);
+    const valBody = await valRes.json();
+    assertUniformErrorShape(valBody, 'MISSING_REQUIRED_FIELDS');
+    expect(valBody.fieldPath).toBe('orderId');
+
+    // 404: Not found (POST /webhooks/whatsapp flat status delivery intent not found)
+    const connId = `conn_webhook_404_${Date.now()}`;
+    await TenantConnectionModel.create({
+      id: generateId('conn'),
+      tenantId,
+      connectionId: connId,
+      provider: 'whatsapp_cloud',
+      status: 'ACTIVE'
+    });
+
+    const flatPayload = JSON.stringify({
+      connectionId: connId,
+      providerMessageId: `wamid_unregistered_${Date.now()}`,
+      status: 'delivered'
+    });
+    const flatSig = `sha256=${crypto.createHmac('sha256', webhookSecret).update(flatPayload).digest('hex')}`;
+
+    const notFoundRes = await fetch(`${baseUrl}/webhooks/whatsapp`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-hub-signature-256': flatSig
+      },
+      body: flatPayload
+    });
+    expect(notFoundRes.status).toBe(404);
+    const notFoundBody = await notFoundRes.json();
+    assertUniformErrorShape(notFoundBody, 'DELIVERY_INTENT_NOT_FOUND');
+
+    // 409: Conflict (POST /internal/campaign-events stale entityVersion)
+    await CampaignEventInboxModel.create({
+      id: `evt_v10_${Date.now()}`,
+      tenantId,
+      producer: 'inventory_service',
+      eventId: `evt_v10_${Date.now()}`,
+      type: 'stock.published',
+      entityId: 'SKU_STALE_TEST_01',
+      entityVersion: 10,
+      occurredAt: new Date(),
+      status: 'PROCESSED'
+    });
+
+    const staleRes = await fetch(`${baseUrl}/internal/campaign-events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-api-key': eventCredential
+      },
+      body: JSON.stringify({
+        schemaVersion: 1,
+        eventId: `evt_v2_stale_${Date.now()}`,
+        type: 'stock.published',
+        producer: 'inventory_service',
+        entityId: 'SKU_STALE_TEST_01',
+        entityVersion: 2, // Stale!
+        occurredAt: new Date().toISOString(),
+        data: { sku: 'SKU_STALE_TEST_01', stockCount: 5 }
+      })
+    });
+    expect(staleRes.status).toBe(409);
+    const staleBody = await staleRes.json();
+    assertUniformErrorShape(staleBody, 'STALE_ENTITY_VERSION');
+
+    // 422: Unprocessable entity (POST /internal/campaign-events schema validation failure)
+    const unprocRes = await fetch(`${baseUrl}/internal/campaign-events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-api-key': eventCredential
+      },
+      body: JSON.stringify({
+        schemaVersion: 999, // Incompatible
+        eventId: `evt_invalid_schema_${Date.now()}`,
+        occurredAt: 'not-a-valid-date'
+      })
+    });
+    expect(unprocRes.status).toBe(422);
+    const unprocBody = await unprocRes.json();
+    assertUniformErrorShape(unprocBody, 'SCHEMA_VALIDATION_FAILED');
+
+    // 500: Server error (POST /webhooks/orders simulated evaluator exception)
+    const orderEvalSpy = vi.spyOn(await import('../src/modules/campaigns/engine/orderGoalEvaluator'), 'evaluateOrderCompletedGoal').mockRejectedValueOnce(
+      new Error('Simulated order evaluation crash')
+    );
+    const errRes = await fetch(`${baseUrl}/webhooks/orders`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-api-key': orderCredential
+      },
+      body: JSON.stringify({ orderId: 'ord_500_test', customerId: 'cus_500_test' })
+    });
+    expect(errRes.status).toBe(500);
+    const errBody = await errRes.json();
+    assertUniformErrorShape(errBody, 'INTERNAL_ERROR');
+    expect(errBody.error).toContain('Simulated order evaluation crash');
+    orderEvalSpy.mockRestore();
+  });
+
+  it('11. Uniform Error Shape: Auth & Security route family (400, 401, 403, 404, 500)', async () => {
+    // 400: Validation error (POST /auth/login missing password)
+    const valRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'owner_demo' })
+    });
+    expect(valRes.status).toBe(400);
+    const valBody = await valRes.json();
+    assertUniformErrorShape(valBody, 'MISSING_CREDENTIALS');
+    expect(valBody.fieldPath).toBe('password');
+
+    // 401: Unauthorized / Invalid credentials (POST /auth/login unregistered user)
+    const badCredRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'non_existent_user_999', password: 'badpassword' })
+    });
+    expect(badCredRes.status).toBe(401);
+    const badCredBody = await badCredRes.json();
+    assertUniformErrorShape(badCredBody, 'INVALID_CREDENTIALS');
+
+    // 403: Forbidden role (PATCH /campaign-settings with STAFF role requiring BOUTIQUE_OWNER or STORE_MANAGER)
+    const forbidRes = await fetch(`${baseUrl}/campaign-settings`, {
+      method: 'PATCH',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${staffToken}`,
+        'Idempotency-Key': `idemp_staff_forbid_${Date.now()}`
+      },
+      body: JSON.stringify({ storeName: 'Staff Mutation Forbidden' })
+    });
+    expect(forbidRes.status).toBe(403);
+    const forbidBody = await forbidRes.json();
+    assertUniformErrorShape(forbidBody, 'FORBIDDEN_ROLE');
+
+    // 404: Resource not found (GET /auth/unknown-endpoint)
+    const notFoundRes = await fetch(`${baseUrl}/auth/unknown-endpoint`, {
+      headers: { Authorization: `Bearer ${ownerToken}` }
+    });
+    expect(notFoundRes.status).toBe(404);
+    const notFoundBody = await notFoundRes.json();
+    assertUniformErrorShape(notFoundBody, 'NOT_FOUND');
+
+    // 500: Server error (POST /auth/login with simulated database exception)
+    const { UserModel } = await import('../src/modules/auth/models/User.model');
+    const authSpy = vi.spyOn(UserModel, 'findOne').mockImplementationOnce(() => {
+      throw new Error('Simulated auth database failure');
+    });
+    const errRes = await fetch(`${baseUrl}/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username: 'owner_demo', password: 'password123' })
+    });
+    expect(errRes.status).toBe(500);
+    const errBody = await errRes.json();
+    assertUniformErrorShape(errBody, 'INTERNAL_ERROR');
+    expect(errBody.error).toContain('Simulated auth database failure');
+    authSpy.mockRestore();
+  });
+
+  it('12. Uniform Error Shape: Idempotency and Internal Auth middleware (400, 401, 403, 409, 422)', async () => {
+    // 400: Idempotency key required on mutation route
+    const missingKeyRes = await fetch(`${baseUrl}/campaigns`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ownerToken}`
+      },
+      body: JSON.stringify({ presetId: 'festival_greeting' })
+    });
+    expect(missingKeyRes.status).toBe(400);
+    const missingKeyBody = await missingKeyRes.json();
+    assertUniformErrorShape(missingKeyBody, 'IDEMPOTENCY_KEY_REQUIRED');
+
+    // 409: Idempotency conflict (IN_PROGRESS concurrent execution)
+    const inProgressKey = `idemp_in_prog_${Date.now()}`;
+    await IdempotencyRecordModel.create({
+      id: generateId('idemp'),
+      tenantId,
+      key: inProgressKey,
+      method: 'POST',
+      route: '/api/v1/campaigns',
+      status: 'IN_PROGRESS',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    const inProgressRes = await fetch(`${baseUrl}/campaigns`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ownerToken}`,
+        'Idempotency-Key': inProgressKey
+      },
+      body: JSON.stringify({ presetId: 'festival_greeting' })
+    });
+    expect(inProgressRes.status).toBe(409);
+    const inProgressBody = await inProgressRes.json();
+    assertUniformErrorShape(inProgressBody, 'IDEMPOTENCY_IN_PROGRESS');
+
+    // 422: Idempotency payload mismatch (same key, different request body)
+    const mismatchKey = `idemp_mismatch_${Date.now()}`;
+    await IdempotencyRecordModel.create({
+      id: generateId('idemp'),
+      tenantId,
+      key: mismatchKey,
+      method: 'POST',
+      route: '/api/v1/campaigns',
+      requestBodyHash: 'previous_recorded_hash_abc',
+      status: 'IN_PROGRESS',
+      createdAt: new Date(),
+      updatedAt: new Date()
+    });
+
+    const mismatchRes = await fetch(`${baseUrl}/campaigns`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        Authorization: `Bearer ${ownerToken}`,
+        'Idempotency-Key': mismatchKey
+      },
+      body: JSON.stringify({ presetId: 'festival_greeting', name: 'Different Body' })
+    });
+    expect(mismatchRes.status).toBe(422);
+    const mismatchBody = await mismatchRes.json();
+    assertUniformErrorShape(mismatchBody, 'IDEMPOTENCY_BODY_MISMATCH');
+
+    // 401: Internal auth required
+    const missingInternalAuthRes = await fetch(`${baseUrl}/internal/campaign-events`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ schemaVersion: 1, type: 'stock.published' })
+    });
+    expect(missingInternalAuthRes.status).toBe(401);
+    const missingInternalAuthBody = await missingInternalAuthRes.json();
+    assertUniformErrorShape(missingInternalAuthBody, 'INTERNAL_AUTH_REQUIRED');
+
+    // 403: Internal auth event family mismatch
+    const { mintServiceToken } = await import('../src/scripts/mintServiceToken');
+    const wrongFamilyToken = mintServiceToken({
+      producer: 'wrong_producer',
+      tenantId,
+      eventFamily: 'orders' // Expected campaign-events for /internal/campaign-events
+    });
+
+    const wrongFamilyRes = await fetch(`${baseUrl}/internal/campaign-events`, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'x-internal-api-key': wrongFamilyToken
+      },
+      body: JSON.stringify({ schemaVersion: 1, type: 'stock.published' })
+    });
+    expect(wrongFamilyRes.status).toBe(403);
+    const wrongFamilyBody = await wrongFamilyRes.json();
+    assertUniformErrorShape(wrongFamilyBody, 'EVENT_FAMILY_MISMATCH');
   });
 });

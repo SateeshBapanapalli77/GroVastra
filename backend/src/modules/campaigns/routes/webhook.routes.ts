@@ -16,6 +16,7 @@ import { reconcileDeliveryStatus } from '../services/deliveryStatusReconciliatio
 import * as deliveryRecon from '../services/deliveryStatusReconciliation';
 import crypto from 'crypto';
 import { validateEventPayload } from '../../../shared/events/registry';
+import { formatErrorResponse } from '../../../shared/utils/errors';
 
 export const webhookRouter = Router();
 
@@ -91,11 +92,9 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     const secret = env.WHATSAPP_APP_SECRET || process.env.WHATSAPP_APP_SECRET;
     if (!secret) {
       logger.error('WhatsApp webhook secret is not configured; rejecting request (fail-closed)');
-      return res.status(500).json({
-        success: false,
-        error: 'Webhook secret is not configured',
-        code: 'WEBHOOK_SECRET_NOT_CONFIGURED'
-      });
+      return res.status(500).json(
+        formatErrorResponse('Webhook secret is not configured', 'WEBHOOK_SECRET_NOT_CONFIGURED')
+      );
     }
 
     const signatureHeader = req.headers['x-hub-signature-256'] as string;
@@ -103,11 +102,9 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     const isValid = verifyMetaSignature(signatureHeader, rawBody, secret);
     if (!isValid) {
       logger.warn('WhatsApp webhook signature verification failed (forged or unsigned payload)');
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid or missing webhook signature',
-        code: 'INVALID_SIGNATURE'
-      });
+      return res.status(401).json(
+        formatErrorResponse('Invalid or missing webhook signature', 'INVALID_SIGNATURE')
+      );
     }
 
     const body = req.body;
@@ -377,11 +374,9 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
       const resolvedTenantId = (req as any).tenantId || connectionTenantId;
       if (!resolvedTenantId) {
         logger.warn({ providerMessageId }, 'Flat status webhook rejected: missing or unresolvable tenant context (fail-closed)');
-        return res.status(401).json({
-          success: false,
-          error: 'Unauthorized: missing or unmapped connection tenant context',
-          code: 'UNAUTHORIZED_CONNECTION'
-        });
+        return res.status(401).json(
+          formatErrorResponse('Unauthorized: missing or unmapped connection tenant context', 'UNAUTHORIZED_CONNECTION')
+        );
       }
 
       // Strictly tenant-scoped delivery intent lookup (no cross-tenant intent matching)
@@ -392,11 +387,9 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
 
       if (!intent) {
         logger.warn({ providerMessageId, tenantId: resolvedTenantId }, 'Flat status webhook dropped: no delivery intent matching providerMessageId for connection tenant (fail-closed)');
-        return res.status(404).json({
-          success: false,
-          error: 'No delivery intent found for providerMessageId and connection tenant',
-          code: 'DELIVERY_INTENT_NOT_FOUND'
-        });
+        return res.status(404).json(
+          formatErrorResponse('No delivery intent found for providerMessageId and connection tenant', 'DELIVERY_INTENT_NOT_FOUND')
+        );
       }
 
       // Route through durable inbox lifecycle & unified transactional reconciliation
@@ -471,24 +464,18 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
       try {
         normalizedPhone = normalizeE164(customerPhone);
       } catch {
-        return res.status(400).json({
-          success: false,
-          error: 'Invalid customer phone number',
-          code: 'INVALID_PHONE_NUMBER',
-          fieldPath: 'customerPhone'
-        });
+        return res.status(400).json(
+          formatErrorResponse('Invalid customer phone number', 'INVALID_PHONE_NUMBER', 'customerPhone')
+        );
       }
 
       const connectionId = body.connectionId;
       const tenantId = (req as any).tenantId || (connectionId ? await resolveTenantForConnection(connectionId) : null);
       if (!tenantId) {
         logger.warn('Flat customer reply rejected: missing or unmapped tenant context');
-        return res.status(400).json({
-          success: false,
-          error: 'Tenant context could not be resolved from connection',
-          code: 'TENANT_RESOLUTION_FAILED',
-          fieldPath: 'connectionId'
-        });
+        return res.status(400).json(
+          formatErrorResponse('Tenant context could not be resolved from connection', 'TENANT_RESOLUTION_FAILED', 'connectionId')
+        );
       }
 
       const customer = await CustomerModel.findOne({
@@ -526,11 +513,9 @@ webhookRouter.post('/webhooks/whatsapp', async (req: Request, res: Response) => 
     return res.status(200).json({ success: true, received: true });
   } catch (err: any) {
     logger.error({ err }, 'Error handling WhatsApp webhook');
-    return res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    return res.status(500).json(
+      formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR')
+    );
   }
 });
 
@@ -571,12 +556,9 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
         status: 'QUARANTINE',
         errorMessage: validation.error
       });
-      return res.status(422).json({
-        success: false,
-        status: 'QUARANTINE',
-        error: validation.error,
-        code: 'SCHEMA_VALIDATION_FAILED'
-      });
+      return res.status(422).json(
+        formatErrorResponse(validation.error, 'SCHEMA_VALIDATION_FAILED', undefined, 'QUARANTINE')
+      );
     }
 
     // 2. Reject Stale Entity Versions (Spec p.24: "An older event cannot restore a state superseded by a newer entity version")
@@ -603,12 +585,14 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
         status: 'QUARANTINE',
         errorMessage: `STALE_ENTITY_VERSION: Incoming version ${parsedEntityVersion} is older than processed version ${latestEvent.entityVersion}`
       });
-      return res.status(409).json({
-        success: false,
-        status: 'QUARANTINE',
-        error: `Stale entity version ${parsedEntityVersion} superseded by ${latestEvent.entityVersion}`,
-        code: 'STALE_ENTITY_VERSION'
-      });
+      return res.status(409).json(
+        formatErrorResponse(
+          `Stale entity version ${parsedEntityVersion} superseded by ${latestEvent.entityVersion}`,
+          'STALE_ENTITY_VERSION',
+          undefined,
+          'QUARANTINE'
+        )
+      );
     }
 
     // 3. Durable & Atomic Ingestion (Persist as RECEIVED before ACK)
@@ -672,11 +656,9 @@ webhookRouter.post('/internal/campaign-events', requireInternalAuth('campaign-ev
     }
   } catch (err: any) {
     logger.error({ err }, 'Error ingesting internal campaign event');
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    res.status(500).json(
+      formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR')
+    );
   }
 });
 
@@ -696,12 +678,9 @@ webhookRouter.post('/webhooks/orders', requireInternalAuth('orders'), async (req
 
     if (!orderId || !customerId) {
       const fieldPath = !orderId ? 'orderId' : 'customerId';
-      return res.status(400).json({
-        success: false,
-        error: 'orderId and customerId are required',
-        code: 'MISSING_REQUIRED_FIELDS',
-        fieldPath
-      });
+      return res.status(400).json(
+        formatErrorResponse('orderId and customerId are required', 'MISSING_REQUIRED_FIELDS', fieldPath)
+      );
     }
 
     // 1. Evaluate goal attribution strictly per spec p.11, p.16
@@ -739,11 +718,9 @@ webhookRouter.post('/webhooks/orders', requireInternalAuth('orders'), async (req
     });
   } catch (err: any) {
     logger.error({ err }, 'Error processing orders webhook');
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    res.status(500).json(
+      formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR')
+    );
   }
 });
 

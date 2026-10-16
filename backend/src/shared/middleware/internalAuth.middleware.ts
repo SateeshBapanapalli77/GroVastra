@@ -1,6 +1,7 @@
 import { Request, Response, NextFunction } from 'express';
 import { verifyJwt, signJwt, AuthPayload } from './auth.middleware';
 import { logger } from '../../config/logger';
+import { formatErrorResponse } from '../utils/errors';
 
 export interface InternalServicePayload {
   tenantId: string;
@@ -37,11 +38,9 @@ export function requireInternalAuth(requiredEventFamily?: string) {
 
     if (!token) {
       logger.warn({ ip: req.ip, path: req.path }, 'Rejected request: Missing internal service credential');
-      return res.status(401).json({
-        success: false,
-        error: 'Unauthorized: Internal service credential is required',
-        code: 'INTERNAL_AUTH_REQUIRED'
-      });
+      return res.status(401).json(
+        formatErrorResponse('Unauthorized: Internal service credential is required', 'INTERNAL_AUTH_REQUIRED')
+      );
     }
 
     // 2. Verify cryptographically
@@ -50,30 +49,24 @@ export function requireInternalAuth(requiredEventFamily?: string) {
       payload = verifyJwt(token) as any;
     } catch (err: any) {
       logger.warn({ err: err.message, path: req.path }, 'Failed internal service credential verification');
-      return res.status(401).json({
-        success: false,
-        error: `Unauthorized internal service call: ${err.message}`,
-        code: 'INVALID_CREDENTIAL'
-      });
+      return res.status(401).json(
+        formatErrorResponse(`Unauthorized internal service call: ${err.message}`, 'INVALID_CREDENTIAL')
+      );
     }
 
     // 3. Validate role and mandatory event family (Finding 7)
     if (payload.role !== 'SYSTEM') {
       logger.warn({ role: payload.role, userId: payload.userId }, 'Internal service credential lacks SYSTEM permissions');
-      return res.status(403).json({
-        success: false,
-        error: 'Forbidden: Credential does not have system service access',
-        code: 'FORBIDDEN_ROLE'
-      });
+      return res.status(403).json(
+        formatErrorResponse('Forbidden: Credential does not have system service access', 'FORBIDDEN_ROLE')
+      );
     }
 
     if (!payload.eventFamily) {
       logger.warn({ userId: payload.userId }, 'Internal service credential missing mandatory eventFamily claim');
-      return res.status(403).json({
-        success: false,
-        error: 'Forbidden: Internal service credential must be scoped with a mandatory eventFamily claim',
-        code: 'MISSING_EVENT_FAMILY'
-      });
+      return res.status(403).json(
+        formatErrorResponse('Forbidden: Internal service credential must be scoped with a mandatory eventFamily claim', 'MISSING_EVENT_FAMILY')
+      );
     }
 
     if (requiredEventFamily && payload.eventFamily !== '*' && payload.eventFamily !== requiredEventFamily) {
@@ -81,11 +74,12 @@ export function requireInternalAuth(requiredEventFamily?: string) {
         { credentialFamily: payload.eventFamily, requiredFamily: requiredEventFamily },
         'Internal service credential event family mismatch'
       );
-      return res.status(403).json({
-        success: false,
-        error: `Forbidden: Credential is scoped for event family '${payload.eventFamily}', but '${requiredEventFamily}' is required`,
-        code: 'EVENT_FAMILY_MISMATCH'
-      });
+      return res.status(403).json(
+        formatErrorResponse(
+          `Forbidden: Credential is scoped for event family '${payload.eventFamily}', but '${requiredEventFamily}' is required`,
+          'EVENT_FAMILY_MISMATCH'
+        )
+      );
     }
 
     // 4. Multi-Tenant Enforcement: Block conflicting header or body tenant
@@ -94,20 +88,16 @@ export function requireInternalAuth(requiredEventFamily?: string) {
 
     if (bodyTenant && bodyTenant !== payload.tenantId) {
       logger.warn({ bodyTenant, credentialTenant: payload.tenantId }, 'Cross-tenant payload rejection');
-      return res.status(403).json({
-        success: false,
-        error: 'Forbidden: Request body tenantId does not match authenticated credential tenant',
-        code: 'CROSS_TENANT_PAYLOAD'
-      });
+      return res.status(403).json(
+        formatErrorResponse('Forbidden: Request body tenantId does not match authenticated credential tenant', 'CROSS_TENANT_PAYLOAD')
+      );
     }
 
     if (headerTenant && headerTenant !== payload.tenantId) {
       logger.warn({ headerTenant, credentialTenant: payload.tenantId }, 'Cross-tenant header rejection');
-      return res.status(403).json({
-        success: false,
-        error: 'Forbidden: x-tenant-id header does not match authenticated credential tenant',
-        code: 'CROSS_TENANT_HEADER'
-      });
+      return res.status(403).json(
+        formatErrorResponse('Forbidden: x-tenant-id header does not match authenticated credential tenant', 'CROSS_TENANT_HEADER')
+      );
     }
 
     // Bind strictly verified tenant

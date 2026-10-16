@@ -2,6 +2,7 @@ import { Router, Request, Response } from 'express';
 import { UserModel, dummyHash, needsRehash, hashPassword } from '../models/User.model';
 import { signJwt, requireAuth } from '../../../shared/middleware/auth.middleware';
 import { logger } from '../../../config/logger';
+import { formatErrorResponse } from '../../../shared/utils/errors';
 
 export const authRouter = Router();
 
@@ -31,23 +32,25 @@ authRouter.post('/auth/login', async (req: Request, res: Response) => {
   try {
     const clientIp = req.ip || req.socket.remoteAddress || 'unknown';
     if (!checkLoginRateLimit(clientIp)) {
-      return res.status(429).json({
-        success: false,
-        error: 'Too many login attempts. Please wait 1 minute before retrying.',
-        code: 'RATE_LIMIT_EXCEEDED'
-      });
+      return res.status(429).json(
+        formatErrorResponse(
+          'Too many login attempts. Please wait 1 minute before retrying.',
+          'RATE_LIMIT_EXCEEDED'
+        )
+      );
     }
 
     const { username, password } = req.body;
 
     if (!username || !password || typeof username !== 'string' || typeof password !== 'string') {
       const fieldPath = !username ? 'username' : 'password';
-      return res.status(400).json({
-        success: false,
-        error: 'Username and password are required',
-        code: 'MISSING_CREDENTIALS',
-        fieldPath
-      });
+      return res.status(400).json(
+        formatErrorResponse(
+          'Username and password are required',
+          'MISSING_CREDENTIALS',
+          fieldPath
+        )
+      );
     }
 
     const user = await UserModel.findOne({ username: username.toLowerCase().trim() });
@@ -55,21 +58,23 @@ authRouter.post('/auth/login', async (req: Request, res: Response) => {
       // Timing parity: run dummy scrypt hash computation so response timing matches valid user check
       await dummyHash(password);
       logger.warn({ username: username.toLowerCase().trim() }, 'Failed login attempt: User not found');
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid username or password',
-        code: 'INVALID_CREDENTIALS'
-      });
+      return res.status(401).json(
+        formatErrorResponse(
+          'Invalid username or password',
+          'INVALID_CREDENTIALS'
+        )
+      );
     }
 
     const isMatch = await user.verifyPassword(password);
     if (!isMatch) {
       logger.warn({ username: user.username }, 'Failed login attempt: Invalid password');
-      return res.status(401).json({
-        success: false,
-        error: 'Invalid username or password',
-        code: 'INVALID_CREDENTIALS'
-      });
+      return res.status(401).json(
+        formatErrorResponse(
+          'Invalid username or password',
+          'INVALID_CREDENTIALS'
+        )
+      );
     }
 
     // Upgrade old/legacy password hashes to modern scrypt$salt$hash on successful authentication
@@ -101,11 +106,9 @@ authRouter.post('/auth/login', async (req: Request, res: Response) => {
     });
   } catch (err: any) {
     logger.error({ err }, 'Error during user login');
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    res.status(500).json(
+      formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR')
+    );
   }
 });
 
@@ -143,10 +146,8 @@ authRouter.get('/auth/me', requireAuth, async (req: Request, res: Response) => {
       }
     });
   } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    res.status(500).json(
+      formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR')
+    );
   }
 });

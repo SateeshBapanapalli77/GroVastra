@@ -1,5 +1,6 @@
 import fs from 'fs';
 import path from 'path';
+import { execSync } from 'child_process';
 import { EVENT_REGISTRY, isKnownEventType } from '../src/shared/events/registry';
 import {
   BOUTIQUE_CAMPAIGN_PRESETS,
@@ -8,6 +9,97 @@ import {
   isAnnualPlannerImplemented
 } from '../src/modules/campaigns/presets/boutiquePresets';
 import { CAMPAIGN_REASON_CODES } from '../src/shared/reasonCodes';
+
+export interface TestRunTotals {
+  testSuitesPassed: number;
+  testSuitesTotal: number;
+  testsPassed: number;
+  testsTotal: number;
+  testsFailed: number;
+  testsSkipped: number;
+}
+
+export function parseVitestOutput(rawOutput: string): TestRunTotals | null {
+  const clean = rawOutput
+    .replace(/\x1b\[[0-9;]*[a-zA-Z]/g, '')
+    .replace(/[\u001b\u009b][[()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g, '');
+
+  const suitesMatches = [...clean.matchAll(/Test Files\s+(?:(\d+)\s+failed\s*\|\s*)?(\d+)\s+passed\s*\((\d+)\)/g)];
+  const testsMatches = [...clean.matchAll(/Tests\s+(?:(\d+)\s+failed\s*\|\s*)?(?:(\d+)\s+skipped\s*\|\s*)?(\d+)\s+passed\s*\((\d+)\)/g)];
+
+  if (suitesMatches.length === 0 || testsMatches.length === 0) {
+    return null;
+  }
+
+  const lastSuites = suitesMatches[suitesMatches.length - 1];
+  const lastTests = testsMatches[testsMatches.length - 1];
+
+  const testSuitesPassed = parseInt(lastSuites[2], 10);
+  const testSuitesTotal = parseInt(lastSuites[3], 10);
+
+  const testsFailed = lastTests[1] ? parseInt(lastTests[1], 10) : 0;
+  const testsSkipped = lastTests[2] ? parseInt(lastTests[2], 10) : 0;
+  const testsPassed = parseInt(lastTests[3], 10);
+  const testsTotal = parseInt(lastTests[4], 10);
+
+  return {
+    testSuitesPassed,
+    testSuitesTotal,
+    testsPassed,
+    testsTotal,
+    testsFailed,
+    testsSkipped
+  };
+}
+
+export function readLatestTestTotals(rootDir: string): TestRunTotals {
+  const possibleLogPaths = [
+    path.join(rootDir, 'docs', 'test-logs', 'final.txt'),
+    path.join(rootDir, 'docs', 'test-logs', 'latest.txt'),
+    path.join(rootDir, 'backend', 'vitest.log')
+  ];
+
+  for (const logPath of possibleLogPaths) {
+    if (fs.existsSync(logPath)) {
+      try {
+        const content = fs.readFileSync(logPath, 'utf8');
+        const parsed = parseVitestOutput(content);
+        if (parsed) {
+          return parsed;
+        }
+      } catch (err) {
+        // Fall through to next option
+      }
+    }
+  }
+
+  // If no log file had valid test counts, run vitest to discover real live counts
+  console.log('No cached test logs found; running vitest to discover real test totals...');
+  try {
+    const rawOutput = execSync('npx vitest run', {
+      cwd: path.join(rootDir, 'backend'),
+      encoding: 'utf8',
+      stdio: ['ignore', 'pipe', 'pipe'],
+      env: { ...process.env, NODE_ENV: 'test' }
+    });
+    const parsed = parseVitestOutput(rawOutput);
+    if (parsed) {
+      const finalLogPath = path.join(rootDir, 'docs', 'test-logs', 'final.txt');
+      fs.mkdirSync(path.dirname(finalLogPath), { recursive: true });
+      fs.writeFileSync(finalLogPath, rawOutput, 'utf8');
+      return parsed;
+    }
+  } catch (execErr: any) {
+    const combinedOutput = `${execErr?.stdout || ''}\n${execErr?.stderr || ''}`;
+    const parsed = parseVitestOutput(combinedOutput);
+    if (parsed) {
+      return parsed;
+    }
+    throw new Error(`Failed to parse test totals from vitest execution: ${execErr?.message}`);
+  }
+
+  throw new Error('Could not read or parse test totals from test logs or vitest run.');
+}
 
 /**
  * Regenerates STATUS.md directly from authoritative codebase registries:
@@ -107,7 +199,6 @@ ${presetRegistryMarkdown}
   }
 
   // 6. Ensure Step 13 Resolution Section exists
-  const step13SectionRegex = /## 23\. Step 13 Resolution — Final Verification & E2E Vertical Slice[\s\S]*?(?=\n---\n\n## 24\.|$)/;
   const step13Section = `## 23. Step 13 Resolution — Final Verification & E2E Vertical Slice (16 October 2026)
 
 Complete vertical slice end-to-end verification implemented in [\`backend/tests/e2eVerticalSlice.test.ts\`](backend/tests/e2eVerticalSlice.test.ts) asserting database state and WhatsApp delivery adapter call counts at every stage:
@@ -127,28 +218,37 @@ Complete vertical slice end-to-end verification implemented in [\`backend/tests/
 - Re-run benchmark in [\`backend/tests/loadLatency.test.ts\`](backend/tests/loadLatency.test.ts) across 100 due steps without races or duplicate provider dispatches: 100/100 dispatches accepted, 100 unique delivery intents created, zero duplicate sends.`;
 
   // 7. Update Baseline section
+  const testTotals = readLatestTestTotals(rootDir);
+
   const baselineSection = `## 24. Current Test Suite & Build Verification Baseline
 
-- **Backend Test Suites:** 20 passed (20/20)
-- **Individual Tests:** 262 passed (262/262, 0 failures, 0 skips)
+- **Backend Test Suites:** ${testTotals.testSuitesPassed} passed (${testTotals.testSuitesPassed}/${testTotals.testSuitesTotal})
+- **Individual Tests:** ${testTotals.testsPassed} passed (${testTotals.testsPassed}/${testTotals.testsTotal}${testTotals.testsFailed > 0 ? `, ${testTotals.testsFailed} failed` : ''}${testTotals.testsSkipped > 0 ? `, ${testTotals.testsSkipped} skipped` : ', 0 failures, 0 skips'})
 - **Backend Typecheck:** \`tsc --noEmit\` clean (0 errors)
 - **Frontend Typecheck:** \`tsc --noEmit\` clean (0 errors)
 - **CI Script:** \`npm run test:ci\` (\`tsc --noEmit && vitest run\`)
-- **CI Automation:** GitHub Actions workflow at \`.github/workflows/ci.yml\`
+- **CI Automation:** GitHub Actions workflow at \`.github/workflows/ci.yml\` (backend and frontend jobs)
 - **Frontend Production Build:** Next.js 16.4.0 Turbopack \`next build\` clean (0 errors)
-- **Authoritative Status Sync:** Programmatically generated by \`scripts/generateStatus.ts\` from codebase registries.
+- **Authoritative Status Sync:** Programmatically generated by \`scripts/generateStatus.ts\` from codebase registries and test logs.
 `;
 
-  // Replace or append Step 13 & Baseline
+  // Replace or insert Step 13 section
+  const step13SectionRegex = /## 23\. Step 13 Resolution — Final Verification & E2E Vertical Slice[\s\S]*?(?=\r?\n---\r?\n\r?\n## 24\.|\r?\n---\r?\n## 24\.|$)/;
   if (step13SectionRegex.test(updatedContent)) {
     updatedContent = updatedContent.replace(step13SectionRegex, step13Section);
+  }
+
+  // Replace or append Baseline section (Section 24)
+  const baselineRegex = /## 24\. Current Test Suite & Build Verification Baseline[\s\S]*$/;
+  if (baselineRegex.test(updatedContent)) {
+    updatedContent = updatedContent.replace(baselineRegex, baselineSection.trim() + '\n');
   } else {
-    // Find Section 22 or baseline and replace
-    const baselineRegex = /## 22\. Current Test Suite & Build Verification Baseline[\s\S]*$/;
-    if (baselineRegex.test(updatedContent)) {
-      updatedContent = updatedContent.replace(baselineRegex, `${step13Section}\n\n---\n\n${baselineSection}`);
+    // If older section 22 exists, replace it, else append
+    const oldBaselineRegex = /## 22\. Current Test Suite & Build Verification Baseline[\s\S]*$/;
+    if (oldBaselineRegex.test(updatedContent)) {
+      updatedContent = updatedContent.replace(oldBaselineRegex, `${step13Section}\n\n---\n\n${baselineSection.trim()}\n`);
     } else {
-      updatedContent += `\n\n---\n\n${step13Section}\n\n---\n\n${baselineSection}`;
+      updatedContent = updatedContent.trim() + `\n\n---\n\n${baselineSection.trim()}\n`;
     }
   }
 

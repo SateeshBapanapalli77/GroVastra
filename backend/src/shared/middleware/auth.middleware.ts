@@ -2,6 +2,7 @@ import { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { env } from '../../config/env';
 import { logger } from '../../config/logger';
+import { formatErrorResponse } from '../utils/errors';
 
 export type UserRole = 'BOUTIQUE_OWNER' | 'STORE_MANAGER' | 'STAFF' | 'SYSTEM';
 
@@ -99,11 +100,12 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
   if (!token) {
     const devBypass = env.NODE_ENV === 'development' && env.ALLOW_INSECURE_DEV_AUTH === 'true';
     if (!devBypass) {
-      return res.status(401).json({
-        success: false,
-        error: 'Authentication required. Missing Bearer token in Authorization header.',
-        code: 'UNAUTHORIZED'
-      });
+      return res.status(401).json(
+        formatErrorResponse(
+          'Authentication required. Missing Bearer token in Authorization header.',
+          'UNAUTHORIZED'
+        )
+      );
     }
     logger.warn('INSECURE DEV AUTH BYPASS in use. Never enable this outside a local machine.');
     token = signJwt({
@@ -123,11 +125,12 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
         { requestedTenant, credentialTenant: payload.tenantId, userId: payload.userId },
         'Cross-tenant access attempt blocked'
       );
-      return res.status(403).json({
-        success: false,
-        error: 'Forbidden: Cannot access resources outside your authenticated tenant scope.',
-        code: 'CROSS_TENANT_FORBIDDEN'
-      });
+      return res.status(403).json(
+        formatErrorResponse(
+          'Forbidden: Cannot access resources outside your authenticated tenant scope.',
+          'CROSS_TENANT_FORBIDDEN'
+        )
+      );
     }
 
     req.user = payload;
@@ -135,11 +138,9 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
     next();
   } catch (err: any) {
     logger.warn({ err: err.message }, 'Failed JWT authentication check');
-    return res.status(401).json({
-      success: false,
-      error: `Unauthorized: ${err.message}`,
-      code: 'INVALID_TOKEN'
-    });
+    return res.status(401).json(
+      formatErrorResponse(`Unauthorized: ${err.message}`, 'UNAUTHORIZED')
+    );
   }
 }
 
@@ -149,15 +150,18 @@ export function requireAuth(req: Request, res: Response, next: NextFunction) {
 export function requireRole(allowedRoles: UserRole[]) {
   return (req: Request, res: Response, next: NextFunction) => {
     if (!req.user) {
-      return res.status(401).json({ success: false, error: 'Authentication required', code: 'UNAUTHORIZED' });
+      return res.status(401).json(
+        formatErrorResponse('Authentication required', 'UNAUTHORIZED')
+      );
     }
 
     if (!allowedRoles.includes(req.user.role) && req.user.role !== 'SYSTEM') {
-      return res.status(403).json({
-        success: false,
-        error: `Forbidden: Role '${req.user.role}' lacks permission for this action.`,
-        code: 'FORBIDDEN_ROLE'
-      });
+      return res.status(403).json(
+        formatErrorResponse(
+          `Forbidden: Role '${req.user.role}' lacks permission for this action.`,
+          'FORBIDDEN_ROLE'
+        )
+      );
     }
 
     next();

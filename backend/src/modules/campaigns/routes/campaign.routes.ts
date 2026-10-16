@@ -34,6 +34,7 @@ import {
 } from '../engine/ownerReporting';
 import { resolveShopDisplayName } from '../services/shopResolver';
 import { CAMPAIGN_REASON_CODES } from '../../../shared/reasonCodes';
+import { formatErrorResponse } from '../../../shared/utils/errors';
 
 export const campaignRouter = Router();
 
@@ -138,11 +139,7 @@ campaignRouter.get('/integration-readiness', async (req: Request, res: Response)
       missingConfiguration
     });
   } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -193,11 +190,7 @@ campaignRouter.get('/campaign-settings', async (req: Request, res: Response) => 
       }
     });
   } catch (err: any) {
-    res.status(500).json({
-      success: false,
-      error: err.message || 'Internal server error',
-      code: 'INTERNAL_ERROR'
-    });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -227,12 +220,9 @@ campaignRouter.patch(
 
       // Mandatory optimistic concurrency control (Review 2, Spec C16)
       if (typeof expectedVersion !== 'number') {
-        return res.status(400).json({
-          success: false,
-          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.',
-          code: 'EXPECTED_VERSION_REQUIRED',
-          fieldPath: 'expectedVersion'
-        });
+        return res.status(400).json(
+          formatErrorResponse('EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion')
+        );
       }
 
       // Atomic conditional update on settings and control gate (Review 2 A)
@@ -362,23 +352,16 @@ campaignRouter.patch(
         });
       } catch (txErr: any) {
         if (txErr.message === 'VERSION_CONFLICT') {
-          return res.status(409).json({
-            success: false,
-            error: `Settings version conflict: expected version ${expectedVersion} does not match current version.`,
-            code: 'VERSION_CONFLICT',
-            fieldPath: 'expectedVersion'
-          });
+          return res.status(409).json(
+            formatErrorResponse(`Settings version conflict: expected version ${expectedVersion} does not match current version.`, 'VERSION_CONFLICT', 'expectedVersion')
+          );
         }
         throw txErr;
       } finally {
         await session.endSession();
       }
     } catch (err: any) {
-      res.status(500).json({
-        success: false,
-        error: err.message || 'Internal server error',
-        code: 'INTERNAL_ERROR'
-      });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -412,7 +395,7 @@ campaignRouter.get('/campaigns', async (req: Request, res: Response) => {
 
     res.json({ success: true, campaigns: populated });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -432,11 +415,11 @@ campaignRouter.post(
       if (presetId) {
         const preset = getCampaignPreset(presetId);
         if (!preset || !preset.implemented) {
-          return res.status(422).json({
-            success: false,
-            error: 'PRESET_NOT_IMPLEMENTED',
-            message: `Preset '${presetId}' cannot be used because it is not implemented.`
-          });
+          return res.status(422).json(
+            formatErrorResponse('PRESET_NOT_IMPLEMENTED', 'PRESET_NOT_IMPLEMENTED', 'presetId', {
+              message: `Preset '${presetId}' cannot be used because it is not implemented.`
+            })
+          );
         }
       }
 
@@ -499,7 +482,7 @@ campaignRouter.post(
         draftVersion
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -512,7 +495,7 @@ campaignRouter.get('/campaigns/:id', async (req: Request, res: Response) => {
     const tenantId = (req as any).tenantId;
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId }).lean();
     if (!campaign) {
-      return res.status(404).json({ success: false, error: 'Campaign not found' });
+      return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
     }
 
     const versions = await CampaignVersionModel.find({ campaignId: campaign.id, tenantId })
@@ -529,7 +512,7 @@ campaignRouter.get('/campaigns/:id', async (req: Request, res: Response) => {
       latestDraft
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -549,10 +532,9 @@ campaignRouter.patch(
 
       // Mandatory optimistic concurrency control (Review 2, Spec C16)
       if (typeof expectedVersion !== 'number') {
-        return res.status(400).json({
-          success: false,
-          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion')
+        );
       }
 
       const session = await mongoose.startSession();
@@ -666,20 +648,19 @@ campaignRouter.patch(
 
         res.json({ success: true, campaign: finalCampaign, draftVersion: finalDraft });
       } catch (txErr: any) {
-        if (txErr.message === 'NOT_FOUND') return res.status(404).json({ success: false, error: 'Campaign not found' });
-        if (txErr.message === 'DRAFT_NOT_FOUND') return res.status(404).json({ success: false, error: 'Draft version not found' });
+        if (txErr.message === 'NOT_FOUND') return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
+        if (txErr.message === 'DRAFT_NOT_FOUND') return res.status(404).json(formatErrorResponse('Draft version not found', 'DRAFT_NOT_FOUND'));
         if (txErr.message === 'VERSION_CONFLICT') {
-          return res.status(409).json({
-            success: false,
-            error: `Draft version conflict: expected version ${expectedVersion} does not match current draft version.`
-          });
+          return res.status(409).json(
+            formatErrorResponse(`Draft version conflict: expected version ${expectedVersion} does not match current draft version.`, 'VERSION_CONFLICT', 'expectedVersion')
+          );
         }
         throw txErr;
       } finally {
         await session.endSession();
       }
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -696,7 +677,7 @@ campaignRouter.post(
       const tenantId = (req as any).tenantId;
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
       if (!campaign) {
-        return res.status(404).json({ success: false, error: 'Campaign not found' });
+        return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
       }
 
       const draft = await CampaignVersionModel.findOne({
@@ -706,7 +687,7 @@ campaignRouter.post(
       });
 
       if (!draft) {
-        return res.status(404).json({ success: false, error: 'Draft version not found' });
+        return res.status(404).json(formatErrorResponse('Draft version not found', 'DRAFT_NOT_FOUND'));
       }
 
       const result = await evaluateCampaignDryRun(draft);
@@ -715,7 +696,7 @@ campaignRouter.post(
 
       res.json({ success: true, dryRun: result });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -735,22 +716,20 @@ campaignRouter.post(
 
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
       if (!campaign) {
-        return res.status(404).json({ success: false, error: 'Campaign not found' });
+        return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
       }
 
       // Mandatory optimistic concurrency control (Review 2, Spec C16)
       if (typeof expectedVersion !== 'number') {
-        return res.status(400).json({
-          success: false,
-          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion')
+        );
       }
 
       if (campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json({
-          success: false,
-          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-        });
+        return res.status(409).json(
+          formatErrorResponse(`Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`, 'VERSION_CONFLICT', 'expectedVersion')
+        );
       }
 
       const draft = await CampaignVersionModel.findOne({
@@ -760,7 +739,7 @@ campaignRouter.post(
       });
 
       if (!draft) {
-        return res.status(404).json({ success: false, error: 'Draft version not found' });
+        return res.status(404).json(formatErrorResponse('Draft version not found', 'DRAFT_NOT_FOUND'));
       }
 
       // Preset capability and activation guard (Step 10)
@@ -768,11 +747,11 @@ campaignRouter.post(
       if (campaignPresetId) {
         const preset = getCampaignPreset(campaignPresetId);
         if (!preset || !preset.implemented) {
-          return res.status(422).json({
-            success: false,
-            error: 'PRESET_NOT_IMPLEMENTED',
-            message: `Activation blocked: Preset '${campaignPresetId}' is not implemented.`
-          });
+          return res.status(422).json(
+            formatErrorResponse('PRESET_NOT_IMPLEMENTED', 'PRESET_NOT_IMPLEMENTED', 'presetId', {
+              message: `Activation blocked: Preset '${campaignPresetId}' is not implemented.`
+            })
+          );
         }
       }
 
@@ -780,45 +759,43 @@ campaignRouter.post(
         if (draft.trigger.type === 'EVENT_DRIVEN') {
           const eventType = draft.trigger.eventType;
           if (!eventType || !isKnownEventType(eventType)) {
-            return res.status(422).json({
-              success: false,
-              error: 'PRESET_NOT_IMPLEMENTED',
-              message: `Activation blocked: Trigger event type '${eventType}' has no registered evaluator.`
-            });
+            return res.status(422).json(
+              formatErrorResponse('PRESET_NOT_IMPLEMENTED', 'PRESET_NOT_IMPLEMENTED', 'trigger.eventType', {
+                message: `Activation blocked: Trigger event type '${eventType}' has no registered evaluator.`
+              })
+            );
           }
         } else if (draft.trigger.type === 'INACTIVITY_SCAN') {
           if (!isScannerImplemented()) {
-            return res.status(422).json({
-              success: false,
-              error: 'PRESET_NOT_IMPLEMENTED',
-              message: 'Activation blocked: Inactivity scanner worker is not implemented.'
-            });
+            return res.status(422).json(
+              formatErrorResponse('PRESET_NOT_IMPLEMENTED', 'PRESET_NOT_IMPLEMENTED', 'trigger.type', {
+                message: 'Activation blocked: Inactivity scanner worker is not implemented.'
+              })
+            );
           }
         } else if (draft.trigger.type === 'ANNUAL_DATE') {
           if (!isAnnualPlannerImplemented(draft.trigger.field)) {
-            return res.status(422).json({
-              success: false,
-              error: 'PRESET_NOT_IMPLEMENTED',
-              message: `Activation blocked: Annual date field '${draft.trigger.field}' is not implemented.`
-            });
+            return res.status(422).json(
+              formatErrorResponse('PRESET_NOT_IMPLEMENTED', 'PRESET_NOT_IMPLEMENTED', 'trigger.field', {
+                message: `Activation blocked: Annual date field '${draft.trigger.field}' is not implemented.`
+              })
+            );
           }
         }
       }
 
       // Mandatory review fingerprint check (Spec p.21, A03)
       if (!reviewFingerprint) {
-        return res.status(400).json({
-          success: false,
-          error: 'Mandatory reviewFingerprint is required to activate a campaign. Run dry run first.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('Mandatory reviewFingerprint is required to activate a campaign. Run dry run first.', 'REVIEW_FINGERPRINT_REQUIRED', 'reviewFingerprint')
+        );
       }
 
       // Verify fingerprint matches draft review (A03: Draft changed after dry run -> reject old review fingerprint)
       if (draft.reviewFingerprint !== reviewFingerprint) {
-        return res.status(400).json({
-          success: false,
-          error: 'Review fingerprint mismatch. The draft was modified after the dry run.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('Review fingerprint mismatch. The draft was modified after the dry run.', 'REVIEW_FINGERPRINT_MISMATCH', 'reviewFingerprint')
+        );
       }
 
       // Verify that a real persisted dry run audit exists (C01)
@@ -829,10 +806,9 @@ campaignRouter.post(
       });
 
       if (!dryRunReport) {
-        return res.status(400).json({
-          success: false,
-          error: 'No dry run execution record found for this review fingerprint.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('No dry run execution record found for this review fingerprint.', 'DRY_RUN_RECORD_NOT_FOUND', 'reviewFingerprint')
+        );
       }
 
       // Activation Readiness Checks (Spec A05, Finding 5): Exact approved template ID, revision, and locale
@@ -847,39 +823,47 @@ campaignRouter.post(
           );
         } catch (tmplErr: any) {
           logger.error({ tmplErr: tmplErr?.message, stepId: step.stepId }, 'Template resolution failed closed due to database error');
-          return res.status(503).json({
-            success: false,
-            error: `Activation failed: Template catalogue is currently unavailable for step '${step.stepId}'.`,
-            fieldPath: `steps.${step.stepId}.templateRef.id`,
-            resolutionOwner: 'INTEGRATION_DEVELOPER'
-          });
+          return res.status(503).json(
+            formatErrorResponse(
+              `Activation failed: Template catalogue is currently unavailable for step '${step.stepId}'.`,
+              'TEMPLATE_CATALOGUE_UNAVAILABLE',
+              `steps.${step.stepId}.templateRef.id`,
+              { resolutionOwner: 'INTEGRATION_DEVELOPER' }
+            )
+          );
         }
         if (!template || template.status === 'PAUSED') {
-          return res.status(422).json({
-            success: false,
-            error: `Activation blocked: Step '${step.stepId}' references unusable template '${step.templateRef?.id}' (revision: ${step.templateRef?.revision}, locale: ${step.templateRef?.language}).`,
-            fieldPath: `steps.${step.stepId}.templateRef.id`,
-            resolutionOwner: 'INTEGRATION_DEVELOPER'
-          });
+          return res.status(422).json(
+            formatErrorResponse(
+              `Activation blocked: Step '${step.stepId}' references unusable template '${step.templateRef?.id}' (revision: ${step.templateRef?.revision}, locale: ${step.templateRef?.language}).`,
+              'TEMPLATE_UNUSABLE',
+              `steps.${step.stepId}.templateRef.id`,
+              { resolutionOwner: 'INTEGRATION_DEVELOPER' }
+            )
+          );
         }
         if (draft.purpose === 'ORDER_SERVICE' && template.category === 'MARKETING') {
-          return res.status(422).json({
-            success: false,
-            error: `Activation blocked: Step '${step.stepId}' template purpose mismatch. Service campaign cannot use marketing template.`,
-            fieldPath: `steps.${step.stepId}.templateRef.id`,
-            resolutionOwner: 'BOUTIQUE_OWNER'
-          });
+          return res.status(422).json(
+            formatErrorResponse(
+              `Activation blocked: Step '${step.stepId}' template purpose mismatch. Service campaign cannot use marketing template.`,
+              'TEMPLATE_PURPOSE_MISMATCH',
+              `steps.${step.stepId}.templateRef.id`,
+              { resolutionOwner: 'BOUTIQUE_OWNER' }
+            )
+          );
         }
       }
 
       const connection = await TenantConnectionModel.findOne({ tenantId, status: 'ACTIVE' });
       if (!connection) {
-        return res.status(422).json({
-          success: false,
-          error: 'Activation blocked: No active WhatsApp connection provisioned for this boutique.',
-          fieldPath: 'connectionId',
-          resolutionOwner: 'INTEGRATION_DEVELOPER'
-        });
+        return res.status(422).json(
+          formatErrorResponse(
+            'Activation blocked: No active WhatsApp connection provisioned for this boutique.',
+            'NO_ACTIVE_CONNECTION',
+            'connectionId',
+            { resolutionOwner: 'INTEGRATION_DEVELOPER' }
+          )
+        );
       }
 
       // Atomic MongoDB transaction for version publishing, campaign activation, and audit (Spec p.21, Finding 3)
@@ -944,10 +928,9 @@ campaignRouter.post(
         });
       } catch (txErr: any) {
         if (txErr.message === 'VERSION_CONFLICT') {
-          return res.status(409).json({
-            success: false,
-            error: 'Version conflict: campaign draft was modified concurrently.'
-          });
+          return res.status(409).json(
+            formatErrorResponse('Version conflict: campaign draft was modified concurrently.', 'VERSION_CONFLICT')
+          );
         }
         throw txErr;
       } finally {
@@ -973,7 +956,7 @@ campaignRouter.post(
         planningResult
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -990,7 +973,7 @@ campaignRouter.post(
     try {
       const tenantId = req.tenantId!;
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-      if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+      if (!campaign) return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
 
       const session = await mongoose.startSession();
       let updatedCampaign: any = null;
@@ -1054,7 +1037,7 @@ campaignRouter.post(
 
       res.json({ success: true, campaign: updatedCampaign });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -1067,7 +1050,7 @@ campaignRouter.post(
   try {
     const tenantId = req.tenantId!;
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+    if (!campaign) return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
 
     const session = await mongoose.startSession();
     let updatedCampaign: any = null;
@@ -1155,7 +1138,7 @@ campaignRouter.post(
 
     res.json({ success: true, campaign: updatedCampaign });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1290,18 +1273,17 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
   try {
     const tenantId = (req as any).tenantId;
     const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-    if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+    if (!campaign) return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
 
     const { expectedVersion } = req.body || {};
     if (expectedVersion !== undefined) {
       if (typeof expectedVersion !== 'number') {
-        return res.status(400).json({ success: false, error: 'expectedVersion must be a number' });
+        return res.status(400).json(formatErrorResponse('expectedVersion must be a number', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion'));
       }
       if (campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json({
-          success: false,
-          error: `Version conflict: expected draft version ${expectedVersion}, but current draft is version ${campaign.draftVersion}.`
-        });
+        return res.status(409).json(
+          formatErrorResponse(`Version conflict: expected draft version ${expectedVersion}, but current draft is version ${campaign.draftVersion}.`, 'VERSION_CONFLICT', 'expectedVersion')
+        );
       }
     }
 
@@ -1313,7 +1295,7 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
     }) || await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
 
     if (!version) {
-      return res.status(400).json({ success: false, error: 'No campaign version found to validate' });
+      return res.status(400).json(formatErrorResponse('No campaign version found to validate', 'NO_BASE_VERSION_FOUND'));
     }
 
     const { valid: isValid, errors, warnings } = await validateCampaignVersionDefinition(version, tenantId);
@@ -1335,7 +1317,7 @@ campaignRouter.post('/campaigns/:id/validate', async (req: Request, res: Respons
       validatedSteps: version.steps?.length || 0
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1353,28 +1335,25 @@ campaignRouter.post(
       const { expectedVersion, reviewFingerprint } = req.body;
 
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-      if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+      if (!campaign) return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
 
       // 1. Mandatory optimistic concurrency control (Review 2, Spec C16)
       if (typeof expectedVersion !== 'number') {
-        return res.status(400).json({
-          success: false,
-          error: 'EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('EXPECTED_VERSION_REQUIRED: expectedVersion is mandatory and must be a number.', 'EXPECTED_VERSION_REQUIRED', 'expectedVersion')
+        );
       }
       if (campaign.draftVersion !== expectedVersion) {
-        return res.status(409).json({
-          success: false,
-          error: `Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`
-        });
+        return res.status(409).json(
+          formatErrorResponse(`Version conflict: expected base version ${expectedVersion}, but draft is at version ${campaign.draftVersion}.`, 'VERSION_CONFLICT', 'expectedVersion')
+        );
       }
 
       // 2. Mandatory dry-run reviewFingerprint
       if (!reviewFingerprint) {
-        return res.status(400).json({
-          success: false,
-          error: 'Mandatory reviewFingerprint is required. Please evaluate dry run before publishing revision.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('Mandatory reviewFingerprint is required. Please evaluate dry run before publishing revision.', 'REVIEW_FINGERPRINT_REQUIRED', 'reviewFingerprint')
+        );
       }
 
       const dryRunReport = await CampaignDryRunModel.findOne({
@@ -1384,10 +1363,9 @@ campaignRouter.post(
       });
 
       if (!dryRunReport) {
-        return res.status(400).json({
-          success: false,
-          error: 'No dry run evaluation found matching reviewFingerprint. Cannot publish unverified revision.'
-        });
+        return res.status(400).json(
+          formatErrorResponse('No dry run evaluation found matching reviewFingerprint. Cannot publish unverified revision.', 'DRY_RUN_RECORD_NOT_FOUND', 'reviewFingerprint')
+        );
       }
 
       const currentVersion = campaign.activeVersionId
@@ -1395,7 +1373,7 @@ campaignRouter.post(
         : await CampaignVersionModel.findOne({ campaignId: campaign.id, tenantId }).sort({ version: -1 });
 
       if (!currentVersion) {
-        return res.status(400).json({ success: false, error: 'No base version found to revise' });
+        return res.status(400).json(formatErrorResponse('No base version found to revise', 'NO_BASE_VERSION_FOUND'));
       }
 
       const candidateSteps = req.body.steps || currentVersion.steps;
@@ -1412,16 +1390,14 @@ campaignRouter.post(
           );
         } catch (tmplErr: any) {
           logger.error({ tmplErr: tmplErr?.message, stepId: step.stepId }, 'Template resolution failed closed due to database error');
-          return res.status(503).json({
-            success: false,
-            error: `Publishing revision failed: Template catalogue is currently unavailable for step '${step.stepId}'.`
-          });
+          return res.status(503).json(
+            formatErrorResponse(`Publishing revision failed: Template catalogue is currently unavailable for step '${step.stepId}'.`, 'TEMPLATE_CATALOGUE_UNAVAILABLE', `steps.${step.stepId}.templateRef.id`)
+          );
         }
         if (!tpl || tpl.status === 'PAUSED') {
-          return res.status(422).json({
-            success: false,
-            error: `Step '${step.stepId}' references unapproved or paused template '${step.templateRef?.id}' (revision: ${step.templateRef?.revision}, locale: ${step.templateRef?.language})`
-          });
+          return res.status(422).json(
+            formatErrorResponse(`Step '${step.stepId}' references unapproved or paused template '${step.templateRef?.id}' (revision: ${step.templateRef?.revision}, locale: ${step.templateRef?.language})`, 'TEMPLATE_UNUSABLE', `steps.${step.stepId}.templateRef.id`)
+          );
         }
       }
 
@@ -1497,10 +1473,9 @@ campaignRouter.post(
         });
       } catch (txErr: any) {
         if (txErr.message === 'VERSION_CONFLICT') {
-          return res.status(409).json({
-            success: false,
-            error: 'Concurrent version update conflict detected.'
-          });
+          return res.status(409).json(
+            formatErrorResponse('Concurrent version update conflict detected.', 'VERSION_CONFLICT')
+          );
         }
         throw txErr;
       } finally {
@@ -1514,7 +1489,7 @@ campaignRouter.post(
         activeVersion: Array.isArray(newVersion) ? newVersion[0] : newVersion
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -1531,7 +1506,7 @@ campaignRouter.post(
     try {
       const tenantId = req.tenantId!;
       const campaign = await CampaignModel.findOne({ id: req.params.id, tenantId });
-      if (!campaign) return res.status(404).json({ success: false, error: 'Campaign not found' });
+      if (!campaign) return res.status(404).json(formatErrorResponse('Campaign not found', 'CAMPAIGN_NOT_FOUND'));
 
       campaign.status = 'ARCHIVED';
       campaign.pauseGeneration += 1;
@@ -1586,7 +1561,7 @@ campaignRouter.post(
         cancelledExecutionsCount: cancelledExecutions.modifiedCount
       });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -1640,7 +1615,7 @@ campaignRouter.get('/campaigns/:id/enrollments', async (req: Request, res: Respo
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1690,7 +1665,7 @@ campaignRouter.get('/campaigns/:id/history', async (req: Request, res: Response)
       pagination: { page, limit, total, totalPages: Math.ceil(total / limit) }
     });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1707,7 +1682,7 @@ campaignRouter.post(
       const tenantId = (req as any).tenantId;
       const enrollment = await CampaignEnrollmentModel.findOne({ id: req.params.id, tenantId });
       if (!enrollment) {
-        return res.status(404).json({ success: false, error: 'Enrollment not found' });
+        return res.status(404).json(formatErrorResponse('Enrollment not found', 'ENROLLMENT_NOT_FOUND'));
       }
 
       enrollment.replyHoldAt = null;
@@ -1727,7 +1702,7 @@ campaignRouter.post(
 
       res.json({ success: true, message: 'Hold released by boutique staff', enrollment });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -1745,7 +1720,7 @@ campaignRouter.post(
       const tenantId = (req as any).tenantId;
       const enrollment = await CampaignEnrollmentModel.findOne({ id: req.params.id, tenantId });
       if (!enrollment) {
-        return res.status(404).json({ success: false, error: 'Enrollment not found' });
+        return res.status(404).json(formatErrorResponse('Enrollment not found', 'ENROLLMENT_NOT_FOUND'));
       }
 
       enrollment.goalReachedAt = new Date();
@@ -1781,7 +1756,7 @@ campaignRouter.post(
 
       res.json({ success: true, message: 'Goal marked; pending sales follow-ups skipped', enrollment });
     } catch (err: any) {
-      res.status(500).json({ success: false, error: err.message });
+      res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
     }
   }
 );
@@ -1846,7 +1821,7 @@ campaignRouter.get('/campaign-activity', async (req: Request, res: Response) => 
 
     res.json({ success: true, activity });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1860,7 +1835,7 @@ campaignRouter.get('/customers', async (req: Request, res: Response) => {
     const customers = await CustomerModel.find({ tenantId }).lean();
     res.json({ success: true, customers });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1882,7 +1857,7 @@ campaignRouter.get('/campaigns/reports/owner-overview', async (req: Request, res
     const report = await generateOwnerOverviewReport(tenantId);
     res.json({ success: true, report });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1897,7 +1872,7 @@ campaignRouter.get('/campaigns/reports/customer-timeline/:customerId', async (re
     const timeline = await getCustomerTimeline(tenantId, customerId);
     res.json({ success: true, customerId, timeline });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
@@ -1911,7 +1886,7 @@ campaignRouter.get('/campaigns/monitoring/alerts', async (req: Request, res: Res
     const alertsReport = await getMonitoringAlerts(tenantId);
     res.json({ success: true, monitoring: alertsReport });
   } catch (err: any) {
-    res.status(500).json({ success: false, error: err.message });
+    res.status(500).json(formatErrorResponse(err.message || 'Internal server error', 'INTERNAL_ERROR'));
   }
 });
 
